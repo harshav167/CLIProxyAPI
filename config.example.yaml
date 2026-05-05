@@ -71,6 +71,21 @@ usage-statistics-enabled: false
 # Default: 60. Max: 3600.
 redis-usage-queue-retention-seconds: 60
 
+# Optional external Redis/Valkey backend for the usage queue. When `enabled` is
+# false (default) the queue stays in-process. When true, the proxy will dial
+# the configured address on startup; on dial/ping failure it logs the error
+# and falls back to the in-memory backend automatically.
+#
+# Each of these fields can also be overridden at runtime via environment
+# variables: REDIS_QUEUE_ENABLED, REDIS_QUEUE_ADDRESS, REDIS_QUEUE_PASSWORD,
+# REDIS_QUEUE_DB, REDIS_QUEUE_KEY_PREFIX. Env vars take precedence over YAML.
+redis-queue:
+  enabled: false
+  address: ""           # host:port, e.g. "valkey:6379"
+  password: ""
+  db: 0
+  key-prefix: "cliproxy:usage"
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""

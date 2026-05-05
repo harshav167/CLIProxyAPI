@@ -14,8 +14,11 @@ services:
     #   - .env
     environment:
       DEPLOY: ${DEPLOY:-}
+      REDIS_QUEUE_ENABLED: "true"
+      REDIS_QUEUE_ADDRESS: "valkey:6379"
+      REDIS_QUEUE_KEY_PREFIX: "cliproxy:usage"
     ports:
-      - "8317:8317"
+      - "9317:8317"
       - "8085:8085"
       - "1455:1455"
       - "54545:54545"
@@ -25,4 +28,25 @@ services:
       - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
       - ${CLI_PROXY_AUTH_PATH:-./auths}:/root/.cli-proxy-api
       - ${CLI_PROXY_LOG_PATH:-./logs}:/CLIProxyAPI/logs
+    depends_on:
+      valkey:
+        condition: service_started
+    networks:
+      - cliproxy
     restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: cli-proxy-valkey
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - valkey-data:/data
+    networks:
+      - cliproxy
+
+volumes:
+  valkey-data:
+
+networks:
+  cliproxy:

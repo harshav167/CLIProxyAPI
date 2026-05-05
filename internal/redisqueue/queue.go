@@ -3,7 +3,6 @@ package redisqueue
 import (
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 const (
@@ -12,33 +11,35 @@ const (
 	usageSubscriberBuffer         = 256
 )
 
-type queueItem struct {
-	enqueuedAt time.Time
-	payload    []byte
-}
-
-type queue struct {
-	mu               sync.Mutex
-	items            []queueItem
-	head             int
-	subscribers      map[uint64]chan []byte
-	nextSubscriberID uint64
+// backend abstracts the storage used to buffer usage payloads. The default
+// implementation keeps records in-memory; an external Redis/Valkey backend
+// can be swapped in via Configure.
+type backend interface {
+	Enqueue(payload []byte)
+	PopOldest(count int) [][]byte
+	Clear()
+	Close() error
 }
 
 var (
 	enabled          atomic.Bool
 	retentionSeconds atomic.Int64
-	global           queue
+
+	backendMu      sync.RWMutex
+	currentBackend backend = newInMemoryBackend()
 )
 
 func init() {
 	retentionSeconds.Store(defaultRetentionSeconds)
 }
 
+// SetEnabled toggles the public Enqueue/PopOldest API. When toggled off the
+// active backend is cleared. This mirrors the legacy behavior where the queue
+// is wired to the management-route lifecycle.
 func SetEnabled(value bool) {
 	enabled.Store(value)
 	if !value {
-		global.clear()
+		getBackend().Clear()
 	}
 }
 
@@ -46,6 +47,8 @@ func Enabled() bool {
 	return enabled.Load()
 }
 
+// SetRetentionSeconds clamps the configured retention window. The window
+// applies to whichever backend is active.
 func SetRetentionSeconds(value int) {
 	normalized := int64(value)
 	if normalized <= 0 {
@@ -56,6 +59,14 @@ func SetRetentionSeconds(value int) {
 	retentionSeconds.Store(normalized)
 }
 
+func currentRetentionSeconds() int64 {
+	v := retentionSeconds.Load()
+	if v <= 0 {
+		return defaultRetentionSeconds
+	}
+	return v
+}
+
 func Enqueue(payload []byte) {
 	if !Enabled() {
 		return
@@ -63,10 +74,7 @@ func Enqueue(payload []byte) {
 	if len(payload) == 0 {
 		return
 	}
-	if global.publishToSubscribers(payload) {
-		return
-	}
-	global.enqueue(payload)
+	getBackend().Enqueue(payload)
 }
 
 func PopOldest(count int) [][]byte {
@@ -76,155 +84,50 @@ func PopOldest(count int) [][]byte {
 	if count <= 0 {
 		return nil
 	}
-	return global.popOldest(count)
+	return getBackend().PopOldest(count)
 }
 
-func SubscribeUsage() (<-chan []byte, func()) {
-	return global.subscribeUsage()
+func getBackend() backend {
+	backendMu.RLock()
+	defer backendMu.RUnlock()
+	return currentBackend
 }
 
-func (q *queue) clear() {
-	q.mu.Lock()
-
-	subscribers := make([]chan []byte, 0, len(q.subscribers))
-	for _, subscriber := range q.subscribers {
-		subscribers = append(subscribers, subscriber)
-	}
-	q.items = nil
-	q.head = 0
-	q.subscribers = nil
-	q.mu.Unlock()
-
-	for _, subscriber := range subscribers {
-		close(subscriber)
-	}
+func setBackend(b backend) backend {
+	backendMu.Lock()
+	prev := currentBackend
+	currentBackend = b
+	backendMu.Unlock()
+	return prev
 }
 
-func (q *queue) enqueue(payload []byte) {
-	now := time.Now()
-
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	q.pruneLocked(now)
-	q.items = append(q.items, queueItem{
-		enqueuedAt: now,
-		payload:    append([]byte(nil), payload...),
-	})
-	q.maybeCompactLocked()
-}
-
-func (q *queue) publishToSubscribers(payload []byte) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if len(q.subscribers) == 0 {
-		return false
-	}
-
-	for id, subscriber := range q.subscribers {
-		cloned := append([]byte(nil), payload...)
-		select {
-		case subscriber <- cloned:
-		default:
-			delete(q.subscribers, id)
-			close(subscriber)
-		}
-	}
-
-	return true
-}
-
-func (q *queue) subscribeUsage() (<-chan []byte, func()) {
-	subscriber := make(chan []byte, usageSubscriberBuffer)
-
-	q.mu.Lock()
-	if q.subscribers == nil {
-		q.subscribers = make(map[uint64]chan []byte)
-	}
-	q.nextSubscriberID++
-	id := q.nextSubscriberID
-	q.subscribers[id] = subscriber
-	q.mu.Unlock()
-
-	var once sync.Once
-	unsubscribe := func() {
-		once.Do(func() {
-			q.unsubscribeUsage(id)
-		})
-	}
-	return subscriber, unsubscribe
-}
-
-func (q *queue) unsubscribeUsage(id uint64) {
-	q.mu.Lock()
-	subscriber, ok := q.subscribers[id]
-	if ok {
-		delete(q.subscribers, id)
-	}
-	q.mu.Unlock()
-
-	if ok {
-		close(subscriber)
+// CurrentBackendName returns a short identifier for the active backend.
+// Intended for diagnostics and tests.
+func CurrentBackendName() string {
+	switch getBackend().(type) {
+	case *redisBackend:
+		return "redis"
+	default:
+		return "in-memory"
 	}
 }
 
-func (q *queue) popOldest(count int) [][]byte {
-	now := time.Now()
+// ResetBackendForTesting forces the in-memory backend. Test-only helper used
+// to keep package-level state stable across tests that may have configured an
+// external backend.
+func ResetBackendForTesting() {
+	prev := setBackend(newInMemoryBackend())
+	if prev != nil {
+		_ = prev.Close()
+	}
+}
 
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	q.pruneLocked(now)
-	available := len(q.items) - q.head
-	if available <= 0 {
-		q.items = nil
-		q.head = 0
+// Shutdown closes any resources held by the active backend. Safe to call
+// multiple times.
+func Shutdown() error {
+	prev := setBackend(newInMemoryBackend())
+	if prev == nil {
 		return nil
 	}
-	if count > available {
-		count = available
-	}
-
-	out := make([][]byte, 0, count)
-	for i := 0; i < count; i++ {
-		item := q.items[q.head+i]
-		out = append(out, item.payload)
-	}
-	q.head += count
-	q.maybeCompactLocked()
-	return out
-}
-
-func (q *queue) pruneLocked(now time.Time) {
-	if q.head >= len(q.items) {
-		q.items = nil
-		q.head = 0
-		return
-	}
-
-	windowSeconds := retentionSeconds.Load()
-	if windowSeconds <= 0 {
-		windowSeconds = defaultRetentionSeconds
-	}
-	cutoff := now.Add(-time.Duration(windowSeconds) * time.Second)
-	for q.head < len(q.items) && q.items[q.head].enqueuedAt.Before(cutoff) {
-		q.head++
-	}
-}
-
-func (q *queue) maybeCompactLocked() {
-	if q.head == 0 {
-		return
-	}
-	if q.head >= len(q.items) {
-		q.items = nil
-		q.head = 0
-		return
-	}
-	if q.head < 1024 && q.head*2 < len(q.items) {
-		return
-	}
-	q.items = append([]queueItem(nil), q.items[q.head:]...)
-	q.head = 0
+	return prev.Close()
 }

@@ -498,6 +498,17 @@ func main() {
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
+	applyRedisQueueEnvOverrides(&cfg.RedisQueue)
+	if cfg.RedisQueue.Enabled {
+		if errBackend := redisqueue.ConfigureRedisBackend(redisqueue.RedisBackendConfig{
+			Address:   cfg.RedisQueue.Address,
+			Password:  cfg.RedisQueue.Password,
+			DB:        cfg.RedisQueue.DB,
+			KeyPrefix: cfg.RedisQueue.KeyPrefix,
+		}); errBackend != nil {
+			log.Errorf("redisqueue: external backend unavailable, falling back to in-memory: %v", errBackend)
+		}
+	}
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {
@@ -674,5 +685,35 @@ func main() {
 			}
 			cmd.StartService(cfg, configFilePath, password)
 		}
+	}
+}
+
+// applyRedisQueueEnvOverrides allows compose/CI environments to point the
+// usage queue at an external Redis/Valkey without editing config.yaml.
+func applyRedisQueueEnvOverrides(c *config.RedisQueueConfig) {
+	if c == nil {
+		return
+	}
+	if v := strings.TrimSpace(os.Getenv("REDIS_QUEUE_ENABLED")); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			c.Enabled = true
+		case "0", "false", "no", "off":
+			c.Enabled = false
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("REDIS_QUEUE_ADDRESS")); v != "" {
+		c.Address = v
+	}
+	if v, ok := os.LookupEnv("REDIS_QUEUE_PASSWORD"); ok {
+		c.Password = v
+	}
+	if v := strings.TrimSpace(os.Getenv("REDIS_QUEUE_DB")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.DB = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("REDIS_QUEUE_KEY_PREFIX")); v != "" {
+		c.KeyPrefix = v
 	}
 }

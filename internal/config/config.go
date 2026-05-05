@@ -74,6 +74,10 @@ type Config struct {
 	// Default: 60. Max: 3600.
 	RedisUsageQueueRetentionSeconds int `yaml:"redis-usage-queue-retention-seconds" json:"redis-usage-queue-retention-seconds"`
 
+	// RedisQueue optionally points the usage queue at an external Redis/Valkey
+	// instance. When Enabled is false (the default) the in-memory backend is used.
+	RedisQueue RedisQueueConfig `yaml:"redis-queue" json:"redis-queue"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -147,6 +151,16 @@ type Config struct {
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// RedisQueueConfig configures the optional external Redis/Valkey backend used
+// by the usage queue. When Enabled is false the queue stays in-memory.
+type RedisQueueConfig struct {
+	Enabled   bool   `yaml:"enabled" json:"enabled"`
+	Address   string `yaml:"address" json:"address"`
+	Password  string `yaml:"password" json:"password"`
+	DB        int    `yaml:"db" json:"db"`
+	KeyPrefix string `yaml:"key-prefix" json:"key-prefix"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
