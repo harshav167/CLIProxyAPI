@@ -34,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -397,6 +398,9 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		// Diagnostic alias for forcing the legacy HTTP responses executor while
+		// keeping an OpenAI-compatible /responses path for SDK clients.
+		v1.POST("/passthrough/responses", openaiResponsesHandlers.ResponsesPassthrough)
 	}
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
@@ -456,6 +460,20 @@ func (s *Server) setupRoutes() {
 		}
 		if state != "" {
 			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "codex", state, code, errStr)
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	})
+
+	s.engine.GET("/gitlab/callback", func(c *gin.Context) {
+		code := c.Query("code")
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if errStr == "" {
+			errStr = c.Query("error_description")
+		}
+		if state != "" {
+			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "gitlab", state, code, errStr)
 		}
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
@@ -556,6 +574,9 @@ func (s *Server) registerManagementRoutes() {
 	mgmt := s.engine.Group("/v0/management")
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
+		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
+		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
@@ -595,6 +616,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/quota-exceeded/switch-preview-model", s.mgmt.GetSwitchPreviewModel)
 		mgmt.PUT("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
 		mgmt.PATCH("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
+
+		mgmt.GET("/copilot-quota", s.mgmt.GetCopilotQuota)
 
 		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
@@ -701,6 +724,10 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
+		mgmt.GET("/gitlab-auth-url", s.mgmt.RequestGitLabToken)
+		mgmt.POST("/gitlab-auth-url", s.mgmt.RequestGitLabPATToken)
+		mgmt.GET("/cursor-auth-url", s.mgmt.RequestCursorToken)
+		mgmt.GET("/github-auth-url", s.mgmt.RequestGitHubToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
@@ -1378,6 +1405,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != cfg.UsageStatisticsEnabled {
+		usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 		redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	}
 
@@ -1458,6 +1486,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if s.mgmt != nil {
 		s.mgmt.SetConfig(cfg)
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
+		s.mgmt.SetUsageStatistics(usage.GetRequestStatistics())
 	}
 
 	// Notify Amp module only when Amp config has changed.

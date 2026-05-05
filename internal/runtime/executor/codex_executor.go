@@ -277,8 +277,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
+	// Keep prompt_cache_retention on HTTP /responses requests; Codex accepts it
+	// here and clients like Cursor rely on it to extend upstream cache TTL.
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
@@ -665,7 +665,6 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "stream", false)
@@ -871,7 +870,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 			cache.ID = promptCacheKey.String()
 		}
 	} else if from == "openai" {
-		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+		if pck := strings.TrimSpace(gjson.GetBytes(req.Payload, "prompt_cache_key").String()); pck != "" {
+			cache.ID = pck
+		} else if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
 			cache.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
 		}
 	}

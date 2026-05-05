@@ -50,50 +50,51 @@ func TestToolCallSimple(t *testing.T) {
 	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
 	result := string(out)
 
-	items := gjson.Get(result, "input").Array()
-	if len(items) != 4 {
-		t.Fatalf("expected 4 input items, got %d: %s", len(items), gjson.Get(result, "input").Raw)
+	// Updated 2026-05-02: system message is now promoted to top-level
+	// `instructions` (matches Codex CLI canonical request shape per
+	// codex-rs/core/src/client.rs build_responses_request) and is NOT
+	// emitted as a developer-role item in input[]. So the count drops from
+	// 4 to 3 (user + function_call + function_call_output).
+	if got := gjson.Get(result, "instructions").String(); got != "You are a helpful assistant." {
+		t.Errorf("expected instructions to contain promoted system message, got: %q", got)
 	}
 
-	// system -> developer
-	if items[0].Get("type").String() != "message" {
-		t.Errorf("item 0: expected type 'message', got '%s'", items[0].Get("type").String())
-	}
-	if items[0].Get("role").String() != "developer" {
-		t.Errorf("item 0: expected role 'developer', got '%s'", items[0].Get("role").String())
+	items := gjson.Get(result, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("expected 3 input items (system promoted to instructions), got %d: %s", len(items), gjson.Get(result, "input").Raw)
 	}
 
 	// user
-	if items[1].Get("type").String() != "message" {
-		t.Errorf("item 1: expected type 'message', got '%s'", items[1].Get("type").String())
+	if items[0].Get("type").String() != "message" {
+		t.Errorf("item 0: expected type 'message', got '%s'", items[0].Get("type").String())
 	}
-	if items[1].Get("role").String() != "user" {
-		t.Errorf("item 1: expected role 'user', got '%s'", items[1].Get("role").String())
+	if items[0].Get("role").String() != "user" {
+		t.Errorf("item 0: expected role 'user', got '%s'", items[0].Get("role").String())
 	}
 
 	// function_call, not an empty assistant msg
-	if items[2].Get("type").String() != "function_call" {
-		t.Errorf("item 2: expected type 'function_call', got '%s'", items[2].Get("type").String())
+	if items[1].Get("type").String() != "function_call" {
+		t.Errorf("item 1: expected type 'function_call', got '%s'", items[1].Get("type").String())
+	}
+	if items[1].Get("call_id").String() != "call_1" {
+		t.Errorf("item 1: expected call_id 'call_1', got '%s'", items[1].Get("call_id").String())
+	}
+	if items[1].Get("name").String() != "get_weather" {
+		t.Errorf("item 1: expected name 'get_weather', got '%s'", items[1].Get("name").String())
+	}
+	if items[1].Get("arguments").String() != `{"city":"Paris"}` {
+		t.Errorf("item 1: unexpected arguments: %s", items[1].Get("arguments").String())
+	}
+
+	// function_call_output
+	if items[2].Get("type").String() != "function_call_output" {
+		t.Errorf("item 2: expected type 'function_call_output', got '%s'", items[2].Get("type").String())
 	}
 	if items[2].Get("call_id").String() != "call_1" {
 		t.Errorf("item 2: expected call_id 'call_1', got '%s'", items[2].Get("call_id").String())
 	}
-	if items[2].Get("name").String() != "get_weather" {
-		t.Errorf("item 2: expected name 'get_weather', got '%s'", items[2].Get("name").String())
-	}
-	if items[2].Get("arguments").String() != `{"city":"Paris"}` {
-		t.Errorf("item 2: unexpected arguments: %s", items[2].Get("arguments").String())
-	}
-
-	// function_call_output
-	if items[3].Get("type").String() != "function_call_output" {
-		t.Errorf("item 3: expected type 'function_call_output', got '%s'", items[3].Get("type").String())
-	}
-	if items[3].Get("call_id").String() != "call_1" {
-		t.Errorf("item 3: expected call_id 'call_1', got '%s'", items[3].Get("call_id").String())
-	}
-	if items[3].Get("output").String() != "sunny, 22C" {
-		t.Errorf("item 3: expected output 'sunny, 22C', got '%s'", items[3].Get("output").String())
+	if items[2].Get("output").String() != "sunny, 22C" {
+		t.Errorf("item 2: expected output 'sunny, 22C', got '%s'", items[2].Get("output").String())
 	}
 }
 
@@ -173,6 +174,83 @@ func TestToolCallWithContent(t *testing.T) {
 	}
 	if items[3].Get("call_id").String() != "call_abc" {
 		t.Errorf("item 3: expected call_id 'call_abc', got '%s'", items[3].Get("call_id").String())
+	}
+}
+
+func TestCustomToolCallPreserved(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{"role": "user", "content": "Apply this patch"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": "call_patch",
+						"type": "function",
+						"function": {
+							"name": "apply_patch",
+							"arguments": "*** Begin Patch\n*** End Patch"
+						}
+					}
+				]
+			},
+			{
+				"role": "tool",
+				"tool_call_id": "call_patch",
+				"content": "Failed to find context"
+			}
+		],
+		"tools": [
+			{
+				"type": "custom",
+				"name": "apply_patch",
+				"description": "Apply a patch",
+				"format": {"type": "grammar", "syntax": "lark", "definition": "start: \"patch\""}
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	result := string(out)
+	items := gjson.Get(result, "input").Array()
+
+	if len(items) != 3 {
+		t.Fatalf("expected 3 input items, got %d: %s", len(items), gjson.Get(result, "input").Raw)
+	}
+	if items[0].Get("type").String() != "message" || items[0].Get("role").String() != "user" {
+		t.Fatalf("item 0: expected user message, got %s", items[0].Raw)
+	}
+
+	if items[1].Get("type").String() != "custom_tool_call" {
+		t.Fatalf("item 1: expected type 'custom_tool_call', got %q; item=%s", items[1].Get("type").String(), items[1].Raw)
+	}
+	if items[1].Get("call_id").String() != "call_patch" {
+		t.Fatalf("item 1: expected call_id 'call_patch', got %q", items[1].Get("call_id").String())
+	}
+	if items[1].Get("name").String() != "apply_patch" {
+		t.Fatalf("item 1: expected name 'apply_patch', got %q", items[1].Get("name").String())
+	}
+	if items[1].Get("input").String() != "*** Begin Patch\n*** End Patch" {
+		t.Fatalf("item 1: expected custom tool input to be preserved, got %q", items[1].Get("input").String())
+	}
+
+	if items[2].Get("type").String() != "custom_tool_call_output" {
+		t.Fatalf("item 2: expected type 'custom_tool_call_output', got %q; item=%s", items[2].Get("type").String(), items[2].Raw)
+	}
+	if items[2].Get("call_id").String() != "call_patch" {
+		t.Fatalf("item 2: expected call_id 'call_patch', got %q", items[2].Get("call_id").String())
+	}
+	output := items[2].Get("output").Array()
+	if len(output) != 1 {
+		t.Fatalf("item 2: expected 1 output block, got %d: %s", len(output), items[2].Get("output").Raw)
+	}
+	if output[0].Get("type").String() != "input_text" {
+		t.Fatalf("item 2 output[0]: expected type 'input_text', got %q", output[0].Get("type").String())
+	}
+	if output[0].Get("text").String() != "Failed to find context" {
+		t.Fatalf("item 2 output[0]: expected text %q, got %q", "Failed to find context", output[0].Get("text").String())
 	}
 }
 
@@ -585,7 +663,7 @@ func TestMultiTurnToolCalling(t *testing.T) {
 	}
 }
 
-// Tool names over 64 chars get shortened, call_id stays the same.
+// Tool names are passed through verbatim, even when they exceed 64 chars.
 func TestToolNameShortening(t *testing.T) {
 	longName := "a_very_long_tool_name_that_exceeds_sixty_four_characters_limit_here_test"
 	if len(longName) <= 64 {
@@ -647,13 +725,44 @@ func TestToolNameShortening(t *testing.T) {
 		t.Errorf("call_id changed: expected 'call_long', got '%s'", funcCallItem.Get("call_id").String())
 	}
 
-	// name must be truncated
+	// Updated 2026-05-02: tool names are now passed through verbatim. The
+	// 64-char defensive shortening was empirically unnecessary — OpenAI
+	// /responses upstream accepts tool names well over 64 chars (verified
+	// against figma-console MCP tools at 75+ chars). Silent rewriting
+	// risked call_id mismatches across turns. Pure passthrough now.
 	translatedName := funcCallItem.Get("name").String()
-	if translatedName == longName {
-		t.Errorf("tool name was NOT shortened: still '%s'", translatedName)
+	if translatedName != longName {
+		t.Errorf("tool name was rewritten (passthrough expected): got '%s', want '%s'", translatedName, longName)
 	}
-	if len(translatedName) > 64 {
-		t.Errorf("shortened name still > 64 chars: len=%d name='%s'", len(translatedName), translatedName)
+	// Also verify the tool definition itself preserved the long name verbatim.
+	tools := gjson.Get(result, "tools").Array()
+	if len(tools) == 0 {
+		t.Fatal("expected at least 1 tool in output")
+	}
+	for _, tool := range tools {
+		if tool.Get("type").String() != "function" {
+			continue
+		}
+		if got := tool.Get("name").String(); got != longName {
+			t.Errorf("tool definition name was rewritten: got '%s', want '%s'", got, longName)
+		}
+	}
+}
+
+func TestPromptCacheKeyPreserved(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"prompt_cache_key": "pck_test_123",
+		"messages": [
+			{"role": "user", "content": "Hello"}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, true)
+	result := string(out)
+
+	if got := gjson.Get(result, "prompt_cache_key").String(); got != "pck_test_123" {
+		t.Fatalf("expected prompt_cache_key to be preserved, got %q", got)
 	}
 }
 

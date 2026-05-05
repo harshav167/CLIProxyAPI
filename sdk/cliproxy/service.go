@@ -117,6 +117,12 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
 		sdkAuth.NewXAIAuthenticator(),
+		sdkAuth.NewAntigravityAuthenticator(),
+		sdkAuth.NewKimiAuthenticator(),
+		sdkAuth.NewGitLabAuthenticator(),
+		sdkAuth.NewCodeBuddyAuthenticator(),
+		sdkAuth.NewGitHubCopilotAuthenticator(),
+		sdkAuth.NewCursorAuthenticator(),
 	)
 }
 
@@ -434,8 +440,16 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
-	case "xai":
-		s.coreManager.RegisterExecutor(executor.NewXAIExecutor(s.cfg))
+	case "codebuddy":
+		s.coreManager.RegisterExecutor(executor.NewCodeBuddyExecutor(s.cfg))
+	case "cursor":
+		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(s.cfg))
+	case "github-copilot":
+		s.coreManager.RegisterExecutor(executor.NewGitHubCopilotExecutor(s.cfg))
+	case "gitlab":
+		s.coreManager.RegisterExecutor(executor.NewGitLabExecutor(s.cfg))
+	case "xai", "xai-oauth", "grok", "grok-oauth":
+		s.coreManager.RegisterExecutor(executor.NewXAIExecutor(strings.ToLower(a.Provider), s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -1159,7 +1173,22 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "kimi":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
-	case "xai":
+	case "codebuddy":
+		models = registry.GetCodeBuddyModels()
+		models = applyExcludedModels(models, excluded)
+	case "cursor":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		models = executor.FetchCursorModels(ctx, a, s.cfg)
+		models = applyExcludedModels(models, excluded)
+	case "github-copilot":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		models = executor.FetchGitHubCopilotModels(ctx, a, s.cfg)
+		models = applyExcludedModels(models, excluded)
+	case "gitlab":
+		models = executor.GitLabModelsFromAuth(a)
+	case "xai", "xai-oauth", "grok", "grok-oauth":
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
 	default:

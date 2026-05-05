@@ -14,6 +14,10 @@ func init() {
 	registerRefreshLead("antigravity", func() Authenticator { return NewAntigravityAuthenticator() })
 	registerRefreshLead("kimi", func() Authenticator { return NewKimiAuthenticator() })
 	registerRefreshLead("xai", func() Authenticator { return NewXAIAuthenticator() })
+	registerRefreshLead("gitlab", func() Authenticator { return NewGitLabAuthenticator() })
+	registerRefreshLead("codebuddy", func() Authenticator { return NewCodeBuddyAuthenticator() })
+	registerRefreshLead("github-copilot", func() Authenticator { return NewGitHubCopilotAuthenticator() })
+	registerRefreshLead("cursor", func() Authenticator { return NewCursorAuthenticator() })
 }
 
 func registerRefreshLead(provider string, factory func() Authenticator) {

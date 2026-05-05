@@ -54,6 +54,7 @@ type apiCallResponse struct {
 	StatusCode int                 `json:"status_code"`
 	Header     map[string][]string `json:"header"`
 	Body       string              `json:"body"`
+	Quota      *QuotaSnapshots     `json:"quota,omitempty"`
 }
 
 // APICall makes a generic HTTP request on behalf of the management API caller.
@@ -226,6 +227,39 @@ func firstNonEmptyString(values ...*string) string {
 		}
 	}
 	return ""
+}
+
+// QuotaDetail represents quota information for a specific resource type.
+type QuotaDetail struct {
+	Entitlement      float64 `json:"entitlement"`
+	OverageCount     float64 `json:"overage_count"`
+	OveragePermitted bool    `json:"overage_permitted"`
+	PercentRemaining float64 `json:"percent_remaining"`
+	QuotaID          string  `json:"quota_id"`
+	QuotaRemaining   float64 `json:"quota_remaining"`
+	Remaining        float64 `json:"remaining"`
+	Unlimited        bool    `json:"unlimited"`
+}
+
+// QuotaSnapshots contains quota details for different resource types.
+type QuotaSnapshots struct {
+	Chat                QuotaDetail `json:"chat"`
+	Completions         QuotaDetail `json:"completions"`
+	PremiumInteractions QuotaDetail `json:"premium_interactions"`
+}
+
+// CopilotUsageResponse represents the GitHub Copilot usage information.
+type CopilotUsageResponse struct {
+	AccessTypeSKU         string         `json:"access_type_sku"`
+	AnalyticsTrackingID   string         `json:"analytics_tracking_id"`
+	AssignedDate          string         `json:"assigned_date"`
+	CanSignupForLimited   bool           `json:"can_signup_for_limited"`
+	ChatEnabled           bool           `json:"chat_enabled"`
+	CopilotPlan           string         `json:"copilot_plan"`
+	OrganizationLoginList []interface{}  `json:"organization_login_list"`
+	OrganizationList      []interface{}  `json:"organization_list"`
+	QuotaResetDate        string         `json:"quota_reset_date"`
+	QuotaSnapshots        QuotaSnapshots `json:"quota_snapshots"`
 }
 
 func tokenValueForAuth(auth *coreauth.Auth) string {
@@ -791,4 +825,116 @@ func buildProxyTransport(proxyStr string) *http.Transport {
 		return nil
 	}
 	return transport
+}
+
+// GetCopilotQuota fetches GitHub Copilot quota information from the /copilot_internal/user endpoint.
+func (h *Handler) GetCopilotQuota(c *gin.Context) {
+	authIndex := strings.TrimSpace(c.Query("auth_index"))
+	if authIndex == "" {
+		authIndex = strings.TrimSpace(c.Query("authIndex"))
+	}
+	if authIndex == "" {
+		authIndex = strings.TrimSpace(c.Query("AuthIndex"))
+	}
+
+	auth := h.findCopilotAuth(authIndex)
+	if auth == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no github copilot credential found"})
+		return
+	}
+
+	token, tokenErr := h.resolveTokenForAuth(c.Request.Context(), auth)
+	if tokenErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to refresh copilot token"})
+		return
+	}
+	if token == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "copilot token not found"})
+		return
+	}
+
+	apiURL := "https://api.github.com/copilot_internal/user"
+	req, errNewRequest := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, apiURL, nil)
+	if errNewRequest != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
+		return
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "CLIProxyAPIPlus")
+	req.Header.Set("Accept", "application/json")
+
+	httpClient := &http.Client{
+		Timeout:   defaultAPICallTimeout,
+		Transport: h.apiCallTransport(auth),
+	}
+
+	resp, errDo := httpClient.Do(req)
+	if errDo != nil {
+		log.WithError(errDo).Debug("copilot quota request failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
+		return
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("response body close error: %v", errClose)
+		}
+	}()
+
+	respBody, errReadAll := io.ReadAll(resp.Body)
+	if errReadAll != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":       "github api request failed",
+			"status_code": resp.StatusCode,
+			"body":        string(respBody),
+		})
+		return
+	}
+
+	var usage CopilotUsageResponse
+	if errUnmarshal := json.Unmarshal(respBody, &usage); errUnmarshal != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse response"})
+		return
+	}
+
+	c.JSON(http.StatusOK, usage)
+}
+
+// findCopilotAuth locates a GitHub Copilot credential by auth_index or returns the first available one.
+func (h *Handler) findCopilotAuth(authIndex string) *coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+
+	auths := h.authManager.List()
+	var firstCopilot *coreauth.Auth
+
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+
+		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if provider != "copilot" && provider != "github" && provider != "github-copilot" {
+			continue
+		}
+
+		if firstCopilot == nil {
+			firstCopilot = auth
+		}
+
+		if authIndex != "" {
+			auth.EnsureIndex()
+			if auth.Index == authIndex {
+				return auth
+			}
+		}
+	}
+
+	return firstCopilot
 }

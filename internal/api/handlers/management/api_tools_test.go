@@ -210,3 +210,55 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
 	}
 }
+
+func TestFindCopilotAuthAcceptsGitHubAliasProvider(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	githubAlias := &coreauth.Auth{
+		ID:       "github-alias-auth",
+		Provider: "github",
+	}
+	if _, errRegister := manager.Register(context.Background(), githubAlias); errRegister != nil {
+		t.Fatalf("register github alias auth: %v", errRegister)
+	}
+
+	h := &Handler{authManager: manager}
+	found := h.findCopilotAuth("")
+	if found == nil {
+		t.Fatal("expected copilot auth match for github alias")
+	}
+	if found.ID != githubAlias.ID {
+		t.Fatalf("findCopilotAuth returned %q, want %q", found.ID, githubAlias.ID)
+	}
+}
+
+func TestFindCopilotAuthMatchesRequestedIndex(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	first := &coreauth.Auth{
+		ID:       "copilot-first",
+		Provider: "github-copilot",
+	}
+	second := &coreauth.Auth{
+		ID:       "copilot-second",
+		Provider: "github",
+	}
+	if _, errRegister := manager.Register(context.Background(), first); errRegister != nil {
+		t.Fatalf("register first copilot auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), second); errRegister != nil {
+		t.Fatalf("register second copilot auth: %v", errRegister)
+	}
+
+	wantIndex := second.EnsureIndex()
+	h := &Handler{authManager: manager}
+	found := h.findCopilotAuth(wantIndex)
+	if found == nil {
+		t.Fatal("expected auth by requested copilot index")
+	}
+	if found.ID != second.ID {
+		t.Fatalf("findCopilotAuth returned %q, want %q", found.ID, second.ID)
+	}
+}

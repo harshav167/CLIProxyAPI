@@ -135,6 +135,83 @@ func TestGetAvailableModelsReturnsClonedSupportedParameters(t *testing.T) {
 	}
 }
 
+func TestGetAvailableModelsIncludesThinkingMetadataForOpenAIAndClaudeCompatibleHandlers(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-openai", "openai", []*ModelInfo{{
+		ID:                  "gpt-test",
+		DisplayName:         "GPT Test",
+		ContextLength:       200000,
+		MaxCompletionTokens: 32000,
+		Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+	}})
+	r.RegisterClient("client-antigravity", "antigravity", []*ModelInfo{{
+		ID:                  "ag-test",
+		DisplayName:         "AG Test",
+		ContextLength:       128000,
+		MaxCompletionTokens: 16000,
+		Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
+	}})
+
+	openAIModels := r.GetAvailableModels("openai")
+	if len(openAIModels) != 2 {
+		t.Fatalf("expected two openai-visible models, got %d", len(openAIModels))
+	}
+
+	var openAIModel map[string]any
+	for _, model := range openAIModels {
+		if id, _ := model["id"].(string); id == "gpt-test" {
+			openAIModel = model
+			break
+		}
+	}
+	if openAIModel == nil {
+		t.Fatal("expected openai model in registry output")
+	}
+	if levels, ok := openAIModel["reasoning_effort_levels"].([]string); !ok || len(levels) != 3 || levels[0] != "low" {
+		t.Fatalf("expected reasoning_effort_levels in openai model, got %#v", openAIModel["reasoning_effort_levels"])
+	}
+	thinkingMap, ok := openAIModel["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected thinking map in openai model, got %#v", openAIModel["thinking"])
+	}
+	thinkingLevels, ok := thinkingMap["levels"].([]string)
+	if !ok || len(thinkingLevels) != 3 || thinkingLevels[2] != "high" {
+		t.Fatalf("expected thinking levels in openai model, got %#v", thinkingMap["levels"])
+	}
+
+	claudeModels := r.GetAvailableModels("antigravity")
+	if len(claudeModels) != 2 {
+		t.Fatalf("expected two claude-compatible models, got %d", len(claudeModels))
+	}
+
+	var antigravityModel map[string]any
+	for _, model := range claudeModels {
+		if id, _ := model["id"].(string); id == "ag-test" {
+			antigravityModel = model
+			break
+		}
+	}
+	if antigravityModel == nil {
+		t.Fatal("expected antigravity model in registry output")
+	}
+	if thinking, ok := antigravityModel["thinking"].(bool); !ok || !thinking {
+		t.Fatalf("expected thinking=true in claude-compatible model, got %#v", antigravityModel["thinking"])
+	}
+	extended, ok := antigravityModel["extended_thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected extended_thinking map, got %#v", antigravityModel["extended_thinking"])
+	}
+	if got, ok := extended["supported"].(bool); !ok || !got {
+		t.Fatalf("expected extended_thinking.supported=true, got %#v", extended["supported"])
+	}
+	if got, ok := antigravityModel["context_length"].(int); !ok || got != 128000 {
+		t.Fatalf("expected context_length=128000, got %#v", antigravityModel["context_length"])
+	}
+	if got, ok := antigravityModel["max_completion_tokens"].(int); !ok || got != 16000 {
+		t.Fatalf("expected max_completion_tokens=16000, got %#v", antigravityModel["max_completion_tokens"])
+	}
+}
+
 func TestLookupModelInfoReturnsCloneForStaticDefinitions(t *testing.T) {
 	first := LookupModelInfo("claude-sonnet-4-6")
 	if first == nil || first.Thinking == nil || len(first.Thinking.Levels) == 0 {

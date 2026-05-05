@@ -165,6 +165,39 @@ func TestConvertSystemRoleToDeveloper_NoInputField(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToCodex_EnablesStoreForPreviousResponseID(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"previous_response_id": "resp_123",
+		"input": [{"role":"user","content":"hello"}]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+
+	if got := gjson.GetBytes(output, "previous_response_id").String(); got != "resp_123" {
+		t.Fatalf("previous_response_id = %q, want %q", got, "resp_123")
+	}
+	if !gjson.GetBytes(output, "store").Bool() {
+		t.Fatalf("store = false, want true when previous_response_id is present: %s", string(output))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_LeavesStoreFalseWithoutPreviousResponseID(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"input": [{"role":"user","content":"hello"}]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+
+	if gjson.GetBytes(output, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id should not be added: %s", string(output))
+	}
+	if gjson.GetBytes(output, "store").Bool() {
+		t.Fatalf("store = true, want false without previous_response_id: %s", string(output))
+	}
+}
+
 // TestConvertOpenAIResponsesRequestToCodex_OriginalIssue tests the exact issue reported by the user
 func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 	// This is the exact input that was failing with "System messages are not allowed"
