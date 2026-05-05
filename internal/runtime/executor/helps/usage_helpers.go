@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -340,6 +341,30 @@ func ParseClaudeUsage(data []byte) usage.Detail {
 	}
 	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
 	return detail
+}
+
+// LogClaudeCacheUsage emits a structured info log line whenever a Claude
+// response carries cache_creation/cache_read counters. This is used to verify
+// org-wide prompt cache sharing across requests using the same API key.
+func LogClaudeCacheUsage(model string, usageNode gjson.Result) {
+	if !usageNode.Exists() {
+		return
+	}
+	input := usageNode.Get("input_tokens").Int()
+	cacheCreate := usageNode.Get("cache_creation_input_tokens").Int()
+	cacheRead := usageNode.Get("cache_read_input_tokens").Int()
+	output := usageNode.Get("output_tokens").Int()
+	if input == 0 && cacheCreate == 0 && cacheRead == 0 && output == 0 {
+		return
+	}
+	denom := input + cacheRead
+	var ratio float64
+	if denom > 0 {
+		ratio = float64(cacheRead) / float64(denom) * 100
+	}
+	total := input + cacheCreate + cacheRead + output
+	log.Infof("claude usage model=%s input=%d cache_create=%d cache_read=%d (%.1f%%) output=%d total=%d",
+		model, input, cacheCreate, cacheRead, ratio, output, total)
 }
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {

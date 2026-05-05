@@ -105,6 +105,55 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	if got := req.Header.Get("X-Stainless-Timeout"); got != "900" {
 		t.Fatalf("X-Stainless-Timeout = %q, want %q", got, "900")
 	}
+	betas := req.Header.Get("Anthropic-Beta")
+	if !strings.Contains(betas, "prompt-caching-scope-2026-01-05") {
+		t.Fatalf("Anthropic-Beta = %q, want prompt caching scope beta preserved", betas)
+	}
+}
+
+func TestApplyClaudeHeaders_PreservesPromptCachingBetaAndAddsContext1M(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	incoming := http.Header{}
+	incoming.Set("Anthropic-Beta", "structured-outputs-2025-12-15")
+	incoming.Set("X-CPA-CLAUDE-1M", "1")
+	req := newClaudeHeaderTestRequest(t, incoming)
+	auth := &cliproxyauth.Auth{
+		ID: "auth-betas",
+		Attributes: map[string]string{
+			"api_key": "key-betas",
+		},
+	}
+
+	applyClaudeHeaders(req, auth, "key-betas", false, nil, &config.Config{})
+
+	betas := req.Header.Get("Anthropic-Beta")
+	if !strings.Contains(betas, "prompt-caching-scope-2026-01-05") {
+		t.Fatalf("Anthropic-Beta = %q, want prompt caching scope beta preserved", betas)
+	}
+	if !strings.Contains(betas, "context-1m-2025-08-07") {
+		t.Fatalf("Anthropic-Beta = %q, want context 1m beta when X-CPA-CLAUDE-1M is present", betas)
+	}
+}
+
+func TestApplyClaudeHeaders_AddsContext1MFromAuthAttribute(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-gitlab-1m",
+		Attributes: map[string]string{
+			"api_key":                     "key-gitlab-1m",
+			"gitlab_duo_force_context_1m": "true",
+		},
+	}
+
+	applyClaudeHeaders(req, auth, "key-gitlab-1m", false, nil, &config.Config{})
+
+	betas := req.Header.Get("Anthropic-Beta")
+	if !strings.Contains(betas, "context-1m-2025-08-07") {
+		t.Fatalf("Anthropic-Beta = %q, want context 1m beta when auth attribute is set", betas)
+	}
 }
 
 func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
@@ -1863,11 +1912,14 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if blocks[1].Get("text").String() != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("blocks[1] should be agent block, got %q", blocks[1].Get("text").String())
 	}
+	if blocks[1].Get("cache_control.scope").String() != "global" {
+		t.Fatalf("blocks[1] should have cache_control.scope=global")
+	}
 	if blocks[2].Get("text").String() != expectedClaudeCodeStaticPrompt() {
 		t.Fatalf("blocks[2] should be static Claude Code prompt, got %q", blocks[2].Get("text").String())
 	}
-	if blocks[2].Get("cache_control").Exists() {
-		t.Fatalf("blocks[2] should not have cache_control, got %s", blocks[2].Get("cache_control").Raw)
+	if blocks[2].Get("cache_control.scope").String() != "global" {
+		t.Fatalf("blocks[2] should have cache_control.scope=global")
 	}
 
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("You are a helpful assistant.")+"hi" {

@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
+	"regexp"
 	"strings"
 	"time"
 
@@ -185,6 +187,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
 	body = normalizeCacheControlTTL(body)
 
+	// Strip OpenAI-isms that Anthropic upstream rejects (e.g. stream_options).
+	body = stripUnsupportedAnthropicFields(body)
+
 	// Extract betas from body and convert to header
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
@@ -286,10 +291,14 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		for _, line := range lines {
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
+				logClaudeUsageFromLine(baseModel, line)
 			}
 		}
 	} else {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
+		if usageNode := gjson.ParseBytes(data).Get("usage"); usageNode.Exists() {
+			helps.LogClaudeCacheUsage(baseModel, usageNode)
+		}
 	}
 	data = restoreClaudeOAuthToolNamesFromResponse(data, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 	var param any
@@ -359,6 +368,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
 	body = normalizeCacheControlTTL(body)
+
+	// Strip OpenAI-isms that Anthropic upstream rejects (e.g. stream_options).
+	body = stripUnsupportedAnthropicFields(body)
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -458,6 +470,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
+					logClaudeUsageFromLine(baseModel, line)
 				}
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				// Forward the line as-is to preserve SSE format
@@ -490,6 +503,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
+				logClaudeUsageFromLine(baseModel, line)
 			}
 			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			chunks := sdktranslator.TranslateStream(
@@ -723,6 +737,29 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	return auth, nil
 }
 
+// stripUnsupportedAnthropicFields removes top-level fields that the Anthropic
+// Messages API explicitly rejects with `invalid_request_error: Extra inputs
+// are not permitted` when the body is forwarded verbatim. These fields come
+// from clients that originally framed their request as OpenAI Chat Completions
+// (notably Cursor BYOK with a custom `claude-*` model entry, which sets
+// stream_options=...) and reach this executor via the openai→claude
+// translator.
+//
+// Verified failures stripped here:
+//   - stream_options: OpenAI-only field; Anthropic returns `invalid_request_error`
+//     "stream_options: Extra inputs are not permitted" (Cursor BYOK 2026-05-04).
+//
+// Add additional fields here as new clients surface new rejections — keep the
+// strip list narrow and document each entry with the exact upstream error.
+func stripUnsupportedAnthropicFields(body []byte) []byte {
+	for _, k := range []string{"stream_options"} {
+		if gjson.GetBytes(body, k).Exists() {
+			body, _ = sjson.DeleteBytes(body, k)
+		}
+	}
+	return body
+}
+
 // extractAndRemoveBetas extracts the "betas" array from the body and removes it.
 // Returns the extracted betas as a string slice and the modified body.
 func extractAndRemoveBetas(body []byte) ([]string, []byte) {
@@ -944,7 +981,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		deviceProfile = helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
 	}
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28,adaptive-thinking-2026-01-28"
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
 		if !strings.Contains(val, "oauth") {
@@ -954,9 +991,33 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if !strings.Contains(baseBetas, "interleaved-thinking") {
 		baseBetas += ",interleaved-thinking-2025-05-14"
 	}
+	if !strings.Contains(baseBetas, "prompt-caching-scope-2026-01-05") {
+		baseBetas += ",prompt-caching-scope-2026-01-05"
+	}
+	// adaptive-thinking-2026-01-28 is required for the `output_config.effort`
+	// field to be honored upstream. Without it, Anthropic silently ignores
+	// effort=high and returns no thinking_delta blocks even when adaptive
+	// thinking is requested. Force-preserve it the same way we do for
+	// prompt-caching-scope so client Anthropic-Beta overrides don't
+	// accidentally strip it.
+	if !strings.Contains(baseBetas, "adaptive-thinking-2026-01-28") {
+		baseBetas += ",adaptive-thinking-2026-01-28"
+	}
+
+	hasClaude1MHeader := false
+	if ginHeaders != nil {
+		if strings.TrimSpace(ginHeaders.Get(textproto.CanonicalMIMEHeaderKey("X-CPA-CLAUDE-1M"))) != "" {
+			hasClaude1MHeader = true
+		}
+	}
+	if !hasClaude1MHeader && auth != nil && auth.Attributes != nil {
+		if auth.Attributes["gitlab_duo_force_context_1m"] == "true" {
+			hasClaude1MHeader = true
+		}
+	}
 
 	// Merge extra betas from request body and request flags.
-	if len(extraBetas) > 0 {
+	if len(extraBetas) > 0 || hasClaude1MHeader {
 		existingSet := make(map[string]bool)
 		for _, b := range strings.Split(baseBetas, ",") {
 			betaName := strings.TrimSpace(b)
@@ -970,6 +1031,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 				baseBetas += "," + beta
 				existingSet[beta] = true
 			}
+		}
+		if hasClaude1MHeader && !existingSet["context-1m-2025-08-07"] {
+			baseBetas += ",context-1m-2025-08-07"
 		}
 	}
 	r.Header.Set("Anthropic-Beta", baseBetas)
@@ -1651,11 +1715,9 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
 	billingBlock := buildTextBlock(billingText, nil)
 
-	// Build system blocks matching real Claude Code structure.
-	// Important: Claude Code's internal cacheScope='org' does NOT serialize to
-	// scope='org' in the API request. Only scope='global' is sent explicitly.
-	// The system prompt prefix block is sent without cache_control.
-	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
+	// Build system blocks matching the maintained fork's cache-bearing Claude behavior.
+	globalCache := map[string]string{"scope": "global"}
+	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", globalCache)
 	staticPrompt := strings.Join([]string{
 		helps.ClaudeCodeIntro,
 		helps.ClaudeCodeSystem,
@@ -1663,7 +1725,7 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		helps.ClaudeCodeToneAndStyle,
 		helps.ClaudeCodeOutputEfficiency,
 	}, "\n\n")
-	staticBlock := buildTextBlock(staticPrompt, nil)
+	staticBlock := buildTextBlock(staticPrompt, globalCache)
 
 	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
@@ -1707,10 +1769,34 @@ func sanitizeForwardedSystemPrompt(text string) string {
 	if strings.TrimSpace(text) == "" {
 		return ""
 	}
-	return strings.TrimSpace(`Use the available tools when needed to help with software engineering tasks.
+	base := `Use the available tools when needed to help with software engineering tasks.
 Keep responses concise and focused on the user's request.
-Prefer acting on the user's task over describing product-specific workflows.`)
+Prefer acting on the user's task over describing product-specific workflows.`
+
+	var extracted []string
+	for _, m := range toolGuidanceTagRe.FindAllStringSubmatch(text, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		body := strings.TrimSpace(m[2])
+		if body == "" {
+			continue
+		}
+		body = identifierLeakageRe.ReplaceAllString(body, "[redacted]")
+		body = pathLeakageRe.ReplaceAllString(body, "[path]")
+		extracted = append(extracted, body)
+	}
+	if len(extracted) == 0 {
+		return strings.TrimSpace(base)
+	}
+	return strings.TrimSpace(base + "\n\n" + strings.Join(extracted, "\n\n"))
 }
+
+var toolGuidanceTagRe = regexp.MustCompile(`(?is)<(tool_calling|tool_use|tool_calls|tools_usage)>(.*?)</(?:tool_calling|tool_use|tool_calls|tools_usage)>`)
+
+var identifierLeakageRe = regexp.MustCompile(`(?i)\b(cursor|factory[- ]?cli|droid|ampcode|amp[- ]?cli|cline|aider|continue\.dev|windsurf|roocode|zed|copilot|github[- ]?copilot)\b`)
+
+var pathLeakageRe = regexp.MustCompile(`(?i)(/Users/[^\s"'\)]+|/home/[^\s"'\)]+|\$HOME[^\s"'\)]*|~/[^\s"'\)]+|C:\\[^\s"'\)]+)`)
 
 // buildTextBlock constructs a JSON text block object with proper escaping.
 // Uses sjson.SetBytes to handle multi-line text, quotes, and control characters.
@@ -1722,6 +1808,9 @@ func buildTextBlock(text string, cacheControl map[string]string) string {
 		// Build cache_control JSON manually to avoid sjson map marshaling issues.
 		// sjson.SetBytes with map[string]string may not produce expected structure.
 		cc := `{"type":"ephemeral"`
+		if scope, ok := cacheControl["scope"]; ok {
+			cc += fmt.Sprintf(`,"scope":"%s"`, scope)
+		}
 		if t, ok := cacheControl["ttl"]; ok {
 			cc += fmt.Sprintf(`,"ttl":"%s"`, t)
 		}
@@ -2230,7 +2319,7 @@ func injectMessagesCacheControl(payload []byte) []byte {
 		contentCount := int(content.Get("#").Int())
 		if contentCount > 0 {
 			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, contentCount-1)
-			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral"})
+			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral", "scope": "global"})
 			if err != nil {
 				log.Warnf("failed to inject cache_control into messages: %v", err)
 				return payload
@@ -2245,7 +2334,8 @@ func injectMessagesCacheControl(payload []byte) []byte {
 				"type": "text",
 				"text": text,
 				"cache_control": map[string]string{
-					"type": "ephemeral",
+					"type":  "ephemeral",
+					"scope": "global",
 				},
 			},
 		}
@@ -2289,7 +2379,7 @@ func injectToolsCacheControl(payload []byte) []byte {
 
 	// Add cache_control to the last tool
 	lastToolPath := fmt.Sprintf("tools.%d.cache_control", toolCount-1)
-	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral"})
+	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral", "scope": "global"})
 	if err != nil {
 		log.Warnf("failed to inject cache_control into tools array: %v", err)
 		return payload
@@ -2328,7 +2418,7 @@ func injectSystemCacheControl(payload []byte) []byte {
 
 		// Add cache_control to the last system element
 		lastSystemPath := fmt.Sprintf("system.%d.cache_control", count-1)
-		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral"})
+		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral", "scope": "global"})
 		if err != nil {
 			log.Warnf("failed to inject cache_control into system array: %v", err)
 			return payload
@@ -2343,7 +2433,8 @@ func injectSystemCacheControl(payload []byte) []byte {
 				"type": "text",
 				"text": text,
 				"cache_control": map[string]string{
-					"type": "ephemeral",
+					"type":  "ephemeral",
+					"scope": "global",
 				},
 			},
 		}
@@ -2379,4 +2470,21 @@ func ensureModelMaxTokens(body []byte, modelID string) []byte {
 	}
 
 	return body
+}
+
+// logClaudeUsageFromLine extracts the JSON payload from a Claude SSE line and
+// logs cache creation/read counters when present.
+func logClaudeUsageFromLine(model string, line []byte) {
+	payload := helps.JSONPayload(line)
+	if len(payload) == 0 {
+		return
+	}
+	usageNode := gjson.GetBytes(payload, "message.usage")
+	if !usageNode.Exists() {
+		usageNode = gjson.GetBytes(payload, "usage")
+	}
+	if !usageNode.Exists() {
+		return
+	}
+	helps.LogClaudeCacheUsage(model, usageNode)
 }

@@ -78,6 +78,510 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+// GetCodeBuddyModels returns the available models for CodeBuddy (Tencent).
+// These models are served through the copilot.tencent.com API.
+func GetCodeBuddyModels() []*ModelInfo {
+	now := int64(1748044800) // 2025-05-24
+	return []*ModelInfo{
+		{
+			ID:                  "auto",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "Auto",
+			Description:         "Automatic model selection via CodeBuddy",
+			ContextLength:       128000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "glm-5v-turbo",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "GLM-5v Turbo",
+			Description:         "GLM-5v Turbo via CodeBuddy",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "glm-5.1",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "GLM-5.1",
+			Description:         "GLM-5.1 via CodeBuddy",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "glm-5.0-turbo",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "GLM-5.0 Turbo",
+			Description:         "GLM-5.0 Turbo via CodeBuddy",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "glm-5.0",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "GLM-5.0",
+			Description:         "GLM-5.0 via CodeBuddy",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "glm-4.7",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "GLM-4.7",
+			Description:         "GLM-4.7 via CodeBuddy",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "minimax-m2.7",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "MiniMax M2.7",
+			Description:         "MiniMax M2.7 via CodeBuddy",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "kimi-k2.5",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "Kimi K2.5",
+			Description:         "Kimi K2.5 via CodeBuddy",
+			ContextLength:       256000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "kimi-k2-thinking",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "Kimi K2 Thinking",
+			Description:         "Kimi K2 Thinking via CodeBuddy",
+			ContextLength:       256000,
+			MaxCompletionTokens: 32768,
+			Thinking:            &ThinkingSupport{ZeroAllowed: true},
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "deepseek-v3-2-volc",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "tencent",
+			Type:                "codebuddy",
+			DisplayName:         "DeepSeek V3.2 (Volc)",
+			Description:         "DeepSeek V3.2 via CodeBuddy",
+			ContextLength:       128000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+	}
+}
+
+// defaultCopilotClaudeContextLength is the conservative prompt token limit for
+// Claude models accessed via the GitHub Copilot API. Individual accounts are
+// capped at 128K; business accounts at 168K. When the dynamic /models API fetch
+// succeeds, the real per-account limit overrides this value. This constant is
+// only used as a safe fallback.
+const defaultCopilotClaudeContextLength = 128000
+
+// GetGitHubCopilotModels returns the available models for GitHub Copilot.
+// These static definitions are used as a fallback when the dynamic /models fetch
+// is unavailable.
+func GetGitHubCopilotModels() []*ModelInfo {
+	now := int64(1732752000) // 2024-11-27
+	copilotClaudeEndpoints := []string{"/chat/completions", "/messages"}
+	gpt4oEntries := []struct {
+		ID          string
+		DisplayName string
+		Description string
+	}{
+		{ID: "gpt-4o-2024-11-20", DisplayName: "GPT-4o (2024-11-20)", Description: "OpenAI GPT-4o 2024-11-20 via GitHub Copilot"},
+		{ID: "gpt-4o-2024-08-06", DisplayName: "GPT-4o (2024-08-06)", Description: "OpenAI GPT-4o 2024-08-06 via GitHub Copilot"},
+		{ID: "gpt-4o-2024-05-13", DisplayName: "GPT-4o (2024-05-13)", Description: "OpenAI GPT-4o 2024-05-13 via GitHub Copilot"},
+		{ID: "gpt-4o", DisplayName: "GPT-4o", Description: "OpenAI GPT-4o via GitHub Copilot"},
+		{ID: "gpt-4-o-preview", DisplayName: "GPT-4-o Preview", Description: "OpenAI GPT-4-o Preview via GitHub Copilot"},
+	}
+
+	models := []*ModelInfo{
+		{
+			ID:                  "gpt-4.1",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-4.1",
+			Description:         "OpenAI GPT-4.1 via GitHub Copilot",
+			ContextLength:       128000,
+			MaxCompletionTokens: 16384,
+			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
+		},
+	}
+
+	for _, entry := range gpt4oEntries {
+		models = append(models, &ModelInfo{
+			ID:                  entry.ID,
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         entry.DisplayName,
+			Description:         entry.Description,
+			ContextLength:       128000,
+			MaxCompletionTokens: 16384,
+			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
+		})
+	}
+
+	return append(models, []*ModelInfo{
+		{
+			ID:                  "gpt-5",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5",
+			Description:         "OpenAI GPT-5 via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:                  "gpt-5-mini",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5 Mini",
+			Description:         "OpenAI GPT-5 Mini via GitHub Copilot",
+			ContextLength:       128000,
+			MaxCompletionTokens: 16384,
+			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:                  "gpt-5-codex",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5 Codex",
+			Description:         "OpenAI GPT-5 Codex via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:                  "gpt-5.1",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.1",
+			Description:         "OpenAI GPT-5.1 via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high"}},
+		},
+		{
+			ID:                  "gpt-5.1-codex",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.1 Codex",
+			Description:         "OpenAI GPT-5.1 Codex via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high"}},
+		},
+		{
+			ID:                  "gpt-5.1-codex-mini",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.1 Codex Mini",
+			Description:         "OpenAI GPT-5.1 Codex Mini via GitHub Copilot",
+			ContextLength:       128000,
+			MaxCompletionTokens: 16384,
+			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high"}},
+		},
+		{
+			ID:                  "gpt-5.1-codex-max",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.1 Codex Max",
+			Description:         "OpenAI GPT-5.1 Codex Max via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}},
+		},
+		{
+			ID:                  "gpt-5.2",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.2",
+			Description:         "OpenAI GPT-5.2 via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}},
+		},
+		{
+			ID:                  "gpt-5.2-codex",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.2 Codex",
+			Description:         "OpenAI GPT-5.2 Codex via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}},
+		},
+		{
+			ID:                  "gpt-5.3-codex",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.3 Codex",
+			Description:         "OpenAI GPT-5.3 Codex via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}},
+		},
+		{
+			ID:                  "gpt-5.4",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.4",
+			Description:         "OpenAI GPT-5.4 via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}},
+		},
+		{
+			ID:                  "gpt-5.4-mini",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "GPT-5.4 mini",
+			Description:         "OpenAI GPT-5.4 mini via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			SupportedEndpoints:  []string{"/responses"},
+			Thinking:            &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh"}},
+		},
+		{
+			ID:                  "claude-haiku-4.5",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Claude Haiku 4.5",
+			Description:         "Anthropic Claude Haiku 4.5 via GitHub Copilot",
+			ContextLength:       defaultCopilotClaudeContextLength,
+			MaxCompletionTokens: 64000,
+			SupportedEndpoints:  copilotClaudeEndpoints,
+		},
+		{
+			ID:                  "claude-opus-4.1",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Claude Opus 4.1",
+			Description:         "Anthropic Claude Opus 4.1 via GitHub Copilot",
+			ContextLength:       defaultCopilotClaudeContextLength,
+			MaxCompletionTokens: 32000,
+			SupportedEndpoints:  copilotClaudeEndpoints,
+		},
+		{
+			ID:                  "claude-opus-4.5",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Claude Opus 4.5",
+			Description:         "Anthropic Claude Opus 4.5 via GitHub Copilot",
+			ContextLength:       defaultCopilotClaudeContextLength,
+			MaxCompletionTokens: 64000,
+			SupportedEndpoints:  copilotClaudeEndpoints,
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:                  "claude-opus-4.6",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Claude Opus 4.6",
+			Description:         "Anthropic Claude Opus 4.6 via GitHub Copilot",
+			ContextLength:       defaultCopilotClaudeContextLength,
+			MaxCompletionTokens: 64000,
+			SupportedEndpoints:  copilotClaudeEndpoints,
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:                  "claude-sonnet-4",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Claude Sonnet 4",
+			Description:         "Anthropic Claude Sonnet 4 via GitHub Copilot",
+			ContextLength:       defaultCopilotClaudeContextLength,
+			MaxCompletionTokens: 64000,
+			SupportedEndpoints:  copilotClaudeEndpoints,
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:                  "claude-sonnet-4.5",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Claude Sonnet 4.5",
+			Description:         "Anthropic Claude Sonnet 4.5 via GitHub Copilot",
+			ContextLength:       defaultCopilotClaudeContextLength,
+			MaxCompletionTokens: 64000,
+			SupportedEndpoints:  copilotClaudeEndpoints,
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:                  "claude-sonnet-4.6",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Claude Sonnet 4.6",
+			Description:         "Anthropic Claude Sonnet 4.6 via GitHub Copilot",
+			ContextLength:       defaultCopilotClaudeContextLength,
+			MaxCompletionTokens: 64000,
+			SupportedEndpoints:  copilotClaudeEndpoints,
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+		},
+		{
+			ID:                  "gemini-2.5-pro",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Gemini 2.5 Pro",
+			Description:         "Google Gemini 2.5 Pro via GitHub Copilot",
+			ContextLength:       1048576,
+			MaxCompletionTokens: 65536,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "gemini-3-pro-preview",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Gemini 3 Pro (Preview)",
+			Description:         "Google Gemini 3 Pro Preview via GitHub Copilot",
+			ContextLength:       1048576,
+			MaxCompletionTokens: 65536,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "gemini-3.1-pro-preview",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Gemini 3.1 Pro (Preview)",
+			Description:         "Google Gemini 3.1 Pro Preview via GitHub Copilot",
+			ContextLength:       173000,
+			MaxCompletionTokens: 65536,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "gemini-3-flash-preview",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Gemini 3 Flash (Preview)",
+			Description:         "Google Gemini 3 Flash Preview via GitHub Copilot",
+			ContextLength:       173000,
+			MaxCompletionTokens: 65536,
+			SupportedEndpoints:  []string{"/chat/completions"},
+		},
+		{
+			ID:                  "grok-code-fast-1",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Grok Code Fast 1",
+			Description:         "xAI Grok Code Fast 1 via GitHub Copilot",
+			ContextLength:       128000,
+			MaxCompletionTokens: 16384,
+		},
+		{
+			ID:                  "oswe-vscode-prime",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Raptor mini (Preview)",
+			Description:         "Raptor mini via GitHub Copilot",
+			ContextLength:       128000,
+			MaxCompletionTokens: 16384,
+			SupportedEndpoints:  []string{"/chat/completions", "/responses"},
+		},
+	}...)
+}
+
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
@@ -167,6 +671,9 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - codex
 //   - kimi
 //   - antigravity
+//   - codebuddy
+//   - github-copilot
+//   - cursor
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	key := strings.ToLower(strings.TrimSpace(channel))
 	switch key {
@@ -186,8 +693,26 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetKimiModels()
 	case "antigravity":
 		return GetAntigravityModels()
+	case "codebuddy":
+		return GetCodeBuddyModels()
+	case "cursor":
+		return GetCursorModels()
+	case "github-copilot":
+		return GetGitHubCopilotModels()
 	default:
 		return nil
+	}
+}
+
+// GetCursorModels returns the fallback Cursor model definitions.
+func GetCursorModels() []*ModelInfo {
+	return []*ModelInfo{
+		{ID: "composer-2", Object: "model", OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer 2", ContextLength: 200000, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Max: 50000, DynamicAllowed: true}},
+		{ID: "claude-4-sonnet", Object: "model", OwnedBy: "cursor", Type: "cursor", DisplayName: "Claude 4 Sonnet", ContextLength: 200000, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Max: 50000, DynamicAllowed: true}},
+		{ID: "claude-3.5-sonnet", Object: "model", OwnedBy: "cursor", Type: "cursor", DisplayName: "Claude 3.5 Sonnet", ContextLength: 200000, MaxCompletionTokens: 8192},
+		{ID: "gpt-4o", Object: "model", OwnedBy: "cursor", Type: "cursor", DisplayName: "GPT-4o", ContextLength: 128000, MaxCompletionTokens: 16384},
+		{ID: "cursor-small", Object: "model", OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Small", ContextLength: 200000, MaxCompletionTokens: 64000},
+		{ID: "gemini-2.5-pro", Object: "model", OwnedBy: "cursor", Type: "cursor", DisplayName: "Gemini 2.5 Pro", ContextLength: 1000000, MaxCompletionTokens: 65536, Thinking: &ThinkingSupport{Max: 50000, DynamicAllowed: true}},
 	}
 }
 
@@ -208,6 +733,9 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.CodexPro,
 		data.Kimi,
 		data.Antigravity,
+		GetCodeBuddyModels(),
+		GetCursorModels(),
+		GetGitHubCopilotModels(),
 	}
 	for _, models := range allModels {
 		for _, m := range models {

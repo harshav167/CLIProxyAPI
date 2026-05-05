@@ -162,6 +162,29 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	// Stream configuration to enable or disable streaming responses
 	out, _ = sjson.SetBytes(out, "stream", stream)
 
+	// Pass through top-level `system` (Anthropic shape). Cursor BYOK with a
+	// custom claude-* model entry sends the system prompt as a top-level
+	// `system: [...]` array (or string) per Anthropic Messages API. The
+	// per-message `system` role handling below covers OpenAI shape, but
+	// without this passthrough Cursor's actual instructions never reach
+	// upstream — only the cloak-injected Claude Code identity prompt does,
+	// turning Claude into a generic chatbot that ignores Cursor's tool
+	// instructions.
+	if topSys := root.Get("system"); topSys.Exists() {
+		if topSys.IsArray() {
+			topSys.ForEach(func(_, blk gjson.Result) bool {
+				if blk.IsObject() {
+					out, _ = sjson.SetRawBytes(out, "system.-1", []byte(blk.Raw))
+				}
+				return true
+			})
+		} else if topSys.Type == gjson.String && topSys.String() != "" {
+			textPart := []byte(`{"type":"text","text":""}`)
+			textPart, _ = sjson.SetBytes(textPart, "text", topSys.String())
+			out, _ = sjson.SetRawBytes(out, "system.-1", textPart)
+		}
+	}
+
 	// Process messages and transform them to Claude Code format
 	if messages := root.Get("messages"); messages.Exists() && messages.IsArray() {
 		messageIndex := 0
@@ -274,7 +297,17 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		}
 	}
 
-	// Tools mapping: OpenAI tools -> Claude Code tools
+	// Tools mapping: OpenAI tools -> Claude Code tools.
+	//
+	// Some clients (notably Cursor BYOK with a custom `claude-*` model entry)
+	// send the request to /v1/chat/completions but use the native ANTHROPIC
+	// Messages API body shape — `tools[].name` + `input_schema` at top level
+	// rather than `{type:"function", function:{name, parameters}}`. The
+	// original loop only handled `tools[].type == "function"`, which silently
+	// skipped every Anthropic-shape tool definition; the post-loop
+	// `hasAnthropicTools=false` branch then deleted the whole tools array.
+	// Pass through Anthropic-shape tools verbatim alongside the existing
+	// OpenAI conversion so both client shapes work on the same endpoint.
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() && len(tools.Array()) > 0 {
 		hasAnthropicTools := false
 		tools.ForEach(func(_, tool gjson.Result) bool {
@@ -293,7 +326,18 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 
 				out, _ = sjson.SetRawBytes(out, "tools.-1", anthropicTool)
 				hasAnthropicTools = true
+				return true
 			}
+
+			// Anthropic-shape tool: top-level `name` (and usually `input_schema`),
+			// NO `function` wrapper. Forward the raw object — it is already in the
+			// shape Anthropic expects.
+			if tool.Get("name").Exists() && !tool.Get("function").Exists() {
+				out, _ = sjson.SetRawBytes(out, "tools.-1", []byte(tool.Raw))
+				hasAnthropicTools = true
+				return true
+			}
+
 			return true
 		})
 
@@ -302,7 +346,11 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		}
 	}
 
-	// Tool choice mapping from OpenAI format to Claude Code format
+	// Tool choice mapping. OpenAI shape: `"none"|"auto"|"required"` string OR
+	// `{type:"function", function:{name}}`. Anthropic shape (which Cursor BYOK
+	// sends to /v1/chat/completions): `{type:"auto"|"any"|"tool", name?}`.
+	// Pass Anthropic shape through verbatim so we don't drop the client's
+	// intent.
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
 		switch toolChoice.Type {
 		case gjson.String:
@@ -316,12 +364,16 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"any"}`))
 			}
 		case gjson.JSON:
-			// Specific tool choice mapping
-			if toolChoice.Get("type").String() == "function" {
+			tcType := toolChoice.Get("type").String()
+			if tcType == "function" {
+				// OpenAI specific tool choice mapping
 				functionName := toolChoice.Get("function.name").String()
 				toolChoiceJSON := []byte(`{"type":"tool","name":""}`)
 				toolChoiceJSON, _ = sjson.SetBytes(toolChoiceJSON, "name", functionName)
 				out, _ = sjson.SetRawBytes(out, "tool_choice", toolChoiceJSON)
+			} else if tcType == "auto" || tcType == "any" || tcType == "tool" {
+				// Anthropic-shape tool_choice — pass through verbatim.
+				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(toolChoice.Raw))
 			}
 		default:
 		}
@@ -354,6 +406,22 @@ func convertOpenAIContentPartToClaudePart(part gjson.Result) string {
 				return string(docPart)
 			}
 		}
+
+	// Anthropic-shape content blocks — pass through verbatim. These show up
+	// when the client sends multi-turn history in native Anthropic Messages
+	// API shape (notably Cursor BYOK with a custom claude-* model entry):
+	//   - "tool_use"    on assistant turns where the model invoked a tool
+	//   - "tool_result" on user turns carrying the tool execution output
+	//   - "image"       Anthropic-native image block (already in Claude shape)
+	//   - "thinking"    extended-thinking block from a prior turn's reasoning
+	//
+	// Without these, multi-turn conversations break with
+	//   `messages.N: user messages must have non-empty content`
+	// because the user turn carrying tool_result loses its only block, and
+	// the assistant turn loses the tool_use that the tool_result references —
+	// Anthropic then rejects the orphaned user message as empty.
+	case "tool_use", "tool_result", "image", "thinking", "redacted_thinking":
+		return part.Raw
 	}
 
 	return ""

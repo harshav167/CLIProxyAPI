@@ -111,8 +111,12 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", message)
 
-			case "function_call":
-				// Handle function call conversion to assistant message with tool_calls
+			case "function_call", "custom_tool_call":
+				// Both function_call (regular OpenAI function tools) AND
+				// custom_tool_call (Responses-API custom-grammar tools like
+				// ApplyPatch) become an assistant message with tool_calls in
+				// chat-completions shape. custom_tool_call uses `input` instead
+				// of `arguments` for the tool body — handle both.
 				assistantMessage := []byte(`{"role":"assistant","tool_calls":[]}`)
 
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
@@ -125,15 +129,23 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					toolCall, _ = sjson.SetBytes(toolCall, "function.name", name.String())
 				}
 
-				if arguments := item.Get("arguments"); arguments.Exists() {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments.String())
+				args := ""
+				if v := item.Get("arguments"); v.Exists() {
+					args = v.String()
+				} else if v := item.Get("input"); v.Exists() {
+					args = v.String()
 				}
+				toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", args)
 
 				assistantMessage, _ = sjson.SetRawBytes(assistantMessage, "tool_calls.0", toolCall)
 				out, _ = sjson.SetRawBytes(out, "messages.-1", assistantMessage)
 
-			case "function_call_output":
-				// Handle function call output conversion to tool message
+			case "function_call_output", "custom_tool_call_output":
+				// Tool result messages — both standard function tools AND custom
+				// tools (e.g. ApplyPatch error messages like "Failed to find
+				// context"). Without handling custom_tool_call_output, the
+				// model never sees ApplyPatch failure messages and loops trying
+				// the same patch repeatedly.
 				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
 
 				if callId := item.Get("call_id"); callId.Exists() {
@@ -141,7 +153,24 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				if output := item.Get("output"); output.Exists() {
-					toolMessage, _ = sjson.SetBytes(toolMessage, "content", output.String())
+					// custom_tool_call_output emits output as an array of
+					// {type:"input_text", text:"..."} blocks. function_call_output
+					// emits output as a plain string. Handle both: concatenate
+					// text from blocks if it's an array; otherwise treat as string.
+					var content string
+					if output.IsArray() {
+						var parts []string
+						output.ForEach(func(_, blk gjson.Result) bool {
+							if t := blk.Get("text"); t.Exists() && t.Type == gjson.String {
+								parts = append(parts, t.String())
+							}
+							return true
+						})
+						content = strings.Join(parts, "\n")
+					} else {
+						content = output.String()
+					}
+					toolMessage, _ = sjson.SetBytes(toolMessage, "content", content)
 				}
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", toolMessage)
@@ -161,12 +190,15 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		var chatCompletionsTools []interface{}
 
 		tools.ForEach(func(_, tool gjson.Result) bool {
-			// Built-in tools (e.g. {"type":"web_search"}) are already compatible with the Chat Completions schema.
-			// Only function tools need structural conversion because Chat Completions nests details under "function".
+			// Built-in tools (e.g. {"type":"web_search"}, {"type":"apply_patch"},
+			// {"type":"local_shell"}) MUST pass through verbatim. Cursor BYOK
+			// (native GPT mode) and other clients rely on these reaching the
+			// upstream Codex /responses endpoint, which is the canonical OpenAI
+			// API surface that supports them. Previously this branch silently
+			// dropped them — that broke apply_patch and friends entirely.
 			toolType := tool.Get("type").String()
 			if toolType != "" && toolType != "function" && tool.IsObject() {
-				// Almost all providers lack built-in tools, so we just ignore them.
-				// chatCompletionsTools = append(chatCompletionsTools, tool.Value())
+				chatCompletionsTools = append(chatCompletionsTools, gjson.ParseBytes([]byte(tool.Raw)).Value())
 				return true
 			}
 
@@ -208,6 +240,30 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// Convert tool_choice if present
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
 		out, _ = sjson.SetBytes(out, "tool_choice", toolChoice.String())
+	}
+
+	// Preserve prompt_cache_key through the responses→chat conversion so
+	// chat→codex can carry it upstream; otherwise Cursor BYOK falls back
+	// to content-prefix matching and loses warm-turn cache locality.
+	if v := root.Get("prompt_cache_key"); v.Exists() && v.String() != "" {
+		out, _ = sjson.SetBytes(out, "prompt_cache_key", v.String())
+	}
+	if v := root.Get("safety_identifier"); v.Exists() && v.String() != "" {
+		out, _ = sjson.SetBytes(out, "safety_identifier", v.String())
+	}
+	if v := root.Get("user"); v.Exists() && v.String() != "" {
+		out, _ = sjson.SetBytes(out, "user", v.String())
+	}
+	// Preserve service_tier through responses→chat conversion. Cursor's
+	// "Fast" mode toggle on Responses-shape input[] bodies (gpt-5.4/5.5
+	// BYOK path) sends `service_tier: "priority"` here. Without this
+	// passthrough the field is dropped at the very first hop of the
+	// Cursor→cli-proxy→Codex chain, so the downstream chat→codex
+	// translator's preserve-priority logic has nothing to forward.
+	// Forwarding only "priority" matches the codex/responses translator
+	// policy (which strips other tier values that Codex /responses rejects).
+	if v := root.Get("service_tier"); v.Exists() && v.String() == "priority" {
+		out, _ = sjson.SetBytes(out, "service_tier", "priority")
 	}
 
 	return out

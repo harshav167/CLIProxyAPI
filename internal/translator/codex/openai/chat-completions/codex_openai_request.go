@@ -7,7 +7,6 @@
 package chat_completions
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -63,72 +62,156 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	out, _ = sjson.SetBytes(out, "reasoning.summary", "auto")
 	out, _ = sjson.SetBytes(out, "include", []string{"reasoning.encrypted_content"})
 
+	// Preserve prompt_cache_key through the chat→Codex Responses conversion.
+	// Without this, the OpenAI handler's synthetic `cli-proxy-<hash>` injection
+	// (or a real client-supplied key from Cursor BYOK) is silently dropped
+	// here, and upstream falls back to content-based prefix hashing — which is
+	// fragile across turns and gives ~80% cache hits instead of 95%+.
+	// The bridge intentionally rejects `cli-proxy-` as a session key (collision
+	// safety), but upstream still uses it for content-based cache lookup.
+	if v := gjson.GetBytes(rawJSON, "prompt_cache_key"); v.Exists() && v.String() != "" {
+		out, _ = sjson.SetBytes(out, "prompt_cache_key", v.String())
+	}
+
+	// Preserve service_tier through the chat→Codex Responses conversion.
+	// Cursor's "Fast" mode toggle sends `service_tier: "priority"` in the
+	// chat-completions request body. Without this passthrough the field is
+	// dropped (translator builds a fresh template + only copies whitelisted
+	// fields), and upstream defaults to standard tier — so Fast mode silently
+	// no-ops on the cli-proxy path. Forwarding only "priority" matches the
+	// codex/openai/responses translator's policy which also only preserves
+	// "priority" and strips other tier values that Codex /responses rejects.
+	if v := gjson.GetBytes(rawJSON, "service_tier"); v.Exists() && v.String() == "priority" {
+		out, _ = sjson.SetBytes(out, "service_tier", "priority")
+	}
+
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
-	// Build tool name shortening map from original tools (if any)
-	originalToolNameMap := map[string]string{}
-	{
-		tools := gjson.GetBytes(rawJSON, "tools")
-		if tools.IsArray() && len(tools.Array()) > 0 {
-			// Collect original tool names
-			var names []string
-			arr := tools.Array()
-			for i := 0; i < len(arr); i++ {
-				t := arr[i]
-				if t.Get("type").String() == "function" {
-					fn := t.Get("function")
-					if fn.Exists() {
-						if v := fn.Get("name"); v.Exists() {
-							names = append(names, v.String())
-						}
+	// PASSTHROUGH 2026-05-02: removed defensive tool-name-shortening map.
+	// Clients that send tools (Cursor, Droid, Codex CLI) already use names
+	// within OpenAI's 64-char limit. Building a rewrite map for a no-op
+	// rewrite was pointless overhead AND risked breaking ApplyPatch and
+	// other native tools that depend on exact name preservation.
+
+	// Extract first system/developer message → top-level `instructions` field
+	// (matches Codex CLI's canonical request shape per codex-rs/core/src/client.rs
+	// build_responses_request: instructions is a top-level string, not an input
+	// message). Without this promotion, the system prompt sits in input[0] as
+	// role:"developer" — a different JSON byte structure that hashes to a
+	// different prompt-cache shard than Codex CLI's requests, AND gpt-5.5 is
+	// trained to give stronger weight to top-level `instructions` than to a
+	// developer-role message at position 0. We also skip emitting the promoted
+	// message in input[] below to avoid duplication.
+	messages := gjson.GetBytes(rawJSON, "messages")
+	systemPromotedIdx := -1
+	if messages.IsArray() {
+		arr := messages.Array()
+		for i := 0; i < len(arr); i++ {
+			m := arr[i]
+			if m.Get("role").String() != "system" {
+				continue
+			}
+			c := m.Get("content")
+			var text string
+			if c.Type == gjson.String {
+				text = c.String()
+			} else if c.IsArray() {
+				var parts []string
+				c.ForEach(func(_, blk gjson.Result) bool {
+					if t := blk.Get("text"); t.Exists() && t.Type == gjson.String {
+						parts = append(parts, t.String())
 					}
-				}
+					return true
+				})
+				text = strings.Join(parts, "\n")
 			}
-			if len(names) > 0 {
-				originalToolNameMap = buildShortNameMap(names)
+			if text != "" {
+				out, _ = sjson.SetBytes(out, "instructions", text)
+				systemPromotedIdx = i
 			}
+			break
 		}
 	}
 
-	// Extract system instructions from first system message (string or text object)
-	messages := gjson.GetBytes(rawJSON, "messages")
-	// if messages.IsArray() {
-	// 	arr := messages.Array()
-	// 	for i := 0; i < len(arr); i++ {
-	// 		m := arr[i]
-	// 		if m.Get("role").String() == "system" {
-	// 			c := m.Get("content")
-	// 			if c.Type == gjson.String {
-	// 				out, _ = sjson.SetBytes(out, "instructions", c.String())
-	// 			} else if c.IsObject() && c.Get("type").String() == "text" {
-	// 				out, _ = sjson.SetBytes(out, "instructions", c.Get("text").String())
-	// 			}
-	// 			break
-	// 		}
-	// 	}
-	// }
+	// Preserve Responses-native custom tool semantics across the
+	// responses->chat->responses transport path. The intermediate chat shape
+	// flattens both standard function tools and custom tools into
+	// assistant.tool_calls, so we need to recover which calls belong to tools
+	// originally registered as non-function Responses tools.
+	customToolNames := map[string]bool{}
+	customCallIDs := map[string]bool{}
+	if rt := gjson.GetBytes(rawJSON, "tools"); rt.IsArray() {
+		rt.ForEach(func(_, t gjson.Result) bool {
+			tt := t.Get("type").String()
+			if tt != "" && tt != "function" {
+				if n := t.Get("name").String(); n != "" {
+					customToolNames[n] = true
+				}
+			}
+			return true
+		})
+	}
+	if len(customToolNames) > 0 && messages.IsArray() {
+		messages.ForEach(func(_, m gjson.Result) bool {
+			if m.Get("role").String() != "assistant" {
+				return true
+			}
+			tcs := m.Get("tool_calls")
+			if !tcs.IsArray() {
+				return true
+			}
+			tcs.ForEach(func(_, tc gjson.Result) bool {
+				if customToolNames[tc.Get("function.name").String()] {
+					if id := tc.Get("id").String(); id != "" {
+						customCallIDs[id] = true
+					}
+				}
+				return true
+			})
+			return true
+		})
+	}
 
-	// Build input from messages, handling all message types including tool calls
+	// Build input from messages, handling all message types including tool calls.
+	// Skip the system message that was promoted to top-level `instructions` above
+	// to avoid duplicating it as a developer-role entry in input[].
 	out, _ = sjson.SetRawBytes(out, "input", []byte(`[]`))
 	if messages.IsArray() {
 		arr := messages.Array()
 		for i := 0; i < len(arr); i++ {
+			if i == systemPromotedIdx {
+				continue
+			}
 			m := arr[i]
 			role := m.Get("role").String()
 
 			switch role {
 			case "tool":
-				// Handle tool response messages as top-level function_call_output objects
+				// Preserve custom tool outputs as custom_tool_call_output so
+				// Responses-native tools keep their original transport shape.
 				toolCallID := m.Get("tool_call_id").String()
 				content := m.Get("content")
 
-				// Create function_call_output object
-				funcOutput := []byte(`{}`)
-				funcOutput, _ = sjson.SetBytes(funcOutput, "type", "function_call_output")
-				funcOutput, _ = sjson.SetBytes(funcOutput, "call_id", toolCallID)
-				funcOutput = setToolCallOutputContent(funcOutput, content)
-				out, _ = sjson.SetRawBytes(out, "input.-1", funcOutput)
+				// Branch on custom-tool tracking: tools registered as non-function in
+				// rawJSON.tools[] need to round-trip as custom_tool_call_output so
+				// Responses-native tools (e.g. ApplyPatch) keep their transport shape.
+				if customCallIDs[toolCallID] {
+					custOut := []byte(`{"type":"custom_tool_call_output","call_id":"","output":[]}`)
+					custOut, _ = sjson.SetBytes(custOut, "call_id", toolCallID)
+					blk := []byte(`{"type":"input_text","text":""}`)
+					blk, _ = sjson.SetBytes(blk, "text", content.String())
+					custOut, _ = sjson.SetRawBytes(custOut, "output.-1", blk)
+					out, _ = sjson.SetRawBytes(out, "input.-1", custOut)
+				} else {
+					// Standard function_call_output via upstream helper which handles
+					// string content, array content, image_url, and file parts.
+					funcOutput := []byte(`{}`)
+					funcOutput, _ = sjson.SetBytes(funcOutput, "type", "function_call_output")
+					funcOutput, _ = sjson.SetBytes(funcOutput, "call_id", toolCallID)
+					funcOutput = setToolCallOutputContent(funcOutput, content)
+					out, _ = sjson.SetRawBytes(out, "input.-1", funcOutput)
+				}
 
 			default:
 				// Handle regular messages
@@ -212,20 +295,24 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 						for j := 0; j < len(toolCallsArr); j++ {
 							tc := toolCallsArr[j]
 							if tc.Get("type").String() == "function" {
+								name := tc.Get("function.name").String()
+								args := tc.Get("function.arguments").String()
+								callID := tc.Get("id").String()
+								if customToolNames[name] {
+									custCall := []byte(`{"type":"custom_tool_call","call_id":"","name":"","input":""}`)
+									custCall, _ = sjson.SetBytes(custCall, "call_id", callID)
+									custCall, _ = sjson.SetBytes(custCall, "name", name)
+									custCall, _ = sjson.SetBytes(custCall, "input", args)
+									out, _ = sjson.SetRawBytes(out, "input.-1", custCall)
+									continue
+								}
+
 								// Create function_call as top-level object
 								funcCall := []byte(`{}`)
 								funcCall, _ = sjson.SetBytes(funcCall, "type", "function_call")
-								funcCall, _ = sjson.SetBytes(funcCall, "call_id", tc.Get("id").String())
-								{
-									name := tc.Get("function.name").String()
-									if short, ok := originalToolNameMap[name]; ok {
-										name = short
-									} else {
-										name = shortenNameIfNeeded(name)
-									}
-									funcCall, _ = sjson.SetBytes(funcCall, "name", name)
-								}
-								funcCall, _ = sjson.SetBytes(funcCall, "arguments", tc.Get("function.arguments").String())
+								funcCall, _ = sjson.SetBytes(funcCall, "call_id", callID)
+								funcCall, _ = sjson.SetBytes(funcCall, "name", name)
+								funcCall, _ = sjson.SetBytes(funcCall, "arguments", args)
 								out, _ = sjson.SetRawBytes(out, "input.-1", funcCall)
 							}
 						}
@@ -301,13 +388,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				fn := t.Get("function")
 				if fn.Exists() {
 					if v := fn.Get("name"); v.Exists() {
-						name := v.String()
-						if short, ok := originalToolNameMap[name]; ok {
-							name = short
-						} else {
-							name = shortenNameIfNeeded(name)
-						}
-						item, _ = sjson.SetBytes(item, "name", name)
+						item, _ = sjson.SetBytes(item, "name", v.String())
 					}
 					if v := fn.Get("description"); v.Exists() {
 						item, _ = sjson.SetBytes(item, "description", v.Value())
@@ -335,13 +416,6 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 			tcType := tc.Get("type").String()
 			if tcType == "function" {
 				name := tc.Get("function.name").String()
-				if name != "" {
-					if short, ok := originalToolNameMap[name]; ok {
-						name = short
-					} else {
-						name = shortenNameIfNeeded(name)
-					}
-				}
 				choice := []byte(`{}`)
 				choice, _ = sjson.SetBytes(choice, "type", "function")
 				if name != "" {
@@ -442,82 +516,4 @@ func appendToolOutputFallbackPart(output []byte, item gjson.Result) []byte {
 	part, _ = sjson.SetBytes(part, "text", text)
 	output, _ = sjson.SetRawBytes(output, "-1", part)
 	return output
-}
-
-// shortenNameIfNeeded applies the simple shortening rule for a single name.
-// If the name length exceeds 64, it will try to preserve the "mcp__" prefix and last segment.
-// Otherwise it truncates to 64 characters.
-func shortenNameIfNeeded(name string) string {
-	const limit = 64
-	if len(name) <= limit {
-		return name
-	}
-	if strings.HasPrefix(name, "mcp__") {
-		// Keep prefix and last segment after '__'
-		idx := strings.LastIndex(name, "__")
-		if idx > 0 {
-			candidate := "mcp__" + name[idx+2:]
-			if len(candidate) > limit {
-				return candidate[:limit]
-			}
-			return candidate
-		}
-	}
-	return name[:limit]
-}
-
-// buildShortNameMap generates unique short names (<=64) for the given list of names.
-// It preserves the "mcp__" prefix with the last segment when possible and ensures uniqueness
-// by appending suffixes like "~1", "~2" if needed.
-func buildShortNameMap(names []string) map[string]string {
-	const limit = 64
-	used := map[string]struct{}{}
-	m := map[string]string{}
-
-	baseCandidate := func(n string) string {
-		if len(n) <= limit {
-			return n
-		}
-		if strings.HasPrefix(n, "mcp__") {
-			idx := strings.LastIndex(n, "__")
-			if idx > 0 {
-				cand := "mcp__" + n[idx+2:]
-				if len(cand) > limit {
-					cand = cand[:limit]
-				}
-				return cand
-			}
-		}
-		return n[:limit]
-	}
-
-	makeUnique := func(cand string) string {
-		if _, ok := used[cand]; !ok {
-			return cand
-		}
-		base := cand
-		for i := 1; ; i++ {
-			suffix := "_" + strconv.Itoa(i)
-			allowed := limit - len(suffix)
-			if allowed < 0 {
-				allowed = 0
-			}
-			tmp := base
-			if len(tmp) > allowed {
-				tmp = tmp[:allowed]
-			}
-			tmp = tmp + suffix
-			if _, ok := used[tmp]; !ok {
-				return tmp
-			}
-		}
-	}
-
-	for _, n := range names {
-		cand := baseCandidate(n)
-		uniq := makeUnique(cand)
-		used[uniq] = struct{}{}
-		m[n] = uniq
-	}
-	return m
 }

@@ -25,7 +25,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
+	cursorauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/cursor"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
+	gitlabauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gitlab"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -47,7 +50,165 @@ const (
 	codexCallbackPort     = 1455
 	geminiCLIEndpoint     = "https://cloudcode-pa.googleapis.com"
 	geminiCLIVersion      = "v1internal"
+	gitLabLoginModeOAuth  = "oauth"
+	gitLabLoginModePAT    = "pat"
 )
+
+func gitLabBaseURLFromRequest(c *gin.Context) string {
+	if c != nil {
+		if raw := strings.TrimSpace(c.Query("base_url")); raw != "" {
+			return gitlabauth.NormalizeBaseURL(raw)
+		}
+	}
+	return gitlabauth.DefaultBaseURL
+}
+
+func buildGitLabAuthMetadata(baseURL, mode string, tokenResp *gitlabauth.TokenResponse, direct *gitlabauth.DirectAccessResponse) map[string]any {
+	metadata := map[string]any{
+		"type":                     "gitlab",
+		"auth_method":              strings.TrimSpace(mode),
+		"base_url":                 gitlabauth.NormalizeBaseURL(baseURL),
+		"last_refresh":             time.Now().UTC().Format(time.RFC3339),
+		"refresh_interval_seconds": 240,
+	}
+	if tokenResp != nil {
+		metadata["access_token"] = strings.TrimSpace(tokenResp.AccessToken)
+		if refreshToken := strings.TrimSpace(tokenResp.RefreshToken); refreshToken != "" {
+			metadata["refresh_token"] = refreshToken
+		}
+		if tokenType := strings.TrimSpace(tokenResp.TokenType); tokenType != "" {
+			metadata["token_type"] = tokenType
+		}
+		if scope := strings.TrimSpace(tokenResp.Scope); scope != "" {
+			metadata["scope"] = scope
+		}
+		if expiry := gitlabauth.TokenExpiry(time.Now(), tokenResp); !expiry.IsZero() {
+			metadata["oauth_expires_at"] = expiry.Format(time.RFC3339)
+		}
+	}
+	mergeGitLabDirectAccessMetadata(metadata, direct)
+	return metadata
+}
+
+func mergeGitLabDirectAccessMetadata(metadata map[string]any, direct *gitlabauth.DirectAccessResponse) {
+	if metadata == nil || direct == nil {
+		return
+	}
+	if base := strings.TrimSpace(direct.BaseURL); base != "" {
+		metadata["duo_gateway_base_url"] = base
+	}
+	if token := strings.TrimSpace(direct.Token); token != "" {
+		metadata["duo_gateway_token"] = token
+	}
+	if direct.ExpiresAt > 0 {
+		expiry := time.Unix(direct.ExpiresAt, 0).UTC()
+		metadata["duo_gateway_expires_at"] = expiry.Format(time.RFC3339)
+		now := time.Now().UTC()
+		if ttl := expiry.Sub(now); ttl > 0 {
+			interval := int(ttl.Seconds()) / 2
+			switch {
+			case interval < 60:
+				interval = 60
+			case interval > 240:
+				interval = 240
+			}
+			metadata["refresh_interval_seconds"] = interval
+		}
+	}
+	if len(direct.Headers) > 0 {
+		headers := make(map[string]string, len(direct.Headers))
+		for key, value := range direct.Headers {
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			if key == "" || value == "" {
+				continue
+			}
+			headers[key] = value
+		}
+		if len(headers) > 0 {
+			metadata["duo_gateway_headers"] = headers
+		}
+	}
+	if direct.ModelDetails != nil {
+		modelDetails := map[string]any{}
+		if provider := strings.TrimSpace(direct.ModelDetails.ModelProvider); provider != "" {
+			modelDetails["model_provider"] = provider
+			metadata["model_provider"] = provider
+		}
+		if model := strings.TrimSpace(direct.ModelDetails.ModelName); model != "" {
+			modelDetails["model_name"] = model
+			metadata["model_name"] = model
+		}
+		if len(modelDetails) > 0 {
+			metadata["model_details"] = modelDetails
+		}
+	}
+}
+
+func primaryGitLabEmail(user *gitlabauth.User) string {
+	if user == nil {
+		return ""
+	}
+	if value := strings.TrimSpace(user.Email); value != "" {
+		return value
+	}
+	return strings.TrimSpace(user.PublicEmail)
+}
+
+func gitLabAccountIdentifier(user *gitlabauth.User) string {
+	if user == nil {
+		return "user"
+	}
+	for _, value := range []string{user.Username, primaryGitLabEmail(user), user.Name} {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return "user"
+}
+
+func sanitizeGitLabFileName(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return "user"
+	}
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+			lastDash = false
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+			lastDash = false
+		case r == '-' || r == '_' || r == '.':
+			builder.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash {
+				builder.WriteRune('-')
+				lastDash = true
+			}
+		}
+	}
+	result := strings.Trim(builder.String(), "-")
+	if result == "" {
+		return "user"
+	}
+	return result
+}
+
+func maskGitLabToken(token string) string {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) <= 8 {
+		return trimmed
+	}
+	return trimmed[:4] + "..." + trimmed[len(trimmed)-4:]
+}
 
 type callbackForwarder struct {
 	provider string
@@ -1532,6 +1693,446 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) RequestGitLabToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	fmt.Println("Initializing GitLab Duo authentication...")
+
+	baseURL := gitLabBaseURLFromRequest(c)
+	clientID := strings.TrimSpace(c.Query("client_id"))
+	clientSecret := strings.TrimSpace(c.Query("client_secret"))
+	if clientID == "" {
+		clientID = strings.TrimSpace(os.Getenv("GITLAB_OAUTH_CLIENT_ID"))
+	}
+	if clientSecret == "" {
+		clientSecret = strings.TrimSpace(os.Getenv("GITLAB_OAUTH_CLIENT_SECRET"))
+	}
+	if clientID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "gitlab client_id is required"})
+		return
+	}
+
+	pkceCodes, err := gitlabauth.GeneratePKCECodes()
+	if err != nil {
+		log.Errorf("Failed to generate GitLab PKCE codes: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate PKCE codes"})
+		return
+	}
+
+	state, err := misc.GenerateRandomState()
+	if err != nil {
+		log.Errorf("Failed to generate GitLab state parameter: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
+		return
+	}
+
+	redirectURI := gitlabauth.RedirectURL(gitlabauth.DefaultCallbackPort)
+	authClient := gitlabauth.NewAuthClient(h.cfg)
+	authURL, err := authClient.GenerateAuthURL(baseURL, clientID, redirectURI, state, pkceCodes)
+	if err != nil {
+		log.Errorf("Failed to generate GitLab authorization URL: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		return
+	}
+
+	RegisterOAuthSession(state, "gitlab")
+
+	isWebUI := isWebUIRequest(c)
+	var forwarder *callbackForwarder
+	if isWebUI {
+		targetURL, errTarget := h.managementCallbackURL("/gitlab/callback")
+		if errTarget != nil {
+			log.WithError(errTarget).Error("failed to compute gitlab callback target")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
+			return
+		}
+		var errStart error
+		if forwarder, errStart = startCallbackForwarder(gitlabauth.DefaultCallbackPort, "gitlab", targetURL); errStart != nil {
+			log.WithError(errStart).Error("failed to start gitlab callback forwarder")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
+			return
+		}
+	}
+
+	go func() {
+		if isWebUI {
+			defer stopCallbackForwarderInstance(gitlabauth.DefaultCallbackPort, forwarder)
+		}
+
+		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-gitlab-%s.oauth", state))
+		deadline := time.Now().Add(5 * time.Minute)
+		var code string
+		for {
+			if !IsOAuthSessionPending(state, "gitlab") {
+				return
+			}
+			if time.Now().After(deadline) {
+				log.Error("gitlab oauth flow timed out")
+				SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
+				return
+			}
+			if data, errRead := os.ReadFile(waitFile); errRead == nil {
+				var payload map[string]string
+				_ = json.Unmarshal(data, &payload)
+				_ = os.Remove(waitFile)
+				if errStr := strings.TrimSpace(payload["error"]); errStr != "" {
+					SetOAuthSessionError(state, errStr)
+					return
+				}
+				if payloadState := strings.TrimSpace(payload["state"]); payloadState != state {
+					SetOAuthSessionError(state, "State code error")
+					return
+				}
+				code = strings.TrimSpace(payload["code"])
+				if code == "" {
+					SetOAuthSessionError(state, "Authorization code missing")
+					return
+				}
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		tokenResp, errExchange := authClient.ExchangeCodeForTokens(ctx, baseURL, clientID, clientSecret, redirectURI, code, pkceCodes.CodeVerifier)
+		if errExchange != nil {
+			log.Errorf("Failed to exchange GitLab authorization code: %v", errExchange)
+			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			return
+		}
+
+		user, errUser := authClient.GetCurrentUser(ctx, baseURL, tokenResp.AccessToken)
+		if errUser != nil {
+			log.Errorf("Failed to fetch GitLab user profile: %v", errUser)
+			SetOAuthSessionError(state, "Failed to fetch account profile")
+			return
+		}
+
+		direct, errDirect := authClient.FetchDirectAccess(ctx, baseURL, tokenResp.AccessToken)
+		if errDirect != nil {
+			log.Errorf("Failed to fetch GitLab direct access metadata: %v", errDirect)
+			SetOAuthSessionError(state, "Failed to fetch GitLab Duo access")
+			return
+		}
+
+		identifier := gitLabAccountIdentifier(user)
+		fileName := fmt.Sprintf("gitlab-%s.json", sanitizeGitLabFileName(identifier))
+		metadata := buildGitLabAuthMetadata(baseURL, gitLabLoginModeOAuth, tokenResp, direct)
+		metadata["auth_kind"] = "oauth"
+		metadata["oauth_client_id"] = clientID
+		metadata["username"] = strings.TrimSpace(user.Username)
+		if email := primaryGitLabEmail(user); email != "" {
+			metadata["email"] = email
+		}
+		metadata["name"] = strings.TrimSpace(user.Name)
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "gitlab",
+			FileName: fileName,
+			Label:    identifier,
+			Metadata: metadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save GitLab auth record: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("GitLab Duo authentication successful. Token saved to %s\n", savedPath)
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("gitlab")
+	}()
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) RequestGitLabPATToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	var payload struct {
+		BaseURL             string `json:"base_url"`
+		PersonalAccessToken string `json:"personal_access_token"`
+		Token               string `json:"token"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid body"})
+		return
+	}
+
+	baseURL := gitlabauth.NormalizeBaseURL(strings.TrimSpace(payload.BaseURL))
+	if baseURL == "" {
+		baseURL = gitLabBaseURLFromRequest(nil)
+	}
+	pat := strings.TrimSpace(payload.PersonalAccessToken)
+	if pat == "" {
+		pat = strings.TrimSpace(payload.Token)
+	}
+	if pat == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "personal_access_token is required"})
+		return
+	}
+
+	authClient := gitlabauth.NewAuthClient(h.cfg)
+
+	user, err := authClient.GetCurrentUser(ctx, baseURL, pat)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+	patSelf, err := authClient.GetPersonalAccessTokenSelf(ctx, baseURL, pat)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+	direct, err := authClient.FetchDirectAccess(ctx, baseURL, pat)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	identifier := gitLabAccountIdentifier(user)
+	fileName := fmt.Sprintf("gitlab-%s-pat.json", sanitizeGitLabFileName(identifier))
+	metadata := buildGitLabAuthMetadata(baseURL, gitLabLoginModePAT, nil, direct)
+	metadata["auth_kind"] = "personal_access_token"
+	metadata["personal_access_token"] = pat
+	metadata["token_preview"] = maskGitLabToken(pat)
+	metadata["username"] = strings.TrimSpace(user.Username)
+	if email := primaryGitLabEmail(user); email != "" {
+		metadata["email"] = email
+	}
+	metadata["name"] = strings.TrimSpace(user.Name)
+	if patSelf != nil {
+		if name := strings.TrimSpace(patSelf.Name); name != "" {
+			metadata["pat_name"] = name
+		}
+		if len(patSelf.Scopes) > 0 {
+			metadata["pat_scopes"] = append([]string(nil), patSelf.Scopes...)
+		}
+	}
+
+	record := &coreauth.Auth{
+		ID:       fileName,
+		Provider: "gitlab",
+		FileName: fileName,
+		Label:    identifier + " (PAT)",
+		Metadata: metadata,
+	}
+
+	savedPath, err := h.saveTokenRecord(ctx, record)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to save authentication tokens"})
+		return
+	}
+
+	response := gin.H{
+		"status":      "ok",
+		"saved_path":  savedPath,
+		"username":    strings.TrimSpace(user.Username),
+		"email":       primaryGitLabEmail(user),
+		"token_label": identifier,
+	}
+	if direct != nil && direct.ModelDetails != nil {
+		if provider := strings.TrimSpace(direct.ModelDetails.ModelProvider); provider != "" {
+			response["model_provider"] = provider
+		}
+		if model := strings.TrimSpace(direct.ModelDetails.ModelName); model != "" {
+			response["model_name"] = model
+		}
+	}
+
+	fmt.Printf("GitLab Duo PAT authentication successful. Token saved to %s\n", savedPath)
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *Handler) RequestGitHubToken(c *gin.Context) {
+	ctx := context.Background()
+
+	fmt.Println("Initializing GitHub Copilot authentication...")
+
+	state := fmt.Sprintf("gh-%d", time.Now().UnixNano())
+
+	deviceClient := copilot.NewDeviceFlowClient(h.cfg)
+	deviceCode, err := deviceClient.RequestDeviceCode(ctx)
+	if err != nil {
+		log.Errorf("Failed to initiate device flow: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initiate device flow"})
+		return
+	}
+
+	authURL := deviceCode.VerificationURI
+	userCode := deviceCode.UserCode
+
+	RegisterOAuthSession(state, "github-copilot")
+
+	go func() {
+		fmt.Printf("Please visit %s and enter code: %s\n", authURL, userCode)
+
+		tokenData, errPoll := deviceClient.PollForToken(ctx, deviceCode)
+		if errPoll != nil {
+			SetOAuthSessionError(state, "Authentication failed")
+			fmt.Printf("Authentication failed: %v\n", errPoll)
+			return
+		}
+
+		userInfo, errUser := deviceClient.FetchUserInfo(ctx, tokenData.AccessToken)
+		if errUser != nil {
+			log.Warnf("Failed to fetch user info: %v", errUser)
+		}
+
+		username := userInfo.Login
+		if username == "" {
+			username = "github-user"
+		}
+
+		tokenStorage := &copilot.CopilotTokenStorage{
+			AccessToken: tokenData.AccessToken,
+			TokenType:   tokenData.TokenType,
+			Scope:       tokenData.Scope,
+			Username:    username,
+			Email:       userInfo.Email,
+			Name:        userInfo.Name,
+			Type:        "github-copilot",
+		}
+
+		fileName := fmt.Sprintf("github-copilot-%s.json", username)
+		label := userInfo.Email
+		if label == "" {
+			label = username
+		}
+		metadata, errMeta := copilotTokenMetadata(tokenStorage)
+		if errMeta != nil {
+			log.Errorf("Failed to build token metadata: %v", errMeta)
+			SetOAuthSessionError(state, "Failed to build token metadata")
+			return
+		}
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "github-copilot",
+			Label:    label,
+			FileName: fileName,
+			Storage:  tokenStorage,
+			Metadata: metadata,
+		}
+
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use GitHub Copilot services through this CLI")
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("github-copilot")
+	}()
+
+	c.JSON(200, gin.H{
+		"status":           "ok",
+		"url":              authURL,
+		"state":            state,
+		"user_code":        userCode,
+		"verification_uri": authURL,
+	})
+}
+
+// RequestCursorToken initiates the Cursor PKCE authentication flow.
+// Supports multiple accounts via ?label=xxx query parameter.
+// The user opens the returned URL in a browser, logs in, and the server polls
+// until the authentication completes.
+func (h *Handler) RequestCursorToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	label := strings.TrimSpace(c.Query("label"))
+	log.Infof("Initializing Cursor authentication (label=%q)...", label)
+
+	authParams, err := cursorauth.GenerateAuthParams()
+	if err != nil {
+		log.Errorf("Failed to generate Cursor auth params: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate auth params"})
+		return
+	}
+
+	state := fmt.Sprintf("cur-%d", time.Now().UnixNano())
+	RegisterOAuthSession(state, "cursor")
+
+	go func() {
+		log.Info("Waiting for Cursor authentication...")
+		log.Infof("Open this URL in your browser: %s", authParams.LoginURL)
+
+		tokens, errPoll := cursorauth.PollForAuth(ctx, authParams.UUID, authParams.Verifier)
+		if errPoll != nil {
+			SetOAuthSessionError(state, "Authentication failed: "+errPoll.Error())
+			log.Errorf("Cursor authentication failed: %v", errPoll)
+			return
+		}
+
+		metadata := map[string]any{
+			"type":          "cursor",
+			"access_token":  tokens.AccessToken,
+			"refresh_token": tokens.RefreshToken,
+			"timestamp":     time.Now().UnixMilli(),
+		}
+
+		expiry := cursorauth.GetTokenExpiry(tokens.AccessToken)
+		if !expiry.IsZero() {
+			metadata["expires_at"] = expiry.Format(time.RFC3339)
+		}
+
+		sub := cursorauth.ParseJWTSub(tokens.AccessToken)
+		subHash := cursorauth.SubToShortHash(sub)
+		if sub != "" {
+			metadata["sub"] = sub
+		}
+
+		fileName := cursorauth.CredentialFileName(label, subHash)
+		displayLabel := cursorauth.DisplayLabel(label, subHash)
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "cursor",
+			FileName: fileName,
+			Label:    displayLabel,
+			Metadata: metadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save Cursor tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save tokens")
+			return
+		}
+
+		log.Infof("Cursor authentication successful! Token saved to %s", savedPath)
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("cursor")
+	}()
+
+	c.JSON(200, gin.H{
+		"status": "ok",
+		"url":    authParams.LoginURL,
+		"state":  state,
+	})
+}
+
+func copilotTokenMetadata(storage *copilot.CopilotTokenStorage) (map[string]any, error) {
+	if storage == nil {
+		return nil, fmt.Errorf("token storage is nil")
+	}
+	payload, errMarshal := json.Marshal(storage)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("marshal token storage: %w", errMarshal)
+	}
+	metadata := make(map[string]any)
+	if errUnmarshal := json.Unmarshal(payload, &metadata); errUnmarshal != nil {
+		return nil, fmt.Errorf("unmarshal token storage: %w", errUnmarshal)
+	}
+	return metadata, nil
 }
 
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
