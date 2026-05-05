@@ -178,6 +178,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		body = ensureCacheControl(body)
 	}
 
+	// Match Claude Code's prompt-anchor pattern by ensuring the LAST text block
+	// of the LAST user message has a cache_control with ttl:"1h". Without this
+	// anchor, the prefix upstream of the user prompt caches but the user prompt
+	// itself doesn't, so the next turn re-creates that segment. The enforcer
+	// below caps total breakpoints at 4 and prefers later breakpoints (last in
+	// evaluation order), so this addition is safe even when client already sent
+	// breakpoints.
+	body = ensureUserPromptCacheAnchor(body)
+
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
 	// (e.g. Amp CLI) already sends multiple cache_control blocks.
@@ -362,6 +371,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
+
+	// User-prompt cache anchor (see Execute path comment).
+	body = ensureUserPromptCacheAnchor(body)
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	body = enforceCacheControlLimit(body, 4)
@@ -981,7 +993,21 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		deviceProfile = helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
 	}
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28,adaptive-thinking-2026-01-28"
+	// Hybrid baseBetas — upstream's curated cross-client safe set, plus the
+	// real-Claude-Code betas that gate features WE actually inject:
+	//   - effort-2025-11-24            gates output_config.effort (payload.override
+	//                                  injects this on *-thinking-high aliases).
+	//   - cache-diagnosis-2026-04-07   surfaces split 5m/1h cache_creation
+	//                                  reporting, required to verify ttl:"1h"
+	//                                  cache_control injection works.
+	//   - context-1m-2025-08-07        unconditional default; Cursor BYOK
+	//                                  conversations exceed 200K tokens routinely
+	//                                  via cached prefix; cheap to enable always.
+	// Dropped redact-thinking-2026-02-12: that beta enables Anthropic's
+	// `redacted_thinking` content blocks (encrypted, hidden from user). Without
+	// it Anthropic emits plain `thinking` blocks for everything — more visible
+	// reasoning, no encrypted/hidden segments.
+	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,token-efficient-tools-2026-03-28,effort-2025-11-24,cache-diagnosis-2026-04-07,context-1m-2025-08-07"
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
 		if !strings.Contains(val, "oauth") {
@@ -994,14 +1020,22 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if !strings.Contains(baseBetas, "prompt-caching-scope-2026-01-05") {
 		baseBetas += ",prompt-caching-scope-2026-01-05"
 	}
-	// adaptive-thinking-2026-01-28 is required for the `output_config.effort`
-	// field to be honored upstream. Without it, Anthropic silently ignores
-	// effort=high and returns no thinking_delta blocks even when adaptive
-	// thinking is requested. Force-preserve it the same way we do for
-	// prompt-caching-scope so client Anthropic-Beta overrides don't
-	// accidentally strip it.
-	if !strings.Contains(baseBetas, "adaptive-thinking-2026-01-28") {
-		baseBetas += ",adaptive-thinking-2026-01-28"
+	// effort-2025-11-24 gates the output_config.effort field. payload.override
+	// injects this on *-thinking-high aliases. Force-preserve so client
+	// Anthropic-Beta overrides don't strip it.
+	if !strings.Contains(baseBetas, "effort-2025-11-24") {
+		baseBetas += ",effort-2025-11-24"
+	}
+	// cache-diagnosis-2026-04-07 surfaces split 5m/1h cache_creation reporting,
+	// required to verify ttl:"1h" injection works. Force-preserve.
+	if !strings.Contains(baseBetas, "cache-diagnosis-2026-04-07") {
+		baseBetas += ",cache-diagnosis-2026-04-07"
+	}
+	// context-1m-2025-08-07 enables 1M context window on Opus 4.7. Default-on
+	// because Cursor BYOK conversations exceed 200K tokens routinely (cached
+	// prefix). Force-preserve.
+	if !strings.Contains(baseBetas, "context-1m-2025-08-07") {
+		baseBetas += ",context-1m-2025-08-07"
 	}
 
 	hasClaude1MHeader := false
@@ -1716,7 +1750,15 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	billingBlock := buildTextBlock(billingText, nil)
 
 	// Build system blocks matching the maintained fork's cache-bearing Claude behavior.
-	globalCache := map[string]string{"scope": "global"}
+	// Extend cache TTL from default 5m → 1h on static system blocks (Claude Code
+	// identity + ClaudeCodeIntro/System/DoingTasks/Tone). These NEVER change across
+	// turns. Default 5m ephemeral evicts after any user gap >5min, forcing the next
+	// turn to cache_creation the entire prefix. With ttl:"1h" the cache survives
+	// realistic gap durations. normalizeCacheControlTTL enforces the constraint
+	// that 1h blocks must come BEFORE any 5m blocks in eval order
+	// (tools→system→messages); since these are the only 1h blocks and live in
+	// `system`, they precede any 5m blocks added later in `messages`.
+	globalCache := map[string]string{"scope": "global", "ttl": "1h"}
 	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", globalCache)
 	staticPrompt := strings.Join([]string{
 		helps.ClaudeCodeIntro,
@@ -1953,6 +1995,61 @@ func ensureCacheControl(payload []byte) []byte {
 	payload = injectMessagesCacheControl(payload)
 
 	return payload
+}
+
+// ensureUserPromptCacheAnchor mirrors Claude Code's prompt-anchor pattern:
+// the LAST text block of the LAST user message gets a cache_control with
+// ttl:"1h". Real Claude Code uses a tiny trailing block carrying this
+// breakpoint to cache the ENTIRE prefix up to and including the user prompt
+// at 1-hour TTL.
+//
+// Without this, even with system blocks cached at 1h, the user prompt segment
+// re-creates each turn — noticeable cost on long-context Cursor BYOK turns.
+//
+// Idempotent: if the LAST user message's LAST block already has cache_control,
+// we leave it alone (respect client intent). The downstream
+// enforceCacheControlLimit (max 4 breakpoints) will prune if this addition
+// pushes us over the cap; it preserves later breakpoints (last in evaluation
+// order), which keeps this prompt anchor by design.
+func ensureUserPromptCacheAnchor(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+	msgs := messages.Array()
+	lastUserIdx := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Get("role").String() == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+	if lastUserIdx < 0 {
+		return payload
+	}
+	content := msgs[lastUserIdx].Get("content")
+	if !content.IsArray() {
+		// String content can't carry cache_control — skip silently.
+		return payload
+	}
+	blocks := content.Array()
+	if len(blocks) == 0 {
+		return payload
+	}
+	lastBlockIdx := len(blocks) - 1
+	if blocks[lastBlockIdx].Get("cache_control").Exists() {
+		return payload
+	}
+	path := fmt.Sprintf("messages.%d.content.%d.cache_control", lastUserIdx, lastBlockIdx)
+	cc := []byte(`{"type":"ephemeral","ttl":"1h"}`)
+	updated, err := sjson.SetRawBytes(payload, path, cc)
+	if err != nil {
+		return payload
+	}
+	return updated
 }
 
 func countCacheControls(payload []byte) int {

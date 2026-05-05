@@ -114,6 +114,21 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		}
 	}
 
+	// Preserve `thinking.*` and `output_config.*` from the intake body when
+	// present. payload.override rules in cliproxy-config.yaml set these fields
+	// directly on the intake (thinking.type, thinking.display, output_config.effort,
+	// max_tokens, etc.) on *-thinking-* aliases for Cursor BYOK Claude. The
+	// translator above builds a fresh `out` template and only copies known
+	// OpenAI fields — without this it would silently drop override-injected
+	// Anthropic-specific fields, leaving Anthropic to default-decide adaptive
+	// behavior. Mirrors the prompt_cache_key / service_tier preserve patterns.
+	if v := root.Get("thinking"); v.Exists() && v.IsObject() {
+		out, _ = sjson.SetRawBytes(out, "thinking", []byte(v.Raw))
+	}
+	if v := root.Get("output_config"); v.Exists() && v.IsObject() {
+		out, _ = sjson.SetRawBytes(out, "output_config", []byte(v.Raw))
+	}
+
 	// Helper for generating tool call IDs in the form: toolu_<alphanum>
 	// This ensures unique identifiers for tool calls in the Claude Code format
 	genToolCallID := func() string {
