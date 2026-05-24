@@ -181,3 +181,148 @@ Classification:
   rather than indicating an incomplete migration.
 - `kiro` remains intentionally deferred and is not part of the locally-ready
   migrated state recorded by this ledger.
+
+## Phase 2 Rebase Resume (2026-05-22)
+
+The interactive rebase started by the original migration pass was paused with 9
+unresolved conflict files and 2 commits remaining in the queue
+(`b3f21f1b` Claude prompt-cache anchor + beta/thinking parity, `83a9426a`
+redisqueue). This addendum records the resumption and resolution.
+
+Observed pre-resume state:
+
+- `interactive rebase in progress; onto 3a9fb378`
+- last command done: `pick 577f7454 # feat(migration): port cpapi-plus
+  product-bearing parity onto upstream main`
+- 9 unresolved conflict files, all `both modified`:
+  - `cmd/server/main.go`
+  - `internal/api/handlers/management/auth_files.go`
+  - `internal/api/handlers/management/handler.go`
+  - `internal/api/handlers/management/usage.go`
+  - `internal/api/server.go`
+  - `internal/runtime/executor/helps/usage_helpers.go`
+  - `internal/translator/openai/openai/responses/openai_openai-responses_request.go`
+  - `sdk/api/handlers/openai/openai_handlers.go`
+  - `sdk/api/handlers/openai/openai_responses_handlers.go`
+
+Conflict resolution philosophy applied:
+
+- Kept upstream's v7 module path (`router-for-me/CLIProxyAPI/v7`) and merged
+  upstream's new imports (`internal/home`) with the migration commit's added
+  imports (`internal/usage`, codex/cursor/copilot/gitlab auth packages, etc.).
+- For semantic conflicts in `openai_openai-responses_request.go` (the
+  `function_call` vs `custom_tool_call` case), kept BOTH sides: upstream's
+  `pendingToolCalls` buffering correctness AND the migration's
+  `custom_tool_call` case label + `arguments`/`input` dual-read for ApplyPatch
+  support.
+- Performed a bulk `v6 -> v7` import rewrite across the 24 migration-added
+  files (`internal/auth/{codebuddy,copilot,cursor,gitlab}/*`,
+  `internal/runtime/executor/{codebuddy,cursor,github_copilot,gitlab,compat}_executor.go`,
+  `internal/cmd/{codebuddy,cursor,github_copilot,gitlab}_login.go`,
+  `internal/usage/*`, `sdk/api/handlers/openai/endpoint_compat.go`,
+  `sdk/auth/{codebuddy,cursor,github_copilot,gitlab}.go`,
+  `internal/api/handlers/management/auth_files_gitlab_test.go`).
+- Resolved `go.mod` / `go.sum` conflicts during the `83a9426a` (redisqueue)
+  pick by accepting the redisqueue side and running `go mod tidy` to
+  reconcile direct vs indirect placement.
+
+Post-rebase verification:
+
+- `gofmt -l .`: clean.
+- `go build -o /tmp/clip-newfork ./cmd/server`: success.
+- `go test ./internal/translator/... ./internal/runtime/executor/...
+  ./sdk/api/handlers/... ./sdk/cliproxy/auth/...`:
+  passing, modulo the two pre-existing Antigravity baseline failures already
+  documented above.
+
+Post-rebase HEAD:
+
+- `f5f3353d feat(redisqueue): add optional external Redis/Valkey backend`
+- `bd49018a feat(claude): port cpapi-plus prompt-cache anchor + beta/thinking parity`
+- `4d9e4445 feat(migration): port cpapi-plus product-bearing parity onto upstream main`
+- `3a9fb378 fix(home): implement home dispatch headers and enhance Gemini model handling` (upstream)
+
+## Phase 2 Delta Check: cpapi-plus Commits Since Ledger Baseline
+
+`cpapi-plus@1d992f60` was the original migration source baseline. cpapi-plus
+HEAD is currently `b5cd8425` (`fix cursor gpt http response routing`),
+representing 15 commits of additional product-bearing work since the baseline.
+These commits' end-state diffs are not fully captured in the migration commit
+`4d9e4445` — the new fork is dormant and a follow-up migration pass is needed.
+
+Cpapi-plus commits between `1d992f60..b5cd8425` (oldest -> newest):
+
+- `3a144e60` fix(codex): preserve custom_tool_call type tag through chat->codex translator
+- `8160c638` feat(claude+cursor): Phase 25.5/26/27 — Cursor BYOK Claude path repair, Fast-mode service_tier, cache TTL/effort/diagnosis betas
+- `ece25714` fix(cursor): preserve raw system prompt identity
+- `479d929e` fix(cliproxy): honor proxy environment for transports
+- `7a259a78` chore: snapshot current service changes
+- `6e766df3` fix(codex): preserve cursor responses request semantics
+- `6a94c8de` feat: add cursor gpt prompt upgrade flag
+- `b0bbe381` chore: snapshot current service fixes
+- `2591c258` fix: balance cursor prompt upgrade modes
+- `dc3726e5` fix: require concrete edit authorization in cursor prompt
+- `95298e25` checkpoint current go changes
+- `7491fff2` checkpoint current new go files
+- `31125531` add cursor execution integrity prompt contract
+- `423ccde1` Promote Claude stream errors before translation
+- `b5cd8425` fix cursor gpt http response routing
+
+Code-level deltas observed via filesystem diff (cpapi-plus vs new fork) that
+are clearly missing from the migration:
+
+1. Files that exist in cpapi-plus but NOT in the new fork (pre-Phase-1
+   product work):
+   - `internal/runtime/executor/codex_http_ws_bridge.go` + test
+   - `internal/runtime/executor/codex_remote_compact.go` + test
+   - `internal/runtime/executor/helps/cursor_system_prompt.go` + test
+     (contains the GPT-5.4 execution-integrity contract patches used by the
+     openai handler family; `RewriteCursorSystemPromptIdentityAndIntegrity`
+     and the persistence/integrity prompt patches.)
+
+2. Cpapi-plus Phase 1 thermo-fixup additions (committed in cpapi-plus AFTER
+   baseline; landing pending in cpapi-plus). These need to be re-applied
+   in the new fork:
+   - G2 fix in `internal/runtime/executor/xai_executor.go` + new test
+     `xai_executor_test.go`.
+   - C3 named constant + `claude_stream_errors.go` extraction.
+   - G3 hasModelProvider helper collapse in `sdk/api/handlers/openai/`.
+   - G7 `helps.ExecutionSessionIDFromOptions` move +
+     `helps/session_id_cache.go` export.
+   - C4 docstring audit in `helps/cursor_system_prompt.go`.
+   - G1 session-id symmetry on non-stream chat in `openai_handlers.go` +
+     regression test.
+   - C1 Claude beta-header merge regression test in `claude_executor_test.go`.
+   - C2 Opus 4.7 thinking-parity boundary test in `claude_executor_test.go`.
+   - G5 Codex translator `service_tier`/`prompt_cache_key` regression test.
+   - G4 `openai_handlers.go` decomposition into 4 sibling files:
+     `openai_session_id.go`, `openai_provider_routing.go`,
+     `openai_responses_bridge.go`, `openai_model_metadata.go`.
+   - C5 `claude_executor.go` decomposition into 5 sibling files:
+     `claude_stream_errors.go` (executor pkg),
+     `helps/claude_oauth_tool_names.go`, `helps/claude_cache_control.go`,
+     `helps/claude_billing.go`, `helps/claude_cursor_system_prompt.go`.
+
+Explicit deferral:
+
+- G6 (xai executor verbatim port from upstream's 940-LoC implementation) is
+  not yet applied. The current xai executor in the new fork is the
+  cpapi-plus 511-LoC custom version (with G2 still missing here). The plan
+  designated this for a follow-up commit on top of the rebase, not as part
+  of the rebase itself.
+
+Recommended next action when the new fork is brought online:
+
+1. Cherry-pick or hand-port the 3 missing product files
+   (`codex_http_ws_bridge.go`, `codex_remote_compact.go`,
+   `helps/cursor_system_prompt.go`) from cpapi-plus first — these are
+   product behavior the migration commit missed.
+2. Port the Phase 1 thermo-fixup work from cpapi-plus into the new fork
+   (the same 11 items listed above, against the v7 module paths).
+3. Then land G6 (xai verbatim from upstream) on top.
+
+This addendum was authored after Phase 2 rebase resume on 2026-05-22 and
+records the actual post-rebase state, not the pre-Phase-1 plan-anticipated
+state. The new fork remains dormant (not in production); cpapi-plus@b5cd8425
+plus its Phase 1 thermo-fixup working tree remains the production source of
+truth until the deltas above are reconciled.
