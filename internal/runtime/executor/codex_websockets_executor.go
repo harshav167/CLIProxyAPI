@@ -1911,12 +1911,14 @@ func authIDForBridge(auth *cliproxyauth.Auth) string {
 //
 // For non-websocket downstream requests, it always uses the legacy HTTP implementation.
 type CodexAutoExecutor struct {
+	cfg      *config.Config
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 	return &CodexAutoExecutor{
+		cfg:      cfg,
 		httpExec: NewCodexExecutor(cfg),
 		wsExec:   NewCodexWebsocketsExecutor(cfg),
 	}
@@ -1942,8 +1944,13 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
+	if forcePassthroughFromContext(ctx) {
+		return e.httpExec.Execute(ctx, auth, req, opts)
+	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.Execute(ctx, auth, req, opts)
+		if sk := helps.ExecutionSessionIDFromOptions(opts); sk == "" || !e.isWSDisabled(sk) {
+			return e.wsExec.Execute(ctx, auth, req, opts)
+		}
 	}
 	return e.httpExec.Execute(ctx, auth, req, opts)
 }
@@ -1952,10 +1959,264 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
+	if forcePassthroughFromContext(ctx) {
+		return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
+		if sk := helps.ExecutionSessionIDFromOptions(opts); sk == "" || !e.isWSDisabled(sk) {
+			return e.wsExec.ExecuteStream(ctx, auth, req, opts)
+		}
+	}
+	chainingEnabled := e.cfg != nil && e.cfg.CodexResponseChaining.Enabled
+	if chainingEnabled && codexWebsocketsEnabled(auth) {
+		if result, err, ok := e.bridgedExecuteStream(ctx, auth, req, opts); ok {
+			return result, err
+		}
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
+}
+
+func (e *CodexAutoExecutor) bridgedExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error, bool) {
+	sessionKey := bridgeSessionKey(opts, req.Payload)
+	if sessionKey == "" {
+		return nil, nil, false
+	}
+	if e.isWSDisabled(sessionKey) {
+		return nil, nil, false
+	}
+
+	wsOpts := bridgeOpts(opts, sessionKey)
+	bridge := getHTTPWSBridge()
+	model := gjson.GetBytes(req.Payload, "model").String()
+	if model == "" {
+		model = req.Model
+	}
+	authID := authIDForBridge(auth)
+
+	turn := e.snapshotBridgeTurn(sessionKey, bridge)
+	result, err, sentDelta := e.doBridgedStream(ctx, auth, req, wsOpts, sessionKey, bridge, authID)
+	turn.finalize(e.connGeneration(sessionKey), sentDelta, currentInputCount(req.Payload))
+
+	if err != nil || turn.reconnectedDelta {
+		if isUpgradeRequiredError(err) {
+			e.disableWS(sessionKey)
+			bridge.Reset(sessionKey)
+			return nil, nil, false
+		}
+		if turn.sentDelta {
+			if turn.reconnectedDelta {
+				log.Infof("codex http-ws bridge: WS reconnected during delta session=%s (gen %d→%d), retrying full", sessionKey, turn.genBefore, turn.genAfter)
+			} else {
+				log.Infof("codex http-ws bridge: delta failed session=%s, retrying full: %v", sessionKey, err)
+			}
+			if result != nil && result.Chunks != nil {
+				go func(ch <-chan cliproxyexecutor.StreamChunk) {
+					for range ch {
+					}
+				}(result.Chunks)
+			}
+			bridge.Reset(sessionKey)
+			turn = e.snapshotBridgeTurn(sessionKey, bridge)
+			var retrySentDelta bool
+			result, err, retrySentDelta = e.doBridgedStream(ctx, auth, req, wsOpts, sessionKey, bridge, authID)
+			turn.finalize(e.connGeneration(sessionKey), retrySentDelta, currentInputCount(req.Payload))
+			if err != nil {
+				log.Warnf("codex http-ws bridge: full retry also failed session=%s, falling back to HTTP: %v", sessionKey, err)
+				bridge.Reset(sessionKey)
+				return nil, nil, false
+			}
+		} else {
+			log.Warnf("codex http-ws bridge: ExecuteStream failed session=%s, falling back to HTTP: %v", sessionKey, err)
+			bridge.Reset(sessionKey)
+			return nil, nil, false
+		}
+	}
+
+	telemetry := turn.telemetry(e.connGeneration(sessionKey))
+	result = e.wrapBridgedStreamForCapture(sessionKey, model, authID, req.Payload, result, telemetry)
+	return result, nil, true
+}
+
+type bridgeTurn struct {
+	baselineBefore   int
+	gap              time.Duration
+	firstTurn        bool
+	genBefore        uint64
+	genAfter         uint64
+	sentDelta        bool
+	reconnectedDelta bool
+	deltaItems       int
+}
+
+func (e *CodexAutoExecutor) snapshotBridgeTurn(sessionKey string, bridge *HTTPToWSBridge) bridgeTurn {
+	gap, firstTurn := bridge.GapSinceLastCompleted(sessionKey)
+	return bridgeTurn{
+		baselineBefore: bridge.BaselineCount(sessionKey),
+		gap:            gap,
+		firstTurn:      firstTurn,
+		genBefore:      e.connGeneration(sessionKey),
+	}
+}
+
+func (t *bridgeTurn) finalize(genAfter uint64, sentDelta bool, currentInputCount int) {
+	t.genAfter = genAfter
+	t.sentDelta = sentDelta
+	t.reconnectedDelta = sentDelta && genAfter != t.genBefore
+	if sentDelta && currentInputCount > t.baselineBefore {
+		t.deltaItems = currentInputCount - t.baselineBefore
+	}
+}
+
+type bridgeTurnTelemetry struct {
+	sentDelta      bool
+	reconnected    bool
+	connGen        uint64
+	gapSinceLast   time.Duration
+	firstTurn      bool
+	baselineBefore int
+	deltaItems     int
+}
+
+func (t bridgeTurn) telemetry(currentConnGen uint64) bridgeTurnTelemetry {
+	return bridgeTurnTelemetry{
+		sentDelta:      t.sentDelta,
+		reconnected:    t.reconnectedDelta,
+		connGen:        currentConnGen,
+		gapSinceLast:   t.gap,
+		firstTurn:      t.firstTurn,
+		baselineBefore: t.baselineBefore,
+		deltaItems:     t.deltaItems,
+	}
+}
+
+func currentInputCount(payload []byte) int {
+	if inputArr := gjson.GetBytes(payload, "input"); inputArr.IsArray() {
+		return len(inputArr.Array())
+	}
+	return 0
+}
+
+func (e *CodexAutoExecutor) doBridgedStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, wsOpts cliproxyexecutor.Options, sessionKey string, bridge *HTTPToWSBridge, authID string) (*cliproxyexecutor.StreamResult, error, bool) {
+	payload := req.Payload
+	wsPayload := stripHTTPOnlyFields(bytes.Clone(payload))
+
+	deltaJSON, prevRespID := bridge.ComputeDelta(sessionKey, payload, authID)
+	sentDelta := false
+	if deltaJSON != nil && prevRespID != "" {
+		wsPayload, _ = sjson.SetRawBytes(wsPayload, "input", deltaJSON)
+		wsPayload, _ = sjson.SetBytes(wsPayload, "previous_response_id", prevRespID)
+		sentDelta = true
+		log.Debugf("codex http-ws bridge: ExecuteStream delta session=%s prev_resp=%s", sessionKey, prevRespID[:minInt(20, len(prevRespID))])
+	} else {
+		log.Debugf("codex http-ws bridge: ExecuteStream full (turn 1) session=%s", sessionKey)
+	}
+
+	wsReq := req
+	wsReq.Payload = wsPayload
+	result, err := e.wsExec.ExecuteStream(ctx, auth, wsReq, wsOpts)
+	return result, err, sentDelta
+}
+
+func (e *CodexAutoExecutor) wrapBridgedStreamForCapture(sessionKey, model, authID string, requestPayload []byte, result *cliproxyexecutor.StreamResult, telemetry bridgeTurnTelemetry) *cliproxyexecutor.StreamResult {
+	if result != nil && result.Headers != nil {
+		primary := result.Headers.Get("x-codex-primary-used-percent")
+		secondary := result.Headers.Get("x-codex-secondary-primary-used-percent")
+		if primary != "" || secondary != "" {
+			log.Infof("codex http-ws bridge: quota session=%s primary_used=%s%% weekly_used=%s%%", sessionKey, primary, secondary)
+		}
+	}
+
+	wrappedCh := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(wrappedCh)
+		outputItemsByIndex := map[int64][]byte{}
+		outputItemsFallback := [][]byte{}
+		for chunk := range result.Chunks {
+			wrappedCh <- chunk
+			if len(chunk.Payload) == 0 {
+				continue
+			}
+			for _, line := range bytes.Split(chunk.Payload, []byte("\n")) {
+				if !bytes.HasPrefix(line, dataTag) {
+					continue
+				}
+				eventData := bytes.TrimSpace(line[5:])
+				eventType := gjson.GetBytes(eventData, "type").String()
+
+				if eventType == "response.output_item.done" {
+					outputItemsFallback = collectOutputItem(eventData, outputItemsByIndex, outputItemsFallback)
+				}
+
+				if eventType == "response.created" {
+					ts := gjson.GetBytes(eventData, "response.turn_state").String()
+					if ts == "" {
+						ts = gjson.GetBytes(eventData, "turn_state").String()
+					}
+					if ts != "" {
+						if wsSess := e.getWSSession(sessionKey); wsSess != nil {
+							wsSess.connMu.Lock()
+							if wsSess.turnState != ts {
+								wsSess.turnState = ts
+								log.Debugf("codex http-ws bridge: captured turn_state from response.created for session %s", sessionKey)
+							}
+							wsSess.connMu.Unlock()
+						}
+					}
+				}
+
+				if eventType == "response.completed" || eventType == "response.done" {
+					respID := extractResponseIDFromSSEPayload(eventData)
+					if respID != "" {
+						capturePayload, patched := patchResponseOutputIfMissing(eventData, outputItemsByIndex, outputItemsFallback)
+						if patched {
+							log.Debugf("codex http-ws bridge: patched response.output for session %s with %d items", sessionKey, len(outputItemsByIndex)+len(outputItemsFallback))
+						}
+						bridge := getHTTPWSBridge()
+						bridge.CaptureResponse(sessionKey, respID, model, authID, requestPayload, capturePayload)
+						bridge.MarkCompleted(sessionKey)
+						outputItemsByIndex = map[int64][]byte{}
+						outputItemsFallback = [][]byte{}
+					}
+					detail, ok := helps.ParseCodexUsage(eventData)
+					if ok {
+						var cachePct float64
+						if detail.InputTokens > 0 {
+							cachePct = float64(detail.CachedTokens) / float64(detail.InputTokens) * 100
+						}
+						class := "full_send"
+						if telemetry.sentDelta {
+							switch {
+							case telemetry.reconnected:
+								class = "reconnect_miss"
+							case detail.CachedTokens == 0:
+								class = "cold_miss"
+							case cachePct >= 80:
+								class = "warm_hit"
+							default:
+								class = "partial_hit"
+							}
+						}
+						gapStr := "first"
+						if !telemetry.firstTurn {
+							gapStr = telemetry.gapSinceLast.Round(time.Millisecond).String()
+						}
+						log.Infof("codex http-ws bridge: turn session=%s model=%s class=%s input=%d cached=%d (%.1f%%) output=%d total=%d sent_delta=%v reconnected=%v conn_gen=%d gap=%s baseline=%d delta_items=%d",
+							sessionKey, model, class,
+							detail.InputTokens, detail.CachedTokens, cachePct, detail.OutputTokens, detail.TotalTokens,
+							telemetry.sentDelta, telemetry.reconnected, telemetry.connGen,
+							gapStr, telemetry.baselineBefore, telemetry.deltaItems)
+						if telemetry.sentDelta && (class == "partial_hit" || class == "cold_miss") {
+							if bridge := getHTTPWSBridge(); bridge != nil {
+								bridge.Reset(sessionKey)
+								log.Warnf("codex http-ws bridge: cache-miss recovery — reset session %s after %s (cache=%.1f%%)", sessionKey, class, cachePct)
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: wrappedCh}
 }
 
 func (e *CodexAutoExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
@@ -1975,6 +2236,9 @@ func (e *CodexAutoExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 func (e *CodexAutoExecutor) CloseExecutionSession(sessionID string) {
 	if e == nil || e.wsExec == nil {
 		return
+	}
+	if e.cfg != nil && e.cfg.CodexResponseChaining.Enabled && sessionID != "" {
+		getHTTPWSBridge().Reset(sessionID)
 	}
 	e.wsExec.CloseExecutionSession(sessionID)
 }
