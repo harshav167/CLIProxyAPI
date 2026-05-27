@@ -42,7 +42,13 @@ func TestOpenAIResponsesToOpenAI_IgnoresBuiltinTools(t *testing.T) {
 
 	out := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, "gpt-5", in, false)
 
-	if got := gjson.GetBytes(out, "tools.#").Int(); got != 0 {
-		t.Fatalf("expected 0 tools (builtin tools not supported in Chat Completions), got %d: %s", got, string(out))
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+		t.Fatalf("expected 1 builtin tool passthrough, got %d: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "web_search" {
+		t.Fatalf("expected tools[0].type=web_search, got %q: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.search_context_size").String(); got != "low" {
+		t.Fatalf("expected tools[0].search_context_size=low, got %q: %s", got, string(out))
 	}
 }
