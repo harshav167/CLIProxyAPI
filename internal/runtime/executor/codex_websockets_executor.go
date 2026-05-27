@@ -261,9 +261,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		sess = e.getOrCreateSession(executionSessionID)
 		sess.reqMu.Lock()
 		defer sess.reqMu.Unlock()
+		wsHeaders.Set("session_id", executionSessionID)
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(body, nil)
+	ginHeaders := extractCodexClientMetadataHeaders(ctx)
+	_, wsReqBody := applyCurrentSessionMetadata(sess, executionSessionID, wsHeaders, body, ginHeaders)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -284,6 +286,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+			disableWSSession(sess, executionSessionID, "426 from upstream")
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -293,6 +296,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	captureTurnStateFromHandshake(sess, respHS)
+	_, wsReqBody = applyCurrentSessionMetadata(sess, executionSessionID, wsHeaders, body, ginHeaders)
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
 		defer func() {
@@ -323,7 +328,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			// execution session.
 			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry == nil && connRetry != nil {
-				wsReqBodyRetry := buildCodexWebsocketRequestBody(body, nil)
+				captureTurnStateFromHandshake(sess, respHSRetry)
+				_, wsReqBodyRetry := applyCurrentSessionMetadata(sess, executionSessionID, wsHeaders, body, ginHeaders)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
 					Method:    "WEBSOCKET",
@@ -460,9 +466,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if sess != nil {
 			sess.reqMu.Lock()
 		}
+		wsHeaders.Set("session_id", executionSessionID)
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(body, nil)
+	ginHeaders := extractCodexClientMetadataHeaders(ctx)
+	_, wsReqBody := applyCurrentSessionMetadata(sess, executionSessionID, wsHeaders, body, ginHeaders)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -487,6 +495,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+			disableWSSession(sess, executionSessionID, "426 from upstream")
+			if sess != nil {
+				sess.reqMu.Unlock()
+			}
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -499,6 +511,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	captureTurnStateFromHandshake(sess, respHS)
+	_, wsReqBody = applyCurrentSessionMetadata(sess, executionSessionID, wsHeaders, body, ginHeaders)
 
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
@@ -524,7 +538,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 				return nil, errDialRetry
 			}
-			wsReqBodyRetry := buildCodexWebsocketRequestBody(body, nil)
+			captureTurnStateFromHandshake(sess, respHSRetry)
+			_, wsReqBodyRetry := applyCurrentSessionMetadata(sess, executionSessionID, wsHeaders, body, ginHeaders)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -1334,6 +1349,10 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.wsURL = wsURL
 	sess.authID = authID
 	sess.readerConn = conn
+	sess.connGeneration++
+	// New connection: sticky turn state and window id generation reset.
+	sess.turnState = ""
+	sess.windowGen++
 	sess.connMu.Unlock()
 
 	sess.configureConn(conn)

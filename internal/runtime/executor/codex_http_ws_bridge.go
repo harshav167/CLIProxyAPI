@@ -60,7 +60,7 @@ func needsRawFallback(eventType string) bool {
 // response.failed / response.error event into an OpenAI-streaming-style
 // error envelope: {"error":{"message":...,"type":"server_error","code":...}}.
 //
-// Used by the Patch 18 zero-chunk fallback when the chat-completions
+// Used by the zero-chunk fallback when the chat-completions
 // translator has no rule for terminal failure events. Forwarding the raw
 // `{"type":"response.failed",...}` payload would have the openai handler
 // wrap it as `data: {"type":"response.failed",...}` — which is not a
