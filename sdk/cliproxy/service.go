@@ -449,7 +449,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 	case "gitlab":
 		s.coreManager.RegisterExecutor(executor.NewGitLabExecutor(s.cfg))
 	case "xai", "xai-oauth", "grok", "grok-oauth":
-		s.coreManager.RegisterExecutor(executor.NewXAIExecutor(strings.ToLower(a.Provider), s.cfg))
+		s.coreManager.RegisterExecutor(executor.NewXAIExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {

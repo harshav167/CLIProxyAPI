@@ -11,6 +11,12 @@ const (
 	usageSubscriberBuffer         = 256
 )
 
+type usageSubscriberRegistry struct {
+	mu          sync.Mutex
+	subscribers map[uint64]chan []byte
+	nextID      uint64
+}
+
 // backend abstracts the storage used to buffer usage payloads. The default
 // implementation keeps records in-memory; an external Redis/Valkey backend
 // can be swapped in via Configure.
@@ -27,6 +33,8 @@ var (
 
 	backendMu      sync.RWMutex
 	currentBackend backend = newInMemoryBackend()
+
+	usageSubscribers usageSubscriberRegistry
 )
 
 func init() {
@@ -39,6 +47,7 @@ func init() {
 func SetEnabled(value bool) {
 	enabled.Store(value)
 	if !value {
+		clearUsageSubscribers()
 		getBackend().Clear()
 	}
 }
@@ -74,7 +83,78 @@ func Enqueue(payload []byte) {
 	if len(payload) == 0 {
 		return
 	}
+	if publishToUsageSubscribers(payload) {
+		return
+	}
 	getBackend().Enqueue(payload)
+}
+
+func SubscribeUsage() (<-chan []byte, func()) {
+	subscriber := make(chan []byte, usageSubscriberBuffer)
+
+	usageSubscribers.mu.Lock()
+	if usageSubscribers.subscribers == nil {
+		usageSubscribers.subscribers = make(map[uint64]chan []byte)
+	}
+	usageSubscribers.nextID++
+	id := usageSubscribers.nextID
+	usageSubscribers.subscribers[id] = subscriber
+	usageSubscribers.mu.Unlock()
+
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			unsubscribeUsageSubscriber(id)
+		})
+	}
+	return subscriber, unsubscribe
+}
+
+func publishToUsageSubscribers(payload []byte) bool {
+	usageSubscribers.mu.Lock()
+	defer usageSubscribers.mu.Unlock()
+
+	if len(usageSubscribers.subscribers) == 0 {
+		return false
+	}
+
+	for id, subscriber := range usageSubscribers.subscribers {
+		cloned := append([]byte(nil), payload...)
+		select {
+		case subscriber <- cloned:
+		default:
+			delete(usageSubscribers.subscribers, id)
+			close(subscriber)
+		}
+	}
+	return true
+}
+
+func unsubscribeUsageSubscriber(id uint64) {
+	usageSubscribers.mu.Lock()
+	subscriber, ok := usageSubscribers.subscribers[id]
+	if ok {
+		delete(usageSubscribers.subscribers, id)
+	}
+	usageSubscribers.mu.Unlock()
+
+	if ok {
+		close(subscriber)
+	}
+}
+
+func clearUsageSubscribers() {
+	usageSubscribers.mu.Lock()
+	subscribers := make([]chan []byte, 0, len(usageSubscribers.subscribers))
+	for _, subscriber := range usageSubscribers.subscribers {
+		subscribers = append(subscribers, subscriber)
+	}
+	usageSubscribers.subscribers = nil
+	usageSubscribers.mu.Unlock()
+
+	for _, subscriber := range subscribers {
+		close(subscriber)
+	}
 }
 
 func PopOldest(count int) [][]byte {
