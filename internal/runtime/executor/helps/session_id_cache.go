@@ -3,10 +3,12 @@ package helps
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type sessionIDCacheEntry struct {
@@ -89,4 +91,23 @@ func CachedSessionID(apiKey string) string {
 	sessionIDCache[key] = entry
 	sessionIDCacheMu.Unlock()
 	return entry.value
+}
+
+// ExecutionSessionIDFromOptions extracts the execution session ID from request options.
+func ExecutionSessionIDFromOptions(opts cliproxyexecutor.Options) string {
+	if len(opts.Metadata) == 0 {
+		return ""
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.ExecutionSessionMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
 }

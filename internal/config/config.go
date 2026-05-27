@@ -150,6 +150,15 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// CodexResponseChaining enables the HTTP→WebSocket bridge for response chaining.
+	CodexResponseChaining struct {
+		Enabled bool `yaml:"enabled" json:"enabled"`
+	} `yaml:"codex-response-chaining" json:"codex-response-chaining"`
+
+	CodexRemoteCompaction CodexRemoteCompactionConfig `yaml:"codex-remote-compaction" json:"codex-remote-compaction"`
+	CursorKeepalive       CursorKeepaliveConfig       `yaml:"cursor-keepalive" json:"cursor-keepalive"`
+	CursorWarmup          CursorWarmupConfig          `yaml:"cursor-warmup" json:"cursor-warmup"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
@@ -184,6 +193,19 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+type CodexRemoteCompactionConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+}
+
+type CursorKeepaliveConfig struct {
+	Enabled    bool `yaml:"enabled" json:"enabled"`
+	IntervalMs int  `yaml:"interval-ms" json:"interval-ms"`
+}
+
+type CursorWarmupConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
 // TLSConfig holds HTTPS server settings.

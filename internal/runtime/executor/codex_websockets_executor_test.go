@@ -23,7 +23,7 @@ import (
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)
 
-	wsReqBody := buildCodexWebsocketRequestBody(body)
+	wsReqBody := buildCodexWebsocketRequestBody(body, nil)
 
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got != "response.create" {
 		t.Fatalf("type = %s, want response.create", got)

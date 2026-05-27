@@ -5,11 +5,13 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,6 +81,29 @@ type codexWebsocketSession struct {
 
 	upstreamDisconnectOnce sync.Once
 	upstreamDisconnectCh   chan error
+
+	// connGeneration is incremented each time ensureUpstreamConn dials a new
+	// connection for this session. The bridge reads this before and after sending
+	// to detect mid-flight reconnects precisely (not heuristically).
+	connGeneration uint64
+
+	// wsDisabled is the session-scoped transport policy latch (matches Codex CLI's
+	// disable_websockets AtomicBool on ModelClientState). Once set, all subsequent
+	// requests in this session skip WS and use HTTP.
+	wsDisabled   bool
+	wsDisabledAt time.Time
+
+	// turnState holds the x-codex-turn-state sticky routing token captured from
+	// server responses (handshake headers + response.created events).
+	turnState string
+
+	// windowGen is the window generation counter, incremented on session reset
+	// or reconnect. Combined with the conversation ID, produces x-codex-window-id.
+	windowGen uint64
+
+	// warmedUp tracks whether a cache-priming warmup request has been sent on
+	// this session's WebSocket. Set once after the first successful warmup.
+	warmedUp bool
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
@@ -238,7 +263,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer sess.reqMu.Unlock()
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(body)
+	wsReqBody := buildCodexWebsocketRequestBody(body, nil)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -298,7 +323,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			// execution session.
 			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry == nil && connRetry != nil {
-				wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
+				wsReqBodyRetry := buildCodexWebsocketRequestBody(body, nil)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
 					Method:    "WEBSOCKET",
@@ -437,7 +462,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
-	wsReqBody := buildCodexWebsocketRequestBody(body)
+	wsReqBody := buildCodexWebsocketRequestBody(body, nil)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -499,7 +524,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				sess.reqMu.Unlock()
 				return nil, errDialRetry
 			}
-			wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
+			wsReqBodyRetry := buildCodexWebsocketRequestBody(body, nil)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
@@ -670,7 +695,7 @@ func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Con
 	return conn.WriteMessage(websocket.TextMessage, payload)
 }
 
-func buildCodexWebsocketRequestBody(body []byte) []byte {
+func buildCodexWebsocketRequestBody(body []byte, clientMetadata map[string]string) []byte {
 	if len(body) == 0 {
 		return nil
 	}
@@ -679,12 +704,27 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	// Incremental follow-up turns continue on the same websocket using
 	// `previous_response_id` + incremental `input`, not `response.append`.
 	wsReqBody, errSet := sjson.SetBytes(bytes.Clone(body), "type", "response.create")
-	if errSet == nil && len(wsReqBody) > 0 {
-		return wsReqBody
+	if errSet != nil || len(wsReqBody) == 0 {
+		wsReqBody = bytes.Clone(body)
+		wsReqBody, _ = sjson.SetBytes(wsReqBody, "type", "response.create")
 	}
-	fallback := bytes.Clone(body)
-	fallback, _ = sjson.SetBytes(fallback, "type", "response.create")
-	return fallback
+
+	if len(clientMetadata) > 0 {
+		keys := make([]string, 0, len(clientMetadata))
+		for k := range clientMetadata {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := clientMetadata[k]
+			if v == "" {
+				continue
+			}
+			wsReqBody, _ = sjson.SetBytes(wsReqBody, "client_metadata."+k, v)
+		}
+	}
+
+	return wsReqBody
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
@@ -1547,6 +1587,322 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 	for i := range toClose {
 		closeCodexWebsocketSession(toClose[i], reason)
 	}
+}
+
+// captureTurnStateFromHandshake extracts x-codex-turn-state from the WS handshake
+// response headers and stores it on the session for replay on future requests.
+func captureTurnStateFromHandshake(sess *codexWebsocketSession, respHS *http.Response) {
+	if sess == nil || respHS == nil || respHS.Header == nil {
+		return
+	}
+	ts := strings.TrimSpace(respHS.Header.Get("x-codex-turn-state"))
+	if ts == "" {
+		return
+	}
+	sess.connMu.Lock()
+	defer sess.connMu.Unlock()
+	if sess.turnState != ts {
+		sess.turnState = ts
+		log.Debugf("codex http-ws bridge: captured turn_state for session %s (len=%d)", sess.sessionID, len(ts))
+	}
+}
+
+const cursorKeepaliveDefaultInterval = 1500 * time.Millisecond
+
+func shouldStartCursorKeepalive(ctx context.Context, cfg *config.Config, from sdktranslator.Format) bool {
+	if cfg == nil || !cfg.CursorKeepalive.Enabled {
+		return false
+	}
+	if from.String() != "openai" {
+		return false
+	}
+	return IsCursorClient(ctx)
+}
+
+func cursorKeepaliveInterval(cfg *config.Config) time.Duration {
+	if cfg == nil || cfg.CursorKeepalive.IntervalMs <= 0 {
+		return cursorKeepaliveDefaultInterval
+	}
+	return time.Duration(cfg.CursorKeepalive.IntervalMs) * time.Millisecond
+}
+
+func runCursorKeepalive(ctx context.Context, send func(cliproxyexecutor.StreamChunk) bool, cachedChunks [][]byte, interval time.Duration, stop <-chan struct{}, executionSessionID string) {
+	if len(cachedChunks) == 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	count := 0
+	for {
+		select {
+		case <-stop:
+			if count > 0 {
+				log.Debugf("codex ws bridge: cursor keepalive stopped session=%s emissions=%d (first content event arrived)", executionSessionID, count)
+			}
+			return
+		case <-ctx.Done():
+			if count > 0 {
+				log.Debugf("codex ws bridge: cursor keepalive stopped session=%s emissions=%d (ctx done)", executionSessionID, count)
+			}
+			return
+		case <-ticker.C:
+			for _, chunk := range cachedChunks {
+				if !send(cliproxyexecutor.StreamChunk{Payload: chunk}) {
+					log.Debugf("codex ws bridge: cursor keepalive stopped session=%s emissions=%d (send failed — client closed)", executionSessionID, count)
+					return
+				}
+			}
+			count++
+		}
+	}
+}
+
+var (
+	unsupportedEventWarnSeenMu     sync.Mutex
+	unsupportedEventWarnSeen       = map[string]time.Time{}
+	unsupportedEventWarnPrunerOnce sync.Once
+)
+
+const (
+	unsupportedEventWarnTTL           = 24 * time.Hour
+	unsupportedEventWarnPruneInterval = 1 * time.Hour
+)
+
+func recordUnsupportedEventWarn(sessionID, eventType string) bool {
+	startUnsupportedEventWarnPruner()
+	key := sessionID + "\x00" + eventType
+	unsupportedEventWarnSeenMu.Lock()
+	defer unsupportedEventWarnSeenMu.Unlock()
+	if when, ok := unsupportedEventWarnSeen[key]; ok && time.Since(when) < unsupportedEventWarnTTL {
+		return false
+	}
+	unsupportedEventWarnSeen[key] = time.Now()
+	return true
+}
+
+func startUnsupportedEventWarnPruner() {
+	unsupportedEventWarnPrunerOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(unsupportedEventWarnPruneInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				pruneUnsupportedEventWarnSeen()
+			}
+		}()
+	})
+}
+
+func pruneUnsupportedEventWarnSeen() {
+	now := time.Now()
+	unsupportedEventWarnSeenMu.Lock()
+	defer unsupportedEventWarnSeenMu.Unlock()
+	for k, when := range unsupportedEventWarnSeen {
+		if now.Sub(when) >= unsupportedEventWarnTTL {
+			delete(unsupportedEventWarnSeen, k)
+		}
+	}
+}
+
+func applyCurrentSessionMetadata(
+	sess *codexWebsocketSession,
+	executionSessionID string,
+	wsHeaders http.Header,
+	body []byte,
+	hdrs codexClientMetadataHeaders,
+) (clientMetadata map[string]string, wsReqBody []byte) {
+	if sess != nil {
+		sess.connMu.Lock()
+		if ts := sess.turnState; ts != "" {
+			wsHeaders.Set("x-codex-turn-state", ts)
+		} else {
+			wsHeaders.Del("x-codex-turn-state")
+		}
+		sess.connMu.Unlock()
+	}
+	clientMetadata = buildCodexClientMetadata(executionSessionID, sess, hdrs)
+	if winID := clientMetadata["x-codex-window-id"]; winID != "" {
+		wsHeaders.Set("x-codex-window-id", winID)
+	} else {
+		wsHeaders.Del("x-codex-window-id")
+	}
+	wsReqBody = buildCodexWebsocketRequestBody(body, clientMetadata)
+	return clientMetadata, wsReqBody
+}
+
+type codexClientMetadataHeaders struct {
+	TurnMetadata   string
+	Subagent       string
+	ParentThreadID string
+}
+
+func extractCodexClientMetadataHeaders(ctx context.Context) codexClientMetadataHeaders {
+	if ctx == nil {
+		return codexClientMetadataHeaders{}
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return codexClientMetadataHeaders{}
+	}
+	h := ginCtx.Request.Header
+	return codexClientMetadataHeaders{
+		TurnMetadata:   strings.TrimSpace(h.Get("x-codex-turn-metadata")),
+		Subagent:       strings.TrimSpace(h.Get("x-openai-subagent")),
+		ParentThreadID: strings.TrimSpace(h.Get("x-codex-parent-thread-id")),
+	}
+}
+
+func buildCodexClientMetadata(sessionKey string, sess *codexWebsocketSession, hdrs codexClientMetadataHeaders) map[string]string {
+	metadata := make(map[string]string, 4)
+	if sessionKey != "" {
+		gen := uint64(1)
+		if sess != nil {
+			sess.connMu.Lock()
+			if sess.windowGen == 0 {
+				sess.windowGen = 1
+			}
+			gen = sess.windowGen
+			sess.connMu.Unlock()
+		}
+		metadata["x-codex-window-id"] = fmt.Sprintf("%s:%d", sessionKey, gen)
+	}
+	if hdrs.TurnMetadata != "" {
+		metadata["x-codex-turn-metadata"] = hdrs.TurnMetadata
+	}
+	if hdrs.Subagent != "" {
+		metadata["x-openai-subagent"] = hdrs.Subagent
+	}
+	if hdrs.ParentThreadID != "" {
+		metadata["x-codex-parent-thread-id"] = hdrs.ParentThreadID
+	}
+	return metadata
+}
+
+const codexForcePassthroughGinKey = "codex-force-passthrough"
+
+func forcePassthroughFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+		return ginCtx.GetBool(codexForcePassthroughGinKey)
+	}
+	return false
+}
+
+func bridgeSessionKey(opts cliproxyexecutor.Options, payload []byte) string {
+	if key := helps.ExecutionSessionIDFromOptions(opts); key != "" {
+		return key
+	}
+	pck := gjson.GetBytes(payload, "prompt_cache_key").String()
+	if strings.HasPrefix(pck, "cli-proxy-") {
+		return ""
+	}
+	return pck
+}
+
+func bridgeOpts(opts cliproxyexecutor.Options, sessionKey string) cliproxyexecutor.Options {
+	o := opts
+	if o.Metadata == nil {
+		o.Metadata = make(map[string]interface{})
+	}
+	o.Metadata[cliproxyexecutor.ExecutionSessionMetadataKey] = sessionKey
+	return o
+}
+
+func stripHTTPOnlyFields(payload []byte) []byte {
+	payload, _ = sjson.DeleteBytes(payload, "safety_identifier")
+	payload, _ = sjson.DeleteBytes(payload, "prompt_cache_retention")
+	return payload
+}
+
+const wsDisabledRecoveryWindow = 5 * time.Minute
+
+func disableWSSession(sess *codexWebsocketSession, sessionKey, reason string) {
+	if sess == nil {
+		return
+	}
+	sess.connMu.Lock()
+	defer sess.connMu.Unlock()
+	if sess.wsDisabled {
+		return
+	}
+	sess.wsDisabled = true
+	sess.wsDisabledAt = time.Now()
+	log.Warnf("codex http-ws bridge: WS transport disabled for session %s (%s, will recover after %v)", sessionKey, reason, wsDisabledRecoveryWindow)
+}
+
+func (e *CodexAutoExecutor) isWSDisabled(sessionKey string) bool {
+	sess := e.getWSSession(sessionKey)
+	if sess == nil {
+		return false
+	}
+	sess.connMu.Lock()
+	defer sess.connMu.Unlock()
+	if !sess.wsDisabled {
+		return false
+	}
+	if time.Since(sess.wsDisabledAt) > wsDisabledRecoveryWindow {
+		sess.wsDisabled = false
+		log.Infof("codex http-ws bridge: WS transport re-enabled for session %s after %v recovery window", sessionKey, wsDisabledRecoveryWindow)
+		return false
+	}
+	return true
+}
+
+func (e *CodexAutoExecutor) disableWS(sessionKey string) {
+	disableWSSession(e.getWSSession(sessionKey), sessionKey, "auto bridge fallback")
+}
+
+func (e *CodexAutoExecutor) getWSSession(sessionKey string) *codexWebsocketSession {
+	if e == nil || e.wsExec == nil || e.wsExec.store == nil {
+		return nil
+	}
+	store := e.wsExec.store
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.sessions[sessionKey]
+}
+
+func (e *CodexAutoExecutor) connGeneration(sessionKey string) uint64 {
+	if e == nil || e.wsExec == nil || e.wsExec.store == nil {
+		return 0
+	}
+	store := e.wsExec.store
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	sess, ok := store.sessions[sessionKey]
+	if !ok || sess == nil {
+		return 0
+	}
+	sess.connMu.Lock()
+	defer sess.connMu.Unlock()
+	return sess.connGeneration
+}
+
+func isUpgradeRequiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se statusErr
+	if errors.As(err, &se) && se.code == http.StatusUpgradeRequired {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "426") && strings.Contains(errStr, "upgrade required")
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func authIDForBridge(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.ID)
 }
 
 // CodexAutoExecutor routes Codex requests to the websocket transport only when:
