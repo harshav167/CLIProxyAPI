@@ -149,7 +149,9 @@ Before further execution:
 ## Final Verification Addendum
 
 Migration execution is now complete for the intended local `cpapi-plus` parity
-scope, with `kiro` explicitly left out of this commit as a deferred follow-up.
+scope. **`kiro`, `kilo`, and `iflow` are permanently dropped** — not ported to
+the fork runtime. They remain only in the frozen `cpapi-plus` tag for archival
+reference; no follow-up port is planned.
 
 Completed migration scope:
 
@@ -179,8 +181,8 @@ Classification:
   expectation relative to the migrated target behavior, because the resulting
   implementation matches current `cpapi-plus` builtin tool passthrough behavior
   rather than indicating an incomplete migration.
-- `kiro` remains intentionally deferred and is not part of the locally-ready
-  migrated state recorded by this ledger.
+- `kiro`, `kilo`, and `iflow` are **permanently dropped** from fork scope (user
+  decision 2026-05-27). They are not part of the migrated runtime.
 
 ## Phase 2 Rebase Resume (2026-05-22)
 

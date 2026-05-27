@@ -203,7 +203,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
 
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	parsed := thinking.ParseModel(req.Model)
+	modelStr := parsed.Stripped
+	baseModel := parsed.BaseModel
+	forcePriority := parsed.PriorityRequested
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
@@ -222,7 +225,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, modelStr, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
@@ -230,7 +233,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = applyCursorGPT54UpgradeIfEnabled(ctx, e.cfg, body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	if forcePriority {
+		body = applyPriorityServiceTier(body)
+	}
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
@@ -419,7 +426,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
 
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	parsed := thinking.ParseModel(req.Model)
+	modelStr := parsed.Stripped
+	baseModel := parsed.BaseModel
+	forcePriority := parsed.PriorityRequested
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
@@ -430,16 +440,35 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := req.Payload
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	var originalTranslated []byte
+	if len(opts.OriginalRequest) == 0 {
+		originalTranslated = body
+	} else {
+		originalTranslated = sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, true)
+	}
 
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, modelStr, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, body, requestedModel, requestPath, opts.Headers)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, helps.PayloadRequestPath(opts))
+	body = applyCursorGPT54UpgradeIfEnabled(ctx, e.cfg, body)
+	body, _ = sjson.SetBytes(body, "model", baseModel)
+	if forcePriority {
+		body = applyPriorityServiceTier(body)
+	}
+	if IsCursorClient(ctx) {
+		if compacted, ok := maybeRemoteCompact(ctx, e.cfg, auth, body, helps.ExecutionSessionIDFromOptions(opts)); ok {
+			body = compacted
+		}
+	}
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
@@ -575,6 +604,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		terminateReason := "completed"
 		var terminateErr error
 
+		keepaliveStop := make(chan struct{})
+		var keepaliveStopOnce sync.Once
+		stopKeepalive := func() {
+			keepaliveStopOnce.Do(func() { close(keepaliveStop) })
+		}
+		defer stopKeepalive()
+		keepaliveStarted := false
+
 		defer close(out)
 		defer func() {
 			if sess != nil {
@@ -667,13 +704,52 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			line := encodeCodexWebsocketAsSSE(payload)
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, body, body, line, &param)
-			for i := range chunks {
-				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayloadSource, body, line, &param)
+			if len(chunks) == 0 && from.String() == "openai" && needsRawFallback(eventType) {
+				if !send(cliproxyexecutor.StreamChunk{Payload: synthesizeChatCompletionsErrorChunk(payload)}) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 					return
 				}
+			} else {
+				for i := range chunks {
+					if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+						terminateReason = "context_done"
+						terminateErr = ctx.Err()
+						return
+					}
+				}
+			}
+			switch eventType {
+			case "response.completed", "response.done", "response.failed",
+				"response.incomplete", "response.error":
+				stopKeepalive()
+			}
+			switch eventType {
+			case "response.in_progress":
+				if !keepaliveStarted && shouldStartCursorKeepalive(ctx, e.cfg, from) && len(chunks) > 0 {
+					cachedChunks := make([][]byte, len(chunks))
+					for i, c := range chunks {
+						cachedChunks[i] = bytes.Clone(c)
+					}
+					interval := cursorKeepaliveInterval(e.cfg)
+					go runCursorKeepalive(ctx, send, cachedChunks, interval, keepaliveStop, executionSessionID)
+					keepaliveStarted = true
+				}
+			case "response.output_text.delta",
+				"response.output_text.done",
+				"response.reasoning_summary_text.delta",
+				"response.reasoning_summary_text.done",
+				"response.reasoning_summary_part.added",
+				"response.reasoning_summary_part.done",
+				"response.reasoning_text.delta",
+				"response.function_call_arguments.delta",
+				"response.function_call_arguments.done",
+				"response.output_item.added",
+				"response.output_item.done",
+				"response.content_part.added",
+				"response.content_part.done":
+				stopKeepalive()
 			}
 			if eventType == "response.completed" || eventType == "response.done" {
 				return
@@ -1357,8 +1433,35 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 
 	sess.configureConn(conn)
 	go e.readUpstreamLoop(sess, conn)
+	gen := sess.connGeneration
+	go e.pingUpstreamLoop(sess, conn, gen)
 	logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
 	return conn, resp, nil
+}
+
+func (e *CodexWebsocketsExecutor) pingUpstreamLoop(sess *codexWebsocketSession, conn *websocket.Conn, gen uint64) {
+	if e == nil || sess == nil || conn == nil {
+		return
+	}
+	const pingInterval = 30 * time.Second
+	t := time.NewTicker(pingInterval)
+	defer t.Stop()
+	for range t.C {
+		sess.connMu.Lock()
+		stale := sess.conn != conn || sess.connGeneration != gen
+		sess.connMu.Unlock()
+		if stale {
+			return
+		}
+		sess.writeMu.Lock()
+		err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
+		sess.writeMu.Unlock()
+		if err != nil {
+			log.Debugf("codex websockets: ping write failed gen=%d: %v — invalidating to trigger reconnect", gen, err)
+			e.invalidateUpstreamConn(sess, conn, "ping_write_failed", err)
+			return
+		}
+	}
 }
 
 func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, conn *websocket.Conn) {

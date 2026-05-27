@@ -159,6 +159,12 @@ type Config struct {
 	CursorKeepalive       CursorKeepaliveConfig       `yaml:"cursor-keepalive" json:"cursor-keepalive"`
 	CursorWarmup          CursorWarmupConfig          `yaml:"cursor-warmup" json:"cursor-warmup"`
 
+	// GPT54Upgrade enables Cursor GPT-5.4 prompt patches for Codex/GPT-bound
+	// Cursor traffic. The rewrite is applied only to Cursor system prompts and
+	// changes the prompt bytes intentionally, so upgraded and control cohorts
+	// naturally use different prompt-cache entries.
+	GPT54Upgrade bool `yaml:"gpt-5.4-upgrade" json:"gpt-5.4-upgrade"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
