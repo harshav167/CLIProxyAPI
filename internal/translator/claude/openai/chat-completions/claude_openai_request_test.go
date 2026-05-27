@@ -243,3 +243,93 @@ func TestConvertOpenAIRequestToClaude_SystemOnlyInputKeepsFallbackUserMessage(t 
 		t.Fatalf("Expected fallback text %q, got %q", "", got)
 	}
 }
+
+func TestConvertOpenAIRequestToClaude_OpusThinkingAliasesUseClaudeCodeParityShape(t *testing.T) {
+	inputJSON := `{
+		"messages": [{"role": "user", "content": "hi"}],
+		"stream": true
+	}`
+
+	low := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-low", []byte(inputJSON), true))
+	medium := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-medium", []byte(inputJSON), true))
+	high := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-high", []byte(inputJSON), true))
+	xhigh := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-xhigh", []byte(inputJSON), true))
+	max := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-max", []byte(inputJSON), true))
+
+	for name, resultJSON := range map[string]gjson.Result{"low": low, "medium": medium, "high": high, "xhigh": xhigh, "max": max} {
+		if got := resultJSON.Get("thinking.type").String(); got != "adaptive" {
+			t.Fatalf("%s thinking.type = %q, want adaptive; body=%s", name, got, resultJSON.Raw)
+		}
+		if got := resultJSON.Get("thinking.display"); got.Exists() {
+			t.Fatalf("%s thinking.display should be omitted for Opus 4.7 adaptive thinking, got %s; body=%s", name, got.Raw, resultJSON.Raw)
+		}
+		if got := resultJSON.Get("max_tokens").Int(); got != 64000 {
+			t.Fatalf("%s max_tokens = %d, want 64000; body=%s", name, got, resultJSON.Raw)
+		}
+		if got := resultJSON.Get("thinking.budget_tokens"); got.Exists() {
+			t.Fatalf("%s thinking.budget_tokens should be omitted for Opus 4.7 adaptive thinking, got %s; body=%s", name, got.Raw, resultJSON.Raw)
+		}
+		if got := resultJSON.Get("context_management.edits.0.type").String(); got != "clear_thinking_20251015" {
+			t.Fatalf("%s context_management edit type = %q, want clear_thinking_20251015; body=%s", name, got, resultJSON.Raw)
+		}
+		if got := resultJSON.Get("context_management.edits.0.keep").String(); got != "all" {
+			t.Fatalf("%s context_management edit keep = %q, want all; body=%s", name, got, resultJSON.Raw)
+		}
+		if got := resultJSON.Get("diagnostics.previous_message_id"); !got.Exists() || got.Type != gjson.Null {
+			t.Fatalf("%s diagnostics.previous_message_id = %s, want explicit null; body=%s", name, got.Raw, resultJSON.Raw)
+		}
+	}
+	if got := low.Get("output_config.effort").String(); got != "low" {
+		t.Fatalf("low effort = %q, want low; body=%s", got, low.Raw)
+	}
+	if got := medium.Get("output_config.effort").String(); got != "medium" {
+		t.Fatalf("medium effort = %q, want medium; body=%s", got, medium.Raw)
+	}
+	if got := high.Get("output_config.effort").String(); got != "high" {
+		t.Fatalf("high effort = %q, want high; body=%s", got, high.Raw)
+	}
+	if got := xhigh.Get("output_config.effort").String(); got != "xhigh" {
+		t.Fatalf("xhigh effort = %q, want xhigh; body=%s", got, xhigh.Raw)
+	}
+	if got := max.Get("output_config.effort").String(); got != "max" {
+		t.Fatalf("max effort = %q, want max; body=%s", got, max.Raw)
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_OpusThinkingPreservesIncomingEffort(t *testing.T) {
+	inputJSON := `{
+		"messages": [{"role": "user", "content": "hi"}],
+		"thinking": {"type": "enabled", "budget_tokens": 2048},
+		"output_config": {"effort": "medium"}
+	}`
+
+	resultJSON := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-4.6-opus-high-thinking", []byte(inputJSON), true))
+	if got := resultJSON.Get("output_config.effort").String(); got != "medium" {
+		t.Fatalf("effort = %q, want preserved medium; body=%s", got, resultJSON.Raw)
+	}
+	if got := resultJSON.Get("thinking.display").String(); got != "summarized" {
+		t.Fatalf("thinking.display = %q, want summarized; body=%s", got, resultJSON.Raw)
+	}
+	if got := resultJSON.Get("thinking.budget_tokens").Int(); got != 63999 {
+		t.Fatalf("thinking.budget_tokens = %d, want parity budget 63999; body=%s", got, resultJSON.Raw)
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_OpusThinkingDisabledDoesNotAddParityFields(t *testing.T) {
+	inputJSON := `{
+		"messages": [{"role": "user", "content": "hi"}],
+		"thinking": {"type": "disabled"},
+		"output_config": {"effort": "high"}
+	}`
+
+	resultJSON := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-high", []byte(inputJSON), true))
+	if got := resultJSON.Get("thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled; body=%s", got, resultJSON.Raw)
+	}
+	if resultJSON.Get("thinking.display").Exists() {
+		t.Fatalf("thinking.display should not be added when disabled; body=%s", resultJSON.Raw)
+	}
+	if got := resultJSON.Get("thinking.budget_tokens"); got.Exists() {
+		t.Fatalf("thinking.budget_tokens should not be added when disabled, got %s; body=%s", got.Raw, resultJSON.Raw)
+	}
+}

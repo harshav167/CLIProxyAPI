@@ -149,6 +149,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
+	out = applyClaudeCodeThinkingParity(out, modelName, root)
 
 	// Temperature setting for controlling response randomness
 	if temp := root.Get("temperature"); temp.Exists() {
@@ -395,6 +396,66 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	}
 
 	return out
+}
+
+func applyClaudeCodeThinkingParity(out []byte, modelName string, root gjson.Result) []byte {
+	if !isClaudeCodeOpusThinkingAlias(modelName) {
+		return out
+	}
+	if toolChoiceType := strings.ToLower(strings.TrimSpace(root.Get("tool_choice.type").String())); toolChoiceType == "any" || toolChoiceType == "tool" {
+		return out
+	}
+	if strings.EqualFold(gjson.GetBytes(out, "thinking.type").String(), "disabled") {
+		return out
+	}
+
+	effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(out, "output_config.effort").String()))
+	if effort == "" {
+		effort = strings.ToLower(strings.TrimSpace(root.Get("reasoning_effort").String()))
+	}
+	if effort == "" {
+		effort = effortFromClaudeModelAlias(modelName)
+	}
+	if effort == "" || effort == "auto" || effort == "none" {
+		return out
+	}
+
+	const maxTokens = 64000
+	out, _ = sjson.SetBytes(out, "max_tokens", maxTokens)
+	if isOpus47ThinkingAlias(modelName) {
+		out, _ = sjson.SetBytes(out, "thinking.type", "adaptive")
+		out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
+		out, _ = sjson.DeleteBytes(out, "thinking.display")
+		out, _ = sjson.SetBytes(out, "context_management.edits.0.type", "clear_thinking_20251015")
+		out, _ = sjson.SetBytes(out, "context_management.edits.0.keep", "all")
+		out, _ = sjson.SetRawBytes(out, "diagnostics.previous_message_id", []byte("null"))
+	} else {
+		out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
+		out, _ = sjson.SetBytes(out, "thinking.budget_tokens", maxTokens-1)
+		out, _ = sjson.SetBytes(out, "thinking.display", "summarized")
+	}
+	out, _ = sjson.SetBytes(out, "output_config.effort", effort)
+	return out
+}
+
+func isClaudeCodeOpusThinkingAlias(modelName string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	return strings.Contains(name, "opus") && strings.Contains(name, "thinking")
+}
+
+func effortFromClaudeModelAlias(modelName string) string {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	for _, effort := range []string{"xhigh", "medium", "high", "low", "max"} {
+		if strings.Contains(name, "thinking-"+effort) || strings.Contains(name, effort+"-thinking") {
+			return effort
+		}
+	}
+	return ""
+}
+
+func isOpus47ThinkingAlias(modelName string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	return strings.Contains(name, "opus-4-7") || strings.Contains(name, "mythos")
 }
 
 func convertOpenAIContentPartToClaudePart(part gjson.Result) string {

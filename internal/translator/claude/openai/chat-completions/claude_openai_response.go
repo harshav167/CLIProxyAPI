@@ -45,6 +45,18 @@ type ToolCallAccumulator struct {
 	Arguments strings.Builder
 }
 
+func calculateClaudeUsageTokens(usage gjson.Result) (promptTokens, completionTokens, totalTokens, cachedTokens int64) {
+	inputTokens := usage.Get("input_tokens").Int()
+	completionTokens = usage.Get("output_tokens").Int()
+	cachedTokens = usage.Get("cache_read_input_tokens").Int()
+	cacheCreationInputTokens := usage.Get("cache_creation_input_tokens").Int()
+
+	promptTokens = inputTokens + cacheCreationInputTokens + cachedTokens
+	totalTokens = promptTokens + completionTokens
+
+	return promptTokens, completionTokens, totalTokens, cachedTokens
+}
+
 func (u *claudeUsageTokens) Merge(usage gjson.Result) {
 	if !usage.Exists() {
 		return
@@ -241,7 +253,13 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 		// Handle usage information for token counts
 		if usage := root.Get("usage"); usage.Exists() {
 			(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.Merge(usage)
-			promptTokens, completionTokens, totalTokens, cachedTokens := (*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.OpenAIUsage()
+			merged := (*param).(*ConvertAnthropicResponseToOpenAIParams).Usage
+			usageJSON := []byte(`{}`)
+			usageJSON, _ = sjson.SetBytes(usageJSON, "input_tokens", merged.InputTokens)
+			usageJSON, _ = sjson.SetBytes(usageJSON, "output_tokens", merged.OutputTokens)
+			usageJSON, _ = sjson.SetBytes(usageJSON, "cache_read_input_tokens", merged.CacheReadInputTokens)
+			usageJSON, _ = sjson.SetBytes(usageJSON, "cache_creation_input_tokens", merged.CacheCreationInputTokens)
+			promptTokens, completionTokens, totalTokens, cachedTokens := calculateClaudeUsageTokens(gjson.ParseBytes(usageJSON))
 			template, _ = sjson.SetBytes(template, "usage.prompt_tokens", promptTokens)
 			template, _ = sjson.SetBytes(template, "usage.completion_tokens", completionTokens)
 			template, _ = sjson.SetBytes(template, "usage.total_tokens", totalTokens)
@@ -405,7 +423,12 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 	}
 
 	if usageTokens.HasUsage {
-		promptTokens, completionTokens, totalTokens, cachedTokens := usageTokens.OpenAIUsage()
+		usageJSON := []byte(`{}`)
+		usageJSON, _ = sjson.SetBytes(usageJSON, "input_tokens", usageTokens.InputTokens)
+		usageJSON, _ = sjson.SetBytes(usageJSON, "output_tokens", usageTokens.OutputTokens)
+		usageJSON, _ = sjson.SetBytes(usageJSON, "cache_read_input_tokens", usageTokens.CacheReadInputTokens)
+		usageJSON, _ = sjson.SetBytes(usageJSON, "cache_creation_input_tokens", usageTokens.CacheCreationInputTokens)
+		promptTokens, completionTokens, totalTokens, cachedTokens := calculateClaudeUsageTokens(gjson.ParseBytes(usageJSON))
 		out, _ = sjson.SetBytes(out, "usage.prompt_tokens", promptTokens)
 		out, _ = sjson.SetBytes(out, "usage.completion_tokens", completionTokens)
 		out, _ = sjson.SetBytes(out, "usage.total_tokens", totalTokens)
@@ -424,8 +447,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 	// Add reasoning content if available (following OpenAI reasoning format)
 	if len(reasoningParts) > 0 {
 		reasoningContent := strings.Join(reasoningParts, "")
-		// Add reasoning as a separate field in the message
-		out, _ = sjson.SetBytes(out, "choices.0.message.reasoning", reasoningContent)
+		out, _ = sjson.SetBytes(out, "choices.0.message.reasoning_content", reasoningContent)
 	}
 
 	// Set tool calls if any were accumulated during processing

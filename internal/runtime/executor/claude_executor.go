@@ -6,13 +6,10 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"net/textproto"
-	"regexp"
 	"strings"
 	"time"
 
@@ -44,28 +41,10 @@ type ClaudeExecutor struct {
 
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
-const claudeToolPrefix = ""
+const claudeToolPrefix = helps.ClaudeToolPrefix
 
-// oauthToolRenameMap maps OpenCode-style (lowercase) tool names to Claude Code-style
-// (TitleCase) names. Anthropic uses tool name fingerprinting to detect third-party
-// clients on OAuth traffic. Renaming to official names avoids extra-usage billing.
-// All tools are mapped to TitleCase equivalents to match Claude Code naming patterns.
-var oauthToolRenameMap = map[string]string{
-	"bash":         "Bash",
-	"read":         "Read",
-	"write":        "Write",
-	"edit":         "Edit",
-	"glob":         "Glob",
-	"grep":         "Grep",
-	"task":         "Task",
-	"webfetch":     "WebFetch",
-	"todowrite":    "TodoWrite",
-	"question":     "Question",
-	"skill":        "Skill",
-	"ls":           "LS",
-	"todoread":     "TodoRead",
-	"notebookedit": "NotebookEdit",
-}
+// oauthToolRenameMap aliases the reserved rename map in helps for OAuth remapping.
+var oauthToolRenameMap = helps.ClaudeOAuthToolRenameMap
 
 // The reverse map is now computed per-request in remapOAuthToolNames so that
 // only names the client actually caused us to rewrite are restored on the
@@ -174,27 +153,17 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = normalizeClaudeTemperatureForThinking(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
+	if helps.CountClaudeCacheControls(body) == 0 {
+		body = helps.EnsureClaudeCacheControl(body)
 	}
 
-	// Match Claude Code's prompt-anchor pattern by ensuring the LAST text block
-	// of the LAST user message has a cache_control with ttl:"1h". Without this
-	// anchor, the prefix upstream of the user prompt caches but the user prompt
-	// itself doesn't, so the next turn re-creates that segment. The enforcer
-	// below caps total breakpoints at 4 and prefers later breakpoints (last in
-	// evaluation order), so this addition is safe even when client already sent
-	// breakpoints.
-	body = ensureUserPromptCacheAnchor(body)
+	body = helps.EnsureClaudeUserPromptCacheAnchor(body)
+	if IsCursorClient(ctx) {
+		body = helps.EnsureCursorClaudeAutomaticPromptCacheControl(body)
+	}
 
-	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	// Cloaking and ensureCacheControl may push the total over 4 when the client
-	// (e.g. Amp CLI) already sends multiple cache_control blocks.
-	body = enforceCacheControlLimit(body, 4)
-
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
-	body = normalizeCacheControlTTL(body)
+	body = helps.EnforceClaudeCacheControlLimit(body, 4)
+	body = helps.NormalizeClaudeCacheControlTTL(body)
 
 	// Strip OpenAI-isms that Anthropic upstream rejects (e.g. stream_options).
 	body = stripUnsupportedAnthropicFields(body)
@@ -368,18 +337,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = normalizeClaudeTemperatureForThinking(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
+	if helps.CountClaudeCacheControls(body) == 0 {
+		body = helps.EnsureClaudeCacheControl(body)
 	}
 
-	// User-prompt cache anchor (see Execute path comment).
-	body = ensureUserPromptCacheAnchor(body)
+	body = helps.EnsureClaudeUserPromptCacheAnchor(body)
+	if IsCursorClient(ctx) {
+		body = helps.EnsureCursorClaudeAutomaticPromptCacheControl(body)
+	}
 
-	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	body = enforceCacheControlLimit(body, 4)
-
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	body = normalizeCacheControlTTL(body)
+	body = helps.EnforceClaudeCacheControlLimit(body, 4)
+	body = helps.NormalizeClaudeCacheControlTTL(body)
 
 	// Strip OpenAI-isms that Anthropic upstream rejects (e.g. stream_options).
 	body = stripUnsupportedAnthropicFields(body)
@@ -484,6 +452,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					reporter.Publish(ctx, detail)
 					logClaudeUsageFromLine(baseModel, line)
 				}
+				if streamErr := helps.DetectClaudeStreamError(line); streamErr != nil {
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx, streamErr)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 				// Forward the line as-is to preserve SSE format
 				cloned := make([]byte, len(line)+1)
@@ -516,6 +493,15 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 				logClaudeUsageFromLine(baseModel, line)
+			}
+			if streamErr := helps.DetectClaudeStreamError(line); streamErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+				case <-ctx.Done():
+				}
+				return
 			}
 			line = restoreClaudeOAuthToolNamesFromStreamLine(line, claudeToolPrefix, auth.ToolPrefixDisabled(), oauthToolNamesReverseMap)
 			chunks := sdktranslator.TranslateStream(
@@ -626,8 +612,8 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
-	body = enforceCacheControlLimit(body, 4)
-	body = normalizeCacheControlTTL(body)
+	body = helps.EnforceClaudeCacheControlLimit(body, 4)
+	body = helps.NormalizeClaudeCacheControlTTL(body)
 
 	// Extract betas from body and convert to header (for count_tokens too)
 	var extraBetas []string
@@ -1155,7 +1141,7 @@ func isClaudeOAuthToken(apiKey string) bool {
 func prepareClaudeOAuthToolNamesForUpstream(body []byte, prefix string, prefixDisabled bool) ([]byte, map[string]string) {
 	body, reverseMap := remapOAuthToolNames(body)
 	if !prefixDisabled {
-		body = applyClaudeToolPrefix(body, prefix)
+		body = helps.ApplyClaudeToolPrefix(body, prefix)
 	}
 	return body, reverseMap
 }
@@ -1164,7 +1150,7 @@ func prepareClaudeOAuthToolNamesForUpstream(body []byte, prefix string, prefixDi
 // transforms for non-stream responses in reverse order.
 func restoreClaudeOAuthToolNamesFromResponse(body []byte, prefix string, prefixDisabled bool, reverseMap map[string]string) []byte {
 	if !prefixDisabled {
-		body = stripClaudeToolPrefixFromResponse(body, prefix)
+		body = helps.StripClaudeToolPrefixFromResponse(body, prefix)
 	}
 	return reverseRemapOAuthToolNames(body, reverseMap)
 }
@@ -1173,7 +1159,7 @@ func restoreClaudeOAuthToolNamesFromResponse(body []byte, prefix string, prefixD
 // transforms for SSE lines in reverse order.
 func restoreClaudeOAuthToolNamesFromStreamLine(line []byte, prefix string, prefixDisabled bool, reverseMap map[string]string) []byte {
 	if !prefixDisabled {
-		line = stripClaudeToolPrefixFromStreamLine(line, prefix)
+		line = helps.StripClaudeToolPrefixFromStreamLine(line, prefix)
 	}
 	return reverseRemapOAuthToolNamesFromStreamLine(line, reverseMap)
 }
@@ -1402,317 +1388,6 @@ func reverseRemapOAuthToolNamesFromStreamLine(line []byte, reverseMap map[string
 	return updated
 }
 
-func applyClaudeToolPrefix(body []byte, prefix string) []byte {
-	if prefix == "" {
-		return body
-	}
-
-	// Collect built-in tool names from the authoritative fallback seed list and
-	// augment it with any typed built-ins present in the current request body.
-	builtinTools := helps.AugmentClaudeBuiltinToolRegistry(body, nil)
-
-	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
-		tools.ForEach(func(index, tool gjson.Result) bool {
-			// Skip built-in tools (web_search, code_execution, etc.) which have
-			// a "type" field and require their name to remain unchanged.
-			if tool.Get("type").Exists() && tool.Get("type").String() != "" {
-				if n := tool.Get("name").String(); n != "" {
-					builtinTools[n] = true
-				}
-				return true
-			}
-			name := tool.Get("name").String()
-			if name == "" || strings.HasPrefix(name, prefix) {
-				return true
-			}
-			path := fmt.Sprintf("tools.%d.name", index.Int())
-			body, _ = sjson.SetBytes(body, path, prefix+name)
-			return true
-		})
-	}
-
-	if gjson.GetBytes(body, "tool_choice.type").String() == "tool" {
-		name := gjson.GetBytes(body, "tool_choice.name").String()
-		if name != "" && !strings.HasPrefix(name, prefix) && !builtinTools[name] {
-			body, _ = sjson.SetBytes(body, "tool_choice.name", prefix+name)
-		}
-	}
-
-	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
-		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.Exists() || !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(contentIndex, part gjson.Result) bool {
-				partType := part.Get("type").String()
-				switch partType {
-				case "tool_use":
-					name := part.Get("name").String()
-					if name == "" || strings.HasPrefix(name, prefix) || builtinTools[name] {
-						return true
-					}
-					path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
-					body, _ = sjson.SetBytes(body, path, prefix+name)
-				case "tool_reference":
-					toolName := part.Get("tool_name").String()
-					if toolName == "" || strings.HasPrefix(toolName, prefix) || builtinTools[toolName] {
-						return true
-					}
-					path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
-					body, _ = sjson.SetBytes(body, path, prefix+toolName)
-				case "tool_result":
-					// Handle nested tool_reference blocks inside tool_result.content[]
-					nestedContent := part.Get("content")
-					if nestedContent.Exists() && nestedContent.IsArray() {
-						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-							if nestedPart.Get("type").String() == "tool_reference" {
-								nestedToolName := nestedPart.Get("tool_name").String()
-								if nestedToolName != "" && !strings.HasPrefix(nestedToolName, prefix) && !builtinTools[nestedToolName] {
-									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
-									body, _ = sjson.SetBytes(body, nestedPath, prefix+nestedToolName)
-								}
-							}
-							return true
-						})
-					}
-				}
-				return true
-			})
-			return true
-		})
-	}
-
-	return body
-}
-
-func stripClaudeToolPrefixFromResponse(body []byte, prefix string) []byte {
-	if prefix == "" {
-		return body
-	}
-	content := gjson.GetBytes(body, "content")
-	if !content.Exists() || !content.IsArray() {
-		return body
-	}
-	content.ForEach(func(index, part gjson.Result) bool {
-		partType := part.Get("type").String()
-		switch partType {
-		case "tool_use":
-			name := part.Get("name").String()
-			if !strings.HasPrefix(name, prefix) {
-				return true
-			}
-			path := fmt.Sprintf("content.%d.name", index.Int())
-			body, _ = sjson.SetBytes(body, path, strings.TrimPrefix(name, prefix))
-		case "tool_reference":
-			toolName := part.Get("tool_name").String()
-			if !strings.HasPrefix(toolName, prefix) {
-				return true
-			}
-			path := fmt.Sprintf("content.%d.tool_name", index.Int())
-			body, _ = sjson.SetBytes(body, path, strings.TrimPrefix(toolName, prefix))
-		case "tool_result":
-			// Handle nested tool_reference blocks inside tool_result.content[]
-			nestedContent := part.Get("content")
-			if nestedContent.Exists() && nestedContent.IsArray() {
-				nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-					if nestedPart.Get("type").String() == "tool_reference" {
-						nestedToolName := nestedPart.Get("tool_name").String()
-						if strings.HasPrefix(nestedToolName, prefix) {
-							nestedPath := fmt.Sprintf("content.%d.content.%d.tool_name", index.Int(), nestedIndex.Int())
-							body, _ = sjson.SetBytes(body, nestedPath, strings.TrimPrefix(nestedToolName, prefix))
-						}
-					}
-					return true
-				})
-			}
-		}
-		return true
-	})
-	return body
-}
-
-func stripClaudeToolPrefixFromStreamLine(line []byte, prefix string) []byte {
-	if prefix == "" {
-		return line
-	}
-	payload := helps.JSONPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return line
-	}
-	contentBlock := gjson.GetBytes(payload, "content_block")
-	if !contentBlock.Exists() {
-		return line
-	}
-
-	blockType := contentBlock.Get("type").String()
-	var updated []byte
-	var err error
-
-	switch blockType {
-	case "tool_use":
-		name := contentBlock.Get("name").String()
-		if !strings.HasPrefix(name, prefix) {
-			return line
-		}
-		updated, err = sjson.SetBytes(payload, "content_block.name", strings.TrimPrefix(name, prefix))
-		if err != nil {
-			return line
-		}
-	case "tool_reference":
-		toolName := contentBlock.Get("tool_name").String()
-		if !strings.HasPrefix(toolName, prefix) {
-			return line
-		}
-		updated, err = sjson.SetBytes(payload, "content_block.tool_name", strings.TrimPrefix(toolName, prefix))
-		if err != nil {
-			return line
-		}
-	default:
-		return line
-	}
-
-	trimmed := bytes.TrimSpace(line)
-	if bytes.HasPrefix(trimmed, []byte("data:")) {
-		return append([]byte("data: "), updated...)
-	}
-	return updated
-}
-
-// getClientUserAgent extracts the client User-Agent from the gin context.
-func getClientUserAgent(ctx context.Context) string {
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		return ginCtx.GetHeader("User-Agent")
-	}
-	return ""
-}
-
-// parseEntrypointFromUA extracts the entrypoint from a Claude Code User-Agent.
-// Format: "claude-cli/x.y.z (external, cli)" → "cli"
-// Format: "claude-cli/x.y.z (external, vscode)" → "vscode"
-// Returns "cli" if parsing fails or UA is not Claude Code.
-func parseEntrypointFromUA(userAgent string) string {
-	// Find content inside parentheses
-	start := strings.Index(userAgent, "(")
-	end := strings.LastIndex(userAgent, ")")
-	if start < 0 || end <= start {
-		return "cli"
-	}
-	inner := userAgent[start+1 : end]
-	// Split by comma, take the second part (entrypoint is at index 1, after USER_TYPE)
-	// Format: "(USER_TYPE, ENTRYPOINT[, extra...])"
-	parts := strings.Split(inner, ",")
-	if len(parts) >= 2 {
-		ep := strings.TrimSpace(parts[1])
-		if ep != "" {
-			return ep
-		}
-	}
-	return "cli"
-}
-
-// getWorkloadFromContext extracts workload identifier from the gin request headers.
-func getWorkloadFromContext(ctx context.Context) string {
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		return strings.TrimSpace(ginCtx.GetHeader("X-CPA-Claude-Workload"))
-	}
-	return ""
-}
-
-// getCloakConfigFromAuth extracts cloak configuration from auth attributes.
-// Returns (cloakMode, strictMode, sensitiveWords, cacheUserID).
-func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (string, bool, []string, bool) {
-	if auth == nil || auth.Attributes == nil {
-		return "auto", false, nil, false
-	}
-
-	cloakMode := auth.Attributes["cloak_mode"]
-	if cloakMode == "" {
-		cloakMode = "auto"
-	}
-
-	strictMode := strings.ToLower(auth.Attributes["cloak_strict_mode"]) == "true"
-
-	var sensitiveWords []string
-	if wordsStr := auth.Attributes["cloak_sensitive_words"]; wordsStr != "" {
-		sensitiveWords = strings.Split(wordsStr, ",")
-		for i := range sensitiveWords {
-			sensitiveWords[i] = strings.TrimSpace(sensitiveWords[i])
-		}
-	}
-
-	cacheUserID := strings.EqualFold(strings.TrimSpace(auth.Attributes["cloak_cache_user_id"]), "true")
-
-	return cloakMode, strictMode, sensitiveWords, cacheUserID
-}
-
-// injectFakeUserID generates and injects a fake user ID into the request metadata.
-// When useCache is false, a new user ID is generated for every call.
-func injectFakeUserID(payload []byte, apiKey string, useCache bool) []byte {
-	generateID := func() string {
-		if useCache {
-			return helps.CachedUserID(apiKey)
-		}
-		return helps.GenerateFakeUserID()
-	}
-
-	metadata := gjson.GetBytes(payload, "metadata")
-	if !metadata.Exists() {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-		return payload
-	}
-
-	existingUserID := gjson.GetBytes(payload, "metadata.user_id").String()
-	if existingUserID == "" || !helps.IsValidUserID(existingUserID) {
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", generateID())
-	}
-	return payload
-}
-
-// fingerprintSalt is the salt used by Claude Code to compute the 3-char build fingerprint.
-const fingerprintSalt = "59cf53e54c78"
-
-// computeFingerprint computes the 3-char build fingerprint that Claude Code embeds in cc_version.
-// Algorithm: SHA256(salt + messageText[4] + messageText[7] + messageText[20] + version)[:3]
-func computeFingerprint(messageText, version string) string {
-	indices := [3]int{4, 7, 20}
-	runes := []rune(messageText)
-	var sb strings.Builder
-	for _, idx := range indices {
-		if idx < len(runes) {
-			sb.WriteRune(runes[idx])
-		} else {
-			sb.WriteRune('0')
-		}
-	}
-	input := fingerprintSalt + sb.String() + version
-	h := sha256.Sum256([]byte(input))
-	return hex.EncodeToString(h[:])[:3]
-}
-
-// generateBillingHeader creates the x-anthropic-billing-header text block that
-// real Claude Code prepends to every system prompt array.
-// Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=<ep>; cch=<hash>; [cc_workload=<wl>;]
-func generateBillingHeader(payload []byte, experimentalCCHSigning bool, version, messageText, entrypoint, workload string) string {
-	if entrypoint == "" {
-		entrypoint = "cli"
-	}
-	buildHash := computeFingerprint(messageText, version)
-	workloadPart := ""
-	if workload != "" {
-		workloadPart = fmt.Sprintf(" cc_workload=%s;", workload)
-	}
-
-	if experimentalCCHSigning {
-		return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=00000;%s", version, buildHash, entrypoint, workloadPart)
-	}
-
-	// Generate a deterministic cch hash from the payload content (system + messages + tools).
-	h := sha256.Sum256(payload)
-	cch := hex.EncodeToString(h[:])[:5]
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=%s;%s", version, buildHash, entrypoint, cch, workloadPart)
-}
-
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "")
 }
@@ -1743,26 +1418,27 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		messageText = system.String()
 	}
 
-	// Skip if already injected
 	firstText := gjson.GetBytes(payload, "system.0.text").String()
 	if strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
 		return payload
 	}
 
-	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
-	billingBlock := buildTextBlock(billingText, nil)
+	effectiveCCHSigning := experimentalCCHSigning || !strictMode
+	billingText := helps.GenerateClaudeBillingHeader(payload, effectiveCCHSigning, version, messageText, entrypoint, workload)
+	billingBlock := helps.BuildClaudeTextBlock(billingText, nil)
+	if !strictMode {
+		cacheTTL := "1h"
+		if helps.LooksLikeCursorSubagent(payload) {
+			cacheTTL = "5m"
+		}
+		if cursorSystemResult, ok := helps.RewriteCursorSystemPromptBlocks(system, billingBlock, cacheTTL); ok {
+			payload, _ = sjson.SetRawBytes(payload, "system", []byte(cursorSystemResult))
+			return payload
+		}
+	}
 
-	// Build system blocks matching the maintained fork's cache-bearing Claude behavior.
-	// Extend cache TTL from default 5m → 1h on static system blocks (Claude Code
-	// identity + ClaudeCodeIntro/System/DoingTasks/Tone). These NEVER change across
-	// turns. Default 5m ephemeral evicts after any user gap >5min, forcing the next
-	// turn to cache_creation the entire prefix. With ttl:"1h" the cache survives
-	// realistic gap durations. normalizeCacheControlTTL enforces the constraint
-	// that 1h blocks must come BEFORE any 5m blocks in eval order
-	// (tools→system→messages); since these are the only 1h blocks and live in
-	// `system`, they precede any 5m blocks added later in `messages`.
 	globalCache := map[string]string{"scope": "global", "ttl": "1h"}
-	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", globalCache)
+	agentBlock := helps.BuildClaudeTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", globalCache)
 	staticPrompt := strings.Join([]string{
 		helps.ClaudeCodeIntro,
 		helps.ClaudeCodeSystem,
@@ -1770,7 +1446,7 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		helps.ClaudeCodeToneAndStyle,
 		helps.ClaudeCodeOutputEfficiency,
 	}, "\n\n")
-	staticBlock := buildTextBlock(staticPrompt, globalCache)
+	staticBlock := helps.BuildClaudeTextBlock(staticPrompt, globalCache)
 
 	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
@@ -1795,10 +1471,10 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		if len(userSystemParts) > 0 {
 			combined := strings.Join(userSystemParts, "\n\n")
 			if oauthMode {
-				combined = sanitizeForwardedSystemPrompt(combined)
+				combined = helps.SanitizeForwardedSystemPrompt(combined)
 			}
 			if strings.TrimSpace(combined) != "" {
-				payload = prependToFirstUserMessage(payload, combined)
+				payload = helps.PrependClaudeToFirstUserMessage(payload, combined)
 			}
 		}
 	}
@@ -1810,123 +1486,19 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 // tiny neutral reminder for Claude OAuth cloaking. The goal is to preserve only
 // the minimum tool/task guidance while removing virtually all client-specific
 // prompt structure that Anthropic may classify as third-party agent traffic.
-func sanitizeForwardedSystemPrompt(text string) string {
-	if strings.TrimSpace(text) == "" {
-		return ""
-	}
-	base := `Use the available tools when needed to help with software engineering tasks.
-Keep responses concise and focused on the user's request.
-Prefer acting on the user's task over describing product-specific workflows.`
-
-	var extracted []string
-	for _, m := range toolGuidanceTagRe.FindAllStringSubmatch(text, -1) {
-		if len(m) < 3 {
-			continue
-		}
-		body := strings.TrimSpace(m[2])
-		if body == "" {
-			continue
-		}
-		body = identifierLeakageRe.ReplaceAllString(body, "[redacted]")
-		body = pathLeakageRe.ReplaceAllString(body, "[path]")
-		extracted = append(extracted, body)
-	}
-	if len(extracted) == 0 {
-		return strings.TrimSpace(base)
-	}
-	return strings.TrimSpace(base + "\n\n" + strings.Join(extracted, "\n\n"))
-}
-
-var toolGuidanceTagRe = regexp.MustCompile(`(?is)<(tool_calling|tool_use|tool_calls|tools_usage)>(.*?)</(?:tool_calling|tool_use|tool_calls|tools_usage)>`)
-
-var identifierLeakageRe = regexp.MustCompile(`(?i)\b(cursor|factory[- ]?cli|droid|ampcode|amp[- ]?cli|cline|aider|continue\.dev|windsurf|roocode|zed|copilot|github[- ]?copilot)\b`)
-
-var pathLeakageRe = regexp.MustCompile(`(?i)(/Users/[^\s"'\)]+|/home/[^\s"'\)]+|\$HOME[^\s"'\)]*|~/[^\s"'\)]+|C:\\[^\s"'\)]+)`)
 
 // buildTextBlock constructs a JSON text block object with proper escaping.
 // Uses sjson.SetBytes to handle multi-line text, quotes, and control characters.
 // cacheControl is optional; pass nil to omit cache_control.
-func buildTextBlock(text string, cacheControl map[string]string) string {
-	block := []byte(`{"type":"text"}`)
-	block, _ = sjson.SetBytes(block, "text", text)
-	if cacheControl != nil && len(cacheControl) > 0 {
-		// Build cache_control JSON manually to avoid sjson map marshaling issues.
-		// sjson.SetBytes with map[string]string may not produce expected structure.
-		cc := `{"type":"ephemeral"`
-		if scope, ok := cacheControl["scope"]; ok {
-			cc += fmt.Sprintf(`,"scope":"%s"`, scope)
-		}
-		if t, ok := cacheControl["ttl"]; ok {
-			cc += fmt.Sprintf(`,"ttl":"%s"`, t)
-		}
-		cc += "}"
-		block, _ = sjson.SetRawBytes(block, "cache_control", []byte(cc))
-	}
-	return string(block)
-}
-
-// prependToFirstUserMessage prepends text content to the first user message.
-// This avoids putting non-Claude-Code system instructions in system[] which
-// triggers Anthropic's extra usage billing for OAuth-proxied requests.
-func prependToFirstUserMessage(payload []byte, text string) []byte {
-	messages := gjson.GetBytes(payload, "messages")
-	if !messages.Exists() || !messages.IsArray() {
-		return payload
-	}
-
-	// Find the first user message index
-	firstUserIdx := -1
-	messages.ForEach(func(idx, msg gjson.Result) bool {
-		if msg.Get("role").String() == "user" {
-			firstUserIdx = int(idx.Int())
-			return false
-		}
-		return true
-	})
-
-	if firstUserIdx < 0 {
-		return payload
-	}
-
-	prefixBlock := fmt.Sprintf(`<system-reminder>
-As you answer the user's questions, you can use the following context from the system:
-%s
-
-IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
-</system-reminder>
-`, text)
-
-	contentPath := fmt.Sprintf("messages.%d.content", firstUserIdx)
-	content := gjson.GetBytes(payload, contentPath)
-
-	if content.IsArray() {
-		newBlock := fmt.Sprintf(`{"type":"text","text":%q}`, prefixBlock)
-		var newArray string
-		if content.Raw == "[]" || content.Raw == "" {
-			newArray = "[" + newBlock + "]"
-		} else {
-			newArray = "[" + newBlock + "," + content.Raw[1:]
-		}
-		payload, _ = sjson.SetRawBytes(payload, contentPath, []byte(newArray))
-	} else if content.Type == gjson.String {
-		newText := prefixBlock + content.String()
-		payload, _ = sjson.SetBytes(payload, contentPath, newText)
-	}
-
-	return payload
-}
-
-// applyCloaking applies cloaking transformations to the payload based on config and client.
-// Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
 func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) []byte {
-	clientUserAgent := getClientUserAgent(ctx)
+	clientUserAgent := helps.GetClaudeClientUserAgent(ctx)
 	// Enable cch signing for OAuth tokens by default (not just experimental flag).
 	oauthToken := isClaudeOAuthToken(apiKey)
 	useCCHSigning := oauthToken || experimentalCCHSigningEnabled(cfg, auth)
 
 	// Get cloak config from ClaudeKey configuration
 	cloakCfg := resolveClaudeKeyCloakConfig(cfg, auth)
-	attrMode, attrStrict, attrWords, attrCache := getCloakConfigFromAuth(auth)
+	attrMode, attrStrict, attrWords, attrCache := helps.GetClaudeCloakConfigFromAuth(auth)
 
 	// Determine cloak settings
 	cloakMode := attrMode
@@ -1957,13 +1529,13 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	// Skip system instructions for claude-3-5-haiku models
 	if !strings.HasPrefix(model, "claude-3-5-haiku") {
 		billingVersion := helps.DefaultClaudeVersion(cfg)
-		entrypoint := parseEntrypointFromUA(clientUserAgent)
-		workload := getWorkloadFromContext(ctx)
+		entrypoint := helps.ParseClaudeEntrypointFromUA(clientUserAgent)
+		workload := helps.GetClaudeWorkloadFromContext(ctx)
 		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
 	}
 
 	// Inject fake user ID
-	payload = injectFakeUserID(payload, apiKey, cacheUserID)
+	payload = helps.InjectClaudeFakeUserID(payload, apiKey, cacheUserID)
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {
@@ -1984,571 +1556,6 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 // Up to 4 cache breakpoints are allowed per request. Tools, System, and Messages are INDEPENDENT breakpoints.
 // This enables up to 90% cost reduction on cached tokens (cache read = 0.1x base price).
 // See: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
-func ensureCacheControl(payload []byte) []byte {
-	// 1. Inject cache_control into the LAST tool (caches all tool definitions)
-	// Tools are cached first in the hierarchy, so this is the most important breakpoint.
-	payload = injectToolsCacheControl(payload)
-
-	// 2. Inject cache_control into the LAST system prompt element
-	// System is the second level in the cache hierarchy.
-	payload = injectSystemCacheControl(payload)
-
-	// 3. Inject cache_control into messages for multi-turn conversation caching
-	// This caches the conversation history up to the second-to-last user turn.
-	payload = injectMessagesCacheControl(payload)
-
-	return payload
-}
-
-// ensureUserPromptCacheAnchor mirrors Claude Code's prompt-anchor pattern:
-// the LAST text block of the LAST user message gets a cache_control with
-// ttl:"1h". Real Claude Code uses a tiny trailing block carrying this
-// breakpoint to cache the ENTIRE prefix up to and including the user prompt
-// at 1-hour TTL.
-//
-// Without this, even with system blocks cached at 1h, the user prompt segment
-// re-creates each turn — noticeable cost on long-context Cursor BYOK turns.
-//
-// Idempotent: if the LAST user message's LAST block already has cache_control,
-// we leave it alone (respect client intent). The downstream
-// enforceCacheControlLimit (max 4 breakpoints) will prune if this addition
-// pushes us over the cap; it preserves later breakpoints (last in evaluation
-// order), which keeps this prompt anchor by design.
-func ensureUserPromptCacheAnchor(payload []byte) []byte {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return payload
-	}
-	messages := gjson.GetBytes(payload, "messages")
-	if !messages.IsArray() {
-		return payload
-	}
-	msgs := messages.Array()
-	lastUserIdx := -1
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Get("role").String() == "user" {
-			lastUserIdx = i
-			break
-		}
-	}
-	if lastUserIdx < 0 {
-		return payload
-	}
-	content := msgs[lastUserIdx].Get("content")
-	if !content.IsArray() {
-		// String content can't carry cache_control — skip silently.
-		return payload
-	}
-	blocks := content.Array()
-	if len(blocks) == 0 {
-		return payload
-	}
-	lastBlockIdx := len(blocks) - 1
-	if blocks[lastBlockIdx].Get("cache_control").Exists() {
-		return payload
-	}
-	path := fmt.Sprintf("messages.%d.content.%d.cache_control", lastUserIdx, lastBlockIdx)
-	cc := []byte(`{"type":"ephemeral","ttl":"1h"}`)
-	updated, err := sjson.SetRawBytes(payload, path, cc)
-	if err != nil {
-		return payload
-	}
-	return updated
-}
-
-func countCacheControls(payload []byte) int {
-	count := 0
-
-	// Check system
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				count++
-			}
-			return true
-		})
-	}
-
-	// Check tools
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				count++
-			}
-			return true
-		})
-	}
-
-	// Check messages
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(_, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if content.IsArray() {
-				content.ForEach(func(_, item gjson.Result) bool {
-					if item.Get("cache_control").Exists() {
-						count++
-					}
-					return true
-				})
-			}
-			return true
-		})
-	}
-
-	return count
-}
-
-// normalizeCacheControlTTL ensures cache_control TTL values don't violate the
-// prompt-caching-scope-2026-01-05 ordering constraint: a 1h-TTL block must not
-// appear after a 5m-TTL block anywhere in the evaluation order.
-//
-// Anthropic evaluates blocks in order: tools → system (index 0..N) → messages.
-// Within each section, blocks are evaluated in array order. A 5m (default) block
-// followed by a 1h block at ANY later position is an error — including within
-// the same section (e.g. system[1]=5m then system[3]=1h).
-//
-// Strategy: walk all cache_control blocks in evaluation order. Once a 5m block
-// is seen, strip ttl from ALL subsequent 1h blocks (downgrading them to 5m).
-func normalizeCacheControlTTL(payload []byte) []byte {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return payload
-	}
-
-	original := payload
-	seen5m := false
-	modified := false
-
-	processBlock := func(path string, obj gjson.Result) {
-		cc := obj.Get("cache_control")
-		if !cc.Exists() {
-			return
-		}
-		if !cc.IsObject() {
-			seen5m = true
-			return
-		}
-		ttl := cc.Get("ttl")
-		if ttl.Type != gjson.String || ttl.String() != "1h" {
-			seen5m = true
-			return
-		}
-		if !seen5m {
-			return
-		}
-		ttlPath := path + ".cache_control.ttl"
-		updated, errDel := sjson.DeleteBytes(payload, ttlPath)
-		if errDel != nil {
-			return
-		}
-		payload = updated
-		modified = true
-	}
-
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			processBlock(fmt.Sprintf("tools.%d", int(idx.Int())), item)
-			return true
-		})
-	}
-
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(idx, item gjson.Result) bool {
-			processBlock(fmt.Sprintf("system.%d", int(idx.Int())), item)
-			return true
-		})
-	}
-
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(itemIdx, item gjson.Result) bool {
-				processBlock(fmt.Sprintf("messages.%d.content.%d", int(msgIdx.Int()), int(itemIdx.Int())), item)
-				return true
-			})
-			return true
-		})
-	}
-
-	if !modified {
-		return original
-	}
-	return payload
-}
-
-// enforceCacheControlLimit removes excess cache_control blocks from a payload
-// so the total does not exceed the Anthropic API limit (currently 4).
-//
-// Anthropic evaluates cache breakpoints in order: tools → system → messages.
-// The most valuable breakpoints are:
-//  1. Last tool         — caches ALL tool definitions
-//  2. Last system block — caches ALL system content
-//  3. Recent messages   — cache conversation context
-//
-// Removal priority (strip lowest-value first):
-//
-//	Phase 1: system blocks earliest-first, preserving the last one.
-//	Phase 2: tool blocks earliest-first, preserving the last one.
-//	Phase 3: message content blocks earliest-first.
-//	Phase 4: remaining system blocks (last system).
-//	Phase 5: remaining tool blocks (last tool).
-func enforceCacheControlLimit(payload []byte, maxBlocks int) []byte {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return payload
-	}
-
-	total := countCacheControls(payload)
-	if total <= maxBlocks {
-		return payload
-	}
-
-	excess := total - maxBlocks
-
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		lastIdx := -1
-		system.ForEach(func(idx, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				lastIdx = int(idx.Int())
-			}
-			return true
-		})
-		if lastIdx >= 0 {
-			system.ForEach(func(idx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				i := int(idx.Int())
-				if i == lastIdx {
-					return true
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("system.%d.cache_control", i)
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-		}
-	}
-	if excess <= 0 {
-		return payload
-	}
-
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		lastIdx := -1
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				lastIdx = int(idx.Int())
-			}
-			return true
-		})
-		if lastIdx >= 0 {
-			tools.ForEach(func(idx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				i := int(idx.Int())
-				if i == lastIdx {
-					return true
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("tools.%d.cache_control", i)
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-		}
-	}
-	if excess <= 0 {
-		return payload
-	}
-
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			content := msg.Get("content")
-			if !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(itemIdx, item gjson.Result) bool {
-				if excess <= 0 {
-					return false
-				}
-				if !item.Get("cache_control").Exists() {
-					return true
-				}
-				path := fmt.Sprintf("messages.%d.content.%d.cache_control", int(msgIdx.Int()), int(itemIdx.Int()))
-				updated, errDel := sjson.DeleteBytes(payload, path)
-				if errDel != nil {
-					return true
-				}
-				payload = updated
-				excess--
-				return true
-			})
-			return true
-		})
-	}
-	if excess <= 0 {
-		return payload
-	}
-
-	system = gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(idx, item gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			if !item.Get("cache_control").Exists() {
-				return true
-			}
-			path := fmt.Sprintf("system.%d.cache_control", int(idx.Int()))
-			updated, errDel := sjson.DeleteBytes(payload, path)
-			if errDel != nil {
-				return true
-			}
-			payload = updated
-			excess--
-			return true
-		})
-	}
-	if excess <= 0 {
-		return payload
-	}
-
-	tools = gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(idx, item gjson.Result) bool {
-			if excess <= 0 {
-				return false
-			}
-			if !item.Get("cache_control").Exists() {
-				return true
-			}
-			path := fmt.Sprintf("tools.%d.cache_control", int(idx.Int()))
-			updated, errDel := sjson.DeleteBytes(payload, path)
-			if errDel != nil {
-				return true
-			}
-			payload = updated
-			excess--
-			return true
-		})
-	}
-
-	return payload
-}
-
-// injectMessagesCacheControl adds cache_control to the second-to-last user turn for multi-turn caching.
-// Per Anthropic docs: "Place cache_control on the second-to-last User message to let the model reuse the earlier cache."
-// This enables caching of conversation history, which is especially beneficial for long multi-turn conversations.
-// Only adds cache_control if:
-// - There are at least 2 user turns in the conversation
-// - No message content already has cache_control
-func injectMessagesCacheControl(payload []byte) []byte {
-	messages := gjson.GetBytes(payload, "messages")
-	if !messages.Exists() || !messages.IsArray() {
-		return payload
-	}
-
-	// Check if ANY message content already has cache_control
-	hasCacheControlInMessages := false
-	messages.ForEach(func(_, msg gjson.Result) bool {
-		content := msg.Get("content")
-		if content.IsArray() {
-			content.ForEach(func(_, item gjson.Result) bool {
-				if item.Get("cache_control").Exists() {
-					hasCacheControlInMessages = true
-					return false
-				}
-				return true
-			})
-		}
-		return !hasCacheControlInMessages
-	})
-	if hasCacheControlInMessages {
-		return payload
-	}
-
-	// Find all user message indices
-	var userMsgIndices []int
-	messages.ForEach(func(index gjson.Result, msg gjson.Result) bool {
-		if msg.Get("role").String() == "user" {
-			userMsgIndices = append(userMsgIndices, int(index.Int()))
-		}
-		return true
-	})
-
-	// Need at least 2 user turns to cache the second-to-last
-	if len(userMsgIndices) < 2 {
-		return payload
-	}
-
-	// Get the second-to-last user message index
-	secondToLastUserIdx := userMsgIndices[len(userMsgIndices)-2]
-
-	// Get the content of this message
-	contentPath := fmt.Sprintf("messages.%d.content", secondToLastUserIdx)
-	content := gjson.GetBytes(payload, contentPath)
-
-	if content.IsArray() {
-		// Add cache_control to the last content block of this message
-		contentCount := int(content.Get("#").Int())
-		if contentCount > 0 {
-			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, contentCount-1)
-			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral", "scope": "global"})
-			if err != nil {
-				log.Warnf("failed to inject cache_control into messages: %v", err)
-				return payload
-			}
-			payload = result
-		}
-	} else if content.Type == gjson.String {
-		// Convert string content to array with cache_control
-		text := content.String()
-		newContent := []map[string]interface{}{
-			{
-				"type": "text",
-				"text": text,
-				"cache_control": map[string]string{
-					"type":  "ephemeral",
-					"scope": "global",
-				},
-			},
-		}
-		result, err := sjson.SetBytes(payload, contentPath, newContent)
-		if err != nil {
-			log.Warnf("failed to inject cache_control into message string content: %v", err)
-			return payload
-		}
-		payload = result
-	}
-
-	return payload
-}
-
-// injectToolsCacheControl adds cache_control to the last tool in the tools array.
-// Per Anthropic docs: "The cache_control parameter on the last tool definition caches all tool definitions."
-// This only adds cache_control if NO tool in the array already has it.
-func injectToolsCacheControl(payload []byte) []byte {
-	tools := gjson.GetBytes(payload, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		return payload
-	}
-
-	toolCount := int(tools.Get("#").Int())
-	if toolCount == 0 {
-		return payload
-	}
-
-	// Check if ANY tool already has cache_control - if so, don't modify tools
-	hasCacheControlInTools := false
-	tools.ForEach(func(_, tool gjson.Result) bool {
-		if tool.Get("cache_control").Exists() {
-			hasCacheControlInTools = true
-			return false
-		}
-		return true
-	})
-	if hasCacheControlInTools {
-		return payload
-	}
-
-	// Add cache_control to the last tool
-	lastToolPath := fmt.Sprintf("tools.%d.cache_control", toolCount-1)
-	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral", "scope": "global"})
-	if err != nil {
-		log.Warnf("failed to inject cache_control into tools array: %v", err)
-		return payload
-	}
-
-	return result
-}
-
-// injectSystemCacheControl adds cache_control to the last element in the system prompt.
-// Converts string system prompts to array format if needed.
-// This only adds cache_control if NO system element already has it.
-func injectSystemCacheControl(payload []byte) []byte {
-	system := gjson.GetBytes(payload, "system")
-	if !system.Exists() {
-		return payload
-	}
-
-	if system.IsArray() {
-		count := int(system.Get("#").Int())
-		if count == 0 {
-			return payload
-		}
-
-		// Check if ANY system element already has cache_control
-		hasCacheControlInSystem := false
-		system.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				hasCacheControlInSystem = true
-				return false
-			}
-			return true
-		})
-		if hasCacheControlInSystem {
-			return payload
-		}
-
-		// Add cache_control to the last system element
-		lastSystemPath := fmt.Sprintf("system.%d.cache_control", count-1)
-		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral", "scope": "global"})
-		if err != nil {
-			log.Warnf("failed to inject cache_control into system array: %v", err)
-			return payload
-		}
-		payload = result
-	} else if system.Type == gjson.String {
-		// Convert string system prompt to array with cache_control
-		// "system": "text" -> "system": [{"type": "text", "text": "text", "cache_control": {"type": "ephemeral"}}]
-		text := system.String()
-		newSystem := []map[string]interface{}{
-			{
-				"type": "text",
-				"text": text,
-				"cache_control": map[string]string{
-					"type":  "ephemeral",
-					"scope": "global",
-				},
-			},
-		}
-		result, err := sjson.SetBytes(payload, "system", newSystem)
-		if err != nil {
-			log.Warnf("failed to inject cache_control into system string: %v", err)
-			return payload
-		}
-		payload = result
-	}
-
-	return payload
-}
-
 func ensureModelMaxTokens(body []byte, modelID string) []byte {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return body
