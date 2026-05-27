@@ -211,6 +211,16 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 	return out
 }
 
+// GetCodeBuddyModels returns nil; the codebuddy executor maintains its own
+// model list. Stub exists to satisfy registry channel and lookup call sites
+// from the f88a5eae migration commit.
+func GetCodeBuddyModels() []*ModelInfo { return nil }
+
+// GetGitHubCopilotModels returns nil; same reason. The github_copilot
+// executor at internal/runtime/executor/github_copilot_executor.go owns
+// the real model list.
+func GetGitHubCopilotModels() []*ModelInfo { return nil }
+
 // GetStaticModelDefinitionsByChannel returns static model definitions for a given channel/provider.
 // It returns nil when the channel is unknown.
 //
