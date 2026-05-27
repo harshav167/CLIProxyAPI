@@ -1831,6 +1831,51 @@ func disableWSSession(sess *codexWebsocketSession, sessionKey, reason string) {
 	log.Warnf("codex http-ws bridge: WS transport disabled for session %s (%s, will recover after %v)", sessionKey, reason, wsDisabledRecoveryWindow)
 }
 
+func isUpgradeRequiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se statusErr
+	if errors.As(err, &se) && se.code == http.StatusUpgradeRequired {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "426") && strings.Contains(errStr, "upgrade required")
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func authIDForBridge(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.ID)
+}
+
+// CodexAutoExecutor routes Codex requests to the websocket transport only when:
+//  1. The downstream transport is websocket, and
+//  2. The selected auth enables websockets.
+//
+// For non-websocket downstream requests, it always uses the legacy HTTP implementation.
+type CodexAutoExecutor struct {
+	cfg      *config.Config
+	httpExec *CodexExecutor
+	wsExec   *CodexWebsocketsExecutor
+}
+
+func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
+	return &CodexAutoExecutor{
+		cfg:      cfg,
+		httpExec: NewCodexExecutor(cfg),
+		wsExec:   NewCodexWebsocketsExecutor(cfg),
+	}
+}
+
 func (e *CodexAutoExecutor) isWSDisabled(sessionKey string) bool {
 	sess := e.getWSSession(sessionKey)
 	if sess == nil {
@@ -1877,51 +1922,6 @@ func (e *CodexAutoExecutor) connGeneration(sessionKey string) uint64 {
 	sess.connMu.Lock()
 	defer sess.connMu.Unlock()
 	return sess.connGeneration
-}
-
-func isUpgradeRequiredError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var se statusErr
-	if errors.As(err, &se) && se.code == http.StatusUpgradeRequired {
-		return true
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "426") && strings.Contains(errStr, "upgrade required")
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func authIDForBridge(auth *cliproxyauth.Auth) string {
-	if auth == nil {
-		return ""
-	}
-	return strings.TrimSpace(auth.ID)
-}
-
-// CodexAutoExecutor routes Codex requests to the websocket transport only when:
-//  1. The downstream transport is websocket, and
-//  2. The selected auth enables websockets.
-//
-// For non-websocket downstream requests, it always uses the legacy HTTP implementation.
-type CodexAutoExecutor struct {
-	cfg      *config.Config
-	httpExec *CodexExecutor
-	wsExec   *CodexWebsocketsExecutor
-}
-
-func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
-	return &CodexAutoExecutor{
-		cfg:      cfg,
-		httpExec: NewCodexExecutor(cfg),
-		wsExec:   NewCodexWebsocketsExecutor(cfg),
-	}
 }
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
