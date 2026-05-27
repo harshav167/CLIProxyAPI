@@ -8,8 +8,6 @@ package openai
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,8 +18,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	codexconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/openai/chat-completions"
+	codexresponsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/openai/responses"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -96,26 +94,7 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 				out["context_window"] = cl
 			}
 		}
-		if id, ok := out["id"].(string); ok {
-			if version, vok := out["version"].(string); vok && version != "" && version != id {
-				out["version"] = id
-				out["display_name"] = id
-				shouldSpoofOwner := false
-				if cwVal, cwOk := out["context_window"]; cwOk {
-					switch cw := cwVal.(type) {
-					case float64:
-						shouldSpoofOwner = cw < 500000
-					case int:
-						shouldSpoofOwner = cw < 500000
-					case int64:
-						shouldSpoofOwner = cw < 500000
-					}
-				}
-				if shouldSpoofOwner {
-					out["owned_by"] = "cpapi-plus"
-				}
-			}
-		}
+		normalizeOpenAIModelMetadata(out)
 		filteredModels[i] = out
 	}
 
@@ -144,7 +123,7 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	if isCodexBoundModel(gjson.GetBytes(rawJSON, "model").String()) {
+	if hasModelProvider(gjson.GetBytes(rawJSON, "model").String(), "codex", "xai") {
 		rawJSON = maybeInjectSyntheticPromptCacheKey(c, rawJSON)
 	}
 
@@ -153,9 +132,25 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 	stream := streamResult.Type == gjson.True
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
+	if shouldRouteResponsesBodyViaCodexResponses(modelName, rawJSON) {
+		originalChat := rawJSON
+		rawJSON = codexresponsesconverter.ConvertOpenAIResponsesRequestToCodex(modelName, rawJSON, stream)
+		stream = gjson.GetBytes(rawJSON, "stream").Bool()
+		if stream {
+			h.handleStreamingResponseViaResponses(c, rawJSON, originalChat)
+		} else {
+			h.handleNonStreamingResponseViaResponses(c, rawJSON, originalChat)
+		}
+		return
+	}
+
 	if overrideEndpoint, ok := resolveEndpointOverride(modelName, openAIChatEndpoint); ok && overrideEndpoint == openAIResponsesEndpoint {
 		originalChat := rawJSON
-		if !shouldTreatAsResponsesFormat(rawJSON) {
+		if shouldTreatAsResponsesFormat(rawJSON) {
+			if hasModelProvider(modelName, "codex") {
+				rawJSON = codexresponsesconverter.ConvertOpenAIResponsesRequestToCodex(modelName, rawJSON, stream)
+			}
+		} else {
 			rawJSON = codexconverter.ConvertOpenAIRequestToCodex(modelName, rawJSON, stream)
 		}
 		stream = gjson.GetBytes(rawJSON, "stream").Bool()
@@ -180,21 +175,6 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		h.handleNonStreamingResponse(c, rawJSON)
 	}
 
-}
-
-// shouldTreatAsResponsesFormat detects OpenAI Responses-style payloads that are
-// accidentally sent to the Chat Completions endpoint.
-func shouldTreatAsResponsesFormat(rawJSON []byte) bool {
-	if gjson.GetBytes(rawJSON, "messages").Exists() {
-		return false
-	}
-	if gjson.GetBytes(rawJSON, "input").Exists() {
-		return true
-	}
-	if gjson.GetBytes(rawJSON, "instructions").Exists() {
-		return true
-	}
-	return false
 }
 
 // Completions handles the /v1/completions endpoint.
@@ -485,6 +465,7 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = withCursorExecutionSessionID(cliCtx, rawJSON)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
@@ -493,31 +474,6 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
-	cliCancel()
-}
-
-func (h *OpenAIAPIHandler) handleNonStreamingResponseViaResponses(c *gin.Context, rawJSON []byte, originalChatJSON []byte) {
-	c.Header("Content-Type", "application/json")
-
-	modelName := gjson.GetBytes(rawJSON, "model").String()
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, OpenaiResponse, modelName, rawJSON, h.GetAlt(c))
-	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
-		cliCancel(errMsg.Error)
-		return
-	}
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	converted := convertResponsesObjectToChatCompletion(cliCtx, modelName, originalChatJSON, rawJSON, resp)
-	if converted == nil {
-		h.WriteErrorResponse(c, &interfaces.ErrorMessage{
-			StatusCode: http.StatusInternalServerError,
-			Error:      fmt.Errorf("failed to convert response to chat completion format"),
-		})
-		cliCancel(fmt.Errorf("response conversion failed"))
-		return
-	}
-	_, _ = c.Writer.Write(converted)
 	cliCancel()
 }
 
@@ -543,6 +499,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = withCursorExecutionSessionID(cliCtx, rawJSON)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 
 	setSSEHeaders := func() {
@@ -592,68 +549,6 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 			// Continue streaming the rest
 			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
-			return
-		}
-	}
-}
-
-func (h *OpenAIAPIHandler) handleStreamingResponseViaResponses(c *gin.Context, rawJSON []byte, originalChatJSON []byte) {
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "Streaming not supported",
-				Type:    "server_error",
-			},
-		})
-		return
-	}
-
-	modelName := gjson.GetBytes(rawJSON, "model").String()
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, OpenaiResponse, modelName, rawJSON, h.GetAlt(c))
-	var param any
-
-	setSSEHeaders := func() {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("Access-Control-Allow-Origin", "*")
-	}
-
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			cliCancel(c.Request.Context().Err())
-			return
-		case errMsg, ok := <-errChan:
-			if !ok {
-				errChan = nil
-				continue
-			}
-			h.WriteErrorResponse(c, errMsg)
-			if errMsg != nil {
-				cliCancel(errMsg.Error)
-			} else {
-				cliCancel(nil)
-			}
-			return
-		case chunk, ok := <-dataChan:
-			if !ok {
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
-				flusher.Flush()
-				cliCancel(nil)
-				return
-			}
-
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-			writeConvertedResponsesChunk(c, cliCtx, modelName, originalChatJSON, rawJSON, chunk, &param)
-			flusher.Flush()
-
-			h.forwardResponsesAsChatStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, cliCtx, modelName, originalChatJSON, rawJSON, &param)
 			return
 		}
 	}
@@ -822,220 +717,4 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 		},
 	})
-}
-
-func convertResponsesObjectToChatCompletion(ctx context.Context, modelName string, originalChatJSON, responsesRequestJSON, responsesPayload []byte) []byte {
-	if len(responsesPayload) == 0 {
-		return nil
-	}
-	wrapped := wrapResponsesPayloadAsCompleted(responsesPayload)
-	if len(wrapped) == 0 {
-		return nil
-	}
-	var param any
-	converted := codexconverter.ConvertCodexResponseToOpenAINonStream(ctx, modelName, originalChatJSON, responsesRequestJSON, wrapped, &param)
-	if len(converted) == 0 {
-		return nil
-	}
-	return converted
-}
-
-func wrapResponsesPayloadAsCompleted(payload []byte) []byte {
-	if gjson.GetBytes(payload, "type").Exists() {
-		return payload
-	}
-	if gjson.GetBytes(payload, "object").String() != "response" {
-		return payload
-	}
-	wrapped := `{"type":"response.completed","response":{}}`
-	wrapped, _ = sjson.SetRaw(wrapped, "response", string(payload))
-	return []byte(wrapped)
-}
-
-func writeConvertedResponsesChunk(c *gin.Context, ctx context.Context, modelName string, originalChatJSON, responsesRequestJSON, chunk []byte, param *any) {
-	outputs := codexconverter.ConvertCodexResponseToOpenAI(ctx, modelName, originalChatJSON, responsesRequestJSON, chunk, param)
-	for _, out := range outputs {
-		if len(out) == 0 {
-			continue
-		}
-		_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", out)
-	}
-}
-
-func (h *OpenAIAPIHandler) forwardResponsesAsChatStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, ctx context.Context, modelName string, originalChatJSON, responsesRequestJSON []byte, param *any) {
-	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
-		WriteChunk: func(chunk []byte) {
-			outputs := codexconverter.ConvertCodexResponseToOpenAI(ctx, modelName, originalChatJSON, responsesRequestJSON, chunk, param)
-			for _, out := range outputs {
-				if len(out) == 0 {
-					continue
-				}
-				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", out)
-			}
-		},
-		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
-			if errMsg == nil {
-				return
-			}
-			status := http.StatusInternalServerError
-			if errMsg.StatusCode > 0 {
-				status = errMsg.StatusCode
-			}
-			errText := http.StatusText(status)
-			if errMsg.Error != nil && errMsg.Error.Error() != "" {
-				errText = errMsg.Error.Error()
-			}
-			body := handlers.BuildErrorResponseBody(status, errText)
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
-		},
-		WriteDone: func() {
-			_, _ = fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
-		},
-	})
-}
-
-func isCodexBoundModel(modelName string) bool {
-	if modelName == "" {
-		return false
-	}
-	for _, p := range util.GetProviderName(modelName) {
-		if p == "codex" {
-			return true
-		}
-	}
-	return false
-}
-
-func maybeInjectSyntheticPromptCacheKey(c *gin.Context, rawJSON []byte) []byte {
-	if c == nil || c.Request == nil {
-		return rawJSON
-	}
-	if existing := gjson.GetBytes(rawJSON, "prompt_cache_key").String(); existing != "" {
-		return rawJSON
-	}
-	model := gjson.GetBytes(rawJSON, "model").String()
-	if model == "" {
-		return rawJSON
-	}
-
-	// PREFERRED — derive pck from a client-supplied conversation identifier
-	// when present. Currently recognized:
-	//
-	//   metadata.cursorConversationId — UUID emitted by Cursor BYOK on every
-	//     chat-completions turn; Cursor is the authority on what constitutes
-	//     "one conversation" and (by extension) which subagent runs should
-	//     share their parent's cache. Stable across all turns of a chat.
-	//
-	// Using a client-supplied identifier eliminates two failure modes that
-	// content-hash anchors have:
-	//   1. False collisions — two truly independent chats opened in the same
-	//      workspace state (identical first 4KB of first user message) get
-	//      DIFFERENT cursorConversationIds → different pck → no shared cache
-	//      slot upstream → no mutual eviction.
-	//   2. False splits — if Cursor ever ships subagents that share the parent
-	//      conversation context, they'll naturally inherit cursorConversationId
-	//      → same pck → subagent reuses parent's warm cache automatically.
-	//
-	// Future: add other clients' equivalents here as they surface (e.g. a
-	// `metadata.parent_message_id` or `X-Conversation-Id` header).
-	if convID := gjson.GetBytes(rawJSON, "metadata.cursorConversationId").String(); convID != "" {
-		// Prefix per-source so different identifier semantics never collide
-		// in the upstream cache namespace. sha256-hash so the public key
-		// length stays constant and we don't leak the raw UUID upstream.
-		sum := sha256.Sum256([]byte("cli-proxy\x00cursor-conv\x00" + model + "\x00" + convID))
-		key := "cli-proxy-" + hex.EncodeToString(sum[:16])
-		out, err := sjson.SetBytes(rawJSON, "prompt_cache_key", key)
-		if err != nil {
-			return rawJSON
-		}
-		return out
-	}
-
-	// FALLBACK — derive pck from a stable text anchor (first user message,
-	// truncated head). Used by clients without a conversation-ID metadata
-	// field: generic openai-sdk consumers, Cursor in legacy modes, future
-	// BYOK paths whose harnesses don't propagate a parent identifier.
-	const anchorMax = 4096
-	anchor := firstUserMessageAnchorAnyShape(rawJSON, anchorMax)
-	if anchor == "" {
-		return rawJSON
-	}
-	sum := sha256.Sum256([]byte("cli-proxy\x00" + model + "\x00" + anchor))
-	key := "cli-proxy-" + hex.EncodeToString(sum[:16])
-	out, err := sjson.SetBytes(rawJSON, "prompt_cache_key", key)
-	if err != nil {
-		return rawJSON
-	}
-	return out
-}
-
-func firstUserMessageAnchor(rawJSON []byte, maxLen int) string {
-	msgs := gjson.GetBytes(rawJSON, "messages")
-	if !msgs.IsArray() {
-		return ""
-	}
-	var out string
-	msgs.ForEach(func(_, m gjson.Result) bool {
-		if m.Get("role").String() != "user" {
-			return true
-		}
-		c := m.Get("content")
-		if !c.Exists() {
-			return true
-		}
-		if c.IsArray() {
-			c.ForEach(func(_, blk gjson.Result) bool {
-				if t := blk.Get("text"); t.Exists() && t.Type == gjson.String {
-					out = truncateGJSONString(t, maxLen)
-					return out == ""
-				}
-				return true
-			})
-		} else if c.Type == gjson.String {
-			out = truncateGJSONString(c, maxLen)
-		}
-		return false
-	})
-	return out
-}
-
-func truncateGJSONString(r gjson.Result, maxLen int) string {
-	s := r.Str
-	if s == "" {
-		s = r.String()
-	}
-	if len(s) > maxLen {
-		s = s[:maxLen]
-	}
-	return s
-}
-
-func firstUserMessageAnchorAnyShape(rawJSON []byte, maxLen int) string {
-	if v := firstUserMessageAnchor(rawJSON, maxLen); v != "" {
-		return v
-	}
-	arr := gjson.GetBytes(rawJSON, "input")
-	if !arr.IsArray() {
-		return ""
-	}
-	var out string
-	arr.ForEach(func(_, m gjson.Result) bool {
-		if m.Get("role").String() != "user" {
-			return true
-		}
-		c := m.Get("content")
-		if c.IsArray() {
-			c.ForEach(func(_, blk gjson.Result) bool {
-				if t := blk.Get("text"); t.Exists() && t.Type == gjson.String {
-					out = truncateGJSONString(t, maxLen)
-					return false
-				}
-				return true
-			})
-		} else if c.Type == gjson.String {
-			out = truncateGJSONString(c, maxLen)
-		}
-		return false
-	})
-	return out
 }

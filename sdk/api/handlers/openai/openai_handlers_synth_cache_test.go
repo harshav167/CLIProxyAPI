@@ -2,6 +2,7 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -165,6 +166,45 @@ func TestFirstUserMessageAnchorPicksFirstUserNotSystem(t *testing.T) {
 	got := firstUserMessageAnchor(body, 4096)
 	if got != "actual user message" {
 		t.Errorf("anchor = %q, want %q", got, "actual user message")
+	}
+}
+
+func TestDeriveCursorSessionIDPrefersCursorConversationId(t *testing.T) {
+	bodyA1 := []byte(`{"model":"gpt-5.4","user":"user-a","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"input":[{"role":"user","content":"turn one"}]}`)
+	bodyA2 := []byte(`{"model":"gpt-5.4","user":"user-a","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"input":[{"role":"user","content":"turn five has different text"}]}`)
+	bodyB := []byte(`{"model":"gpt-5.4","user":"user-a","metadata":{"cursorConversationId":"6e9c5188-53c5-4207-8a7b-c00d7428979c"},"input":[{"role":"user","content":"turn one"}]}`)
+
+	sessionA1 := deriveCursorSessionID(bodyA1)
+	sessionA2 := deriveCursorSessionID(bodyA2)
+	sessionB := deriveCursorSessionID(bodyB)
+
+	if sessionA1 == "" || !strings.HasPrefix(sessionA1, "cursor-conv-") {
+		t.Fatalf("expected cursorConversationId-derived session, got %q", sessionA1)
+	}
+	if sessionA1 != sessionA2 {
+		t.Fatalf("same cursorConversationId must produce stable execution session: %q vs %q", sessionA1, sessionA2)
+	}
+	if sessionA1 == sessionB {
+		t.Fatalf("different cursorConversationIds must not share execution session: %q", sessionA1)
+	}
+}
+
+func TestWithCursorExecutionSessionID_WrapsWhenSessionDerivable(t *testing.T) {
+	bg := context.Background()
+
+	cursorBody := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"hello"}]}`)
+	wrapped := withCursorExecutionSessionID(bg, cursorBody)
+	if wrapped == bg {
+		t.Fatalf("expected wrapped context to differ from input when session id derivable; got identical context")
+	}
+
+	plainBody := []byte(`{"model":"some-other-model","messages":[{"role":"user","content":"hi"}]}`)
+	if got := withCursorExecutionSessionID(bg, plainBody); got != bg {
+		t.Fatalf("expected input context to be returned unchanged when session id not derivable; got wrapped context %p (input %p)", got, bg)
+	}
+
+	if got := withCursorExecutionSessionID(bg, cursorBody); got == bg {
+		t.Fatalf("expected second wrap to also differ from input")
 	}
 }
 
