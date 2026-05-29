@@ -461,7 +461,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, helps.PayloadRequestPath(opts))
 	body = applyCursorGPTUpgradeIfEnabled(ctx, e.cfg, baseModel, body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
-	if IsCursorClient(ctx) {
+	// Remote compaction is for NON-Cursor chat-completions clients that don't
+	// do their own compaction and hit upstream's context ceiling. Cursor has
+	// native compaction and must keep owning that lifecycle, so it is excluded
+	// here at the call site (and defensively again inside maybeRemoteCompact).
+	// Pre-fix this was gated on IsCursorClient(ctx), which — combined with the
+	// in-helper Cursor skip — made maybeRemoteCompact unreachable for everyone.
+	if !IsCursorClient(ctx) {
 		if compacted, ok := maybeRemoteCompact(ctx, e.cfg, auth, body, helps.ExecutionSessionIDFromOptions(opts)); ok {
 			body = compacted
 		}
@@ -529,6 +535,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
+			// Unlock the per-session request mutex before returning. Without
+			// this, a non-426 handshake rejection (401/403/429/500) on an
+			// execution-session stream permanently strands sess.reqMu locked,
+			// deadlocking every later request that reuses the same
+			// executionSessionID.
+			if sess != nil {
+				sess.reqMu.Unlock()
+			}
 			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)

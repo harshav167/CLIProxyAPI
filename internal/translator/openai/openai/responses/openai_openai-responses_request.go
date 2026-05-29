@@ -120,7 +120,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
 			}
-			if itemType != "function_call" {
+			// Keep buffering across BOTH tool-call item types. The case below
+			// buffers function_call AND custom_tool_call into pendingToolCalls so
+			// consecutive tool calls collapse into one assistant message with
+			// multiple tool_calls (correct Chat Completions parallel-call shape).
+			// If we only exempt function_call here, a custom_tool_call forces a
+			// premature flush and splits consecutive custom tool calls into
+			// separate assistant messages before their outputs — invalid ordering.
+			if itemType != "function_call" && itemType != "custom_tool_call" {
 				flushPendingToolCalls()
 			}
 
