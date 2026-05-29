@@ -191,20 +191,35 @@ func TestDeriveCursorSessionIDPrefersCursorConversationId(t *testing.T) {
 
 func TestWithCursorExecutionSessionID_WrapsWhenSessionDerivable(t *testing.T) {
 	bg := context.Background()
+	cursorCtx, _ := newTestGinContext(t, "Cursor/1.0")
 
 	cursorBody := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"hello"}]}`)
-	wrapped := withCursorExecutionSessionID(bg, cursorBody)
+	wrapped := withCursorExecutionSessionID(bg, cursorCtx, cursorBody)
 	if wrapped == bg {
 		t.Fatalf("expected wrapped context to differ from input when session id derivable; got identical context")
 	}
 
 	plainBody := []byte(`{"model":"some-other-model","messages":[{"role":"user","content":"hi"}]}`)
-	if got := withCursorExecutionSessionID(bg, plainBody); got != bg {
+	if got := withCursorExecutionSessionID(bg, cursorCtx, plainBody); got != bg {
 		t.Fatalf("expected input context to be returned unchanged when session id not derivable; got wrapped context %p (input %p)", got, bg)
 	}
 
-	if got := withCursorExecutionSessionID(bg, cursorBody); got == bg {
+	if got := withCursorExecutionSessionID(bg, cursorCtx, cursorBody); got == bg {
 		t.Fatalf("expected second wrap to also differ from input")
+	}
+}
+
+func TestWithCursorExecutionSessionIDRequiresCursorUserAgent(t *testing.T) {
+	bg := context.Background()
+	nonCursorCtx, _ := newTestGinContext(t, "factory-cli/0.108.0")
+	body := []byte(`{"model":"gpt-5.5","user":"generic-user","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"hello"}]}`)
+
+	if got := withCursorExecutionSessionID(bg, nonCursorCtx, body); got != bg {
+		t.Fatalf("non-Cursor chat request must not receive Cursor execution session context")
+	}
+
+	if got := withCursorExecutionSessionID(bg, nil, body); got != bg {
+		t.Fatalf("nil gin context must not receive Cursor execution session context")
 	}
 }
 

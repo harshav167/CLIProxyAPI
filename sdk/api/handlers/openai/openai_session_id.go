@@ -185,7 +185,10 @@ func deriveCursorSessionID(rawJSON []byte) string {
 	return "cursor-" + hex.EncodeToString(sum[:12])
 }
 
-func withCursorExecutionSessionID(ctx context.Context, rawJSON []byte) context.Context {
+func withCursorExecutionSessionID(ctx context.Context, c *gin.Context, rawJSON []byte) context.Context {
+	if c == nil || c.Request == nil || !strings.HasPrefix(c.Request.UserAgent(), "Cursor/") {
+		return ctx
+	}
 	sessionID := deriveCursorSessionID(rawJSON)
 	if sessionID == "" {
 		return ctx

@@ -186,6 +186,13 @@ func maybeRemoteCompact(
 	if cfg == nil || !cfg.CodexRemoteCompaction.Enabled {
 		return payload, false
 	}
+	// Cursor has native compaction and must keep owning that lifecycle. The
+	// proxy's remote /responses/compact splice can leave Cursor waiting on a
+	// turn shape it did not initiate, so never apply it to Cursor traffic even
+	// when the experimental remote-compaction flag is enabled.
+	if IsCursorClient(ctx) {
+		return payload, false
+	}
 	// Skip when session key is empty. The (session, auth) cooldown that
 	// guards against degraded-endpoint thrashing is keyed by sessionKey;
 	// with an empty key the cooldown can't protect us, so every oversized

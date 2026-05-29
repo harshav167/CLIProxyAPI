@@ -121,3 +121,15 @@ func TestRefreshTokens_DeduplicatesConcurrentRefresh(t *testing.T) {
 		t.Fatalf("expected exactly 1 upstream refresh call, got %d", got)
 	}
 }
+
+func TestGenerateSuccessHTMLEscapesPlatformURL(t *testing.T) {
+	server := &OAuthServer{}
+	html := server.generateSuccessHTML(true, `https://console.anthropic.com/?next="><script>alert(1)</script>`)
+
+	if strings.Contains(html, `"><script>`) {
+		t.Fatalf("platform URL was not escaped: %s", html)
+	}
+	if !strings.Contains(html, "&#34;&gt;&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Fatalf("escaped platform URL not found in success HTML: %s", html)
+	}
+}

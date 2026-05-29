@@ -63,7 +63,7 @@ func TestRewriteCursorSystemPromptIdentity_NonCursorUnchanged(t *testing.T) {
 	}
 }
 
-func TestApplyCursorGPT54SystemPromptUpgrade(t *testing.T) {
+func TestApplyCursorGPTSystemPromptUpgrade(t *testing.T) {
 	input := strings.Join([]string{
 		"You are running as a coding agent in Cursor IDE on a user's computer.",
 		"",
@@ -93,9 +93,9 @@ func TestApplyCursorGPT54SystemPromptUpgrade(t *testing.T) {
 		"</main_goal>",
 	}, "\n")
 
-	out, matched := ApplyCursorGPT54SystemPromptUpgrade(input)
+	out, matched := ApplyCursorGPTSystemPromptUpgrade(input)
 	if !matched {
-		t.Fatal("expected Cursor GPT-5.4 prompt shape to match")
+		t.Fatal("expected Cursor GPT prompt shape to match")
 	}
 
 	for _, want := range []string{
@@ -138,7 +138,7 @@ func TestApplyCursorGPT54SystemPromptUpgrade(t *testing.T) {
 		}
 	}
 
-	again, matchedAgain := ApplyCursorGPT54SystemPromptUpgrade(out)
+	again, matchedAgain := ApplyCursorGPTSystemPromptUpgrade(out)
 	if matchedAgain {
 		t.Fatal("second upgrade should be idempotent")
 	}
@@ -147,7 +147,7 @@ func TestApplyCursorGPT54SystemPromptUpgrade(t *testing.T) {
 	}
 }
 
-func TestApplyCursorGPT54SystemPromptUpgradeToPayload(t *testing.T) {
+func TestApplyCursorGPTSystemPromptUpgradeToPayload(t *testing.T) {
 	prompt := strings.Join([]string{
 		"<general>",
 		"- Keep working.",
@@ -164,7 +164,7 @@ func TestApplyCursorGPT54SystemPromptUpgradeToPayload(t *testing.T) {
 	payload := []byte(`{"instructions":""}`)
 	payload, _ = sjson.SetBytes(payload, "instructions", prompt)
 
-	out := ApplyCursorGPT54SystemPromptUpgradeToPayload(payload)
+	out := ApplyCursorGPTSystemPromptUpgradeToPayload(payload)
 	instructions := gjson.GetBytes(out, "instructions").String()
 	if !strings.Contains(instructions, "<execution_persistence>") {
 		t.Fatalf("expected payload instructions to be upgraded: %s", string(out))
@@ -174,7 +174,7 @@ func TestApplyCursorGPT54SystemPromptUpgradeToPayload(t *testing.T) {
 	}
 
 	other := []byte(`{"instructions":"You are helpful."}`)
-	if got := string(ApplyCursorGPT54SystemPromptUpgradeToPayload(other)); got != string(other) {
+	if got := string(ApplyCursorGPTSystemPromptUpgradeToPayload(other)); got != string(other) {
 		t.Fatalf("non-Cursor payload changed: %s", got)
 	}
 }

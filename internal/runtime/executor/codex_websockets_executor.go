@@ -206,7 +206,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	parsed := thinking.ParseModel(req.Model)
 	modelStr := parsed.Stripped
 	baseModel := parsed.BaseModel
-	forcePriority := parsed.PriorityRequested
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
@@ -233,11 +232,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = applyCursorGPT54UpgradeIfEnabled(ctx, e.cfg, body)
+	body = applyCursorGPTUpgradeIfEnabled(ctx, e.cfg, baseModel, body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
-	if forcePriority {
-		body = applyPriorityServiceTier(body)
-	}
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
@@ -429,7 +425,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	parsed := thinking.ParseModel(req.Model)
 	modelStr := parsed.Stripped
 	baseModel := parsed.BaseModel
-	forcePriority := parsed.PriorityRequested
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
@@ -459,11 +454,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, helps.PayloadRequestPath(opts))
-	body = applyCursorGPT54UpgradeIfEnabled(ctx, e.cfg, body)
+	body = applyCursorGPTUpgradeIfEnabled(ctx, e.cfg, baseModel, body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
-	if forcePriority {
-		body = applyPriorityServiceTier(body)
-	}
 	if IsCursorClient(ctx) {
 		if compacted, ok := maybeRemoteCompact(ctx, e.cfg, auth, body, helps.ExecutionSessionIDFromOptions(opts)); ok {
 			body = compacted
@@ -701,6 +693,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					reporter.Publish(ctx, detail)
 				}
+			}
+			if !shouldForwardEventToClient(ctx, eventType) {
+				continue
 			}
 
 			line := encodeCodexWebsocketAsSSE(payload)

@@ -275,7 +275,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = applyCursorGPT54UpgradeIfEnabled(ctx, e.cfg, body)
+	body = applyCursorGPTUpgradeIfEnabled(ctx, e.cfg, baseModel, body)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	// Keep prompt_cache_retention on HTTP /responses requests; Codex accepts it
@@ -534,7 +534,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = applyCursorGPT54UpgradeIfEnabled(ctx, e.cfg, body)
+	body = applyCursorGPTUpgradeIfEnabled(ctx, e.cfg, baseModel, body)
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
@@ -1012,16 +1012,15 @@ func normalizeCodexInstructions(body []byte) []byte {
 	return body
 }
 
-func applyPriorityServiceTier(body []byte) []byte {
-	out, _ := sjson.SetBytes(body, "service_tier", "priority")
-	return out
-}
-
-func applyCursorGPT54UpgradeIfEnabled(ctx context.Context, cfg *config.Config, body []byte) []byte {
-	if cfg == nil || !cfg.GPT54Upgrade || !IsCursorClient(ctx) {
+func applyCursorGPTUpgradeIfEnabled(ctx context.Context, cfg *config.Config, model string, body []byte) []byte {
+	if cfg == nil || !cfg.GPTUpgrade || !IsCursorClient(ctx) || !isGPTModelName(model) {
 		return body
 	}
-	return helps.ApplyCursorGPT54SystemPromptUpgradeToPayload(body)
+	return helps.ApplyCursorGPTSystemPromptUpgradeToPayload(body)
+}
+
+func isGPTModelName(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-")
 }
 
 var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)

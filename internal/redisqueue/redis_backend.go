@@ -30,6 +30,28 @@ const (
 	tsPrefixLen           = 8
 )
 
+var pruneTailScript = redis.NewScript(`
+local raw = redis.call("LINDEX", KEYS[1], -1)
+if not raw then
+	return 0
+end
+if string.len(raw) < 8 then
+	return 0
+end
+for i = 1, 8 do
+	local rawByte = string.byte(raw, i)
+	local cutoffByte = string.byte(ARGV[1], i)
+	if rawByte < cutoffByte then
+		redis.call("RPOP", KEYS[1])
+		return 1
+	end
+	if rawByte > cutoffByte then
+		return 0
+	end
+end
+return 0
+`)
+
 // redisBackend buffers payloads in a Redis LIST. Newest entries are pushed to
 // the head with LPUSH, oldest entries are popped from the tail with RPOP so
 // PopOldest semantics match the in-memory backend. Each payload is stored with
@@ -77,9 +99,19 @@ func ConfigureRedisBackend(cfg RedisBackendConfig) error {
 
 func encodePayload(now time.Time, payload []byte) []byte {
 	out := make([]byte, tsPrefixLen+len(payload))
-	binary.BigEndian.PutUint64(out[:tsPrefixLen], uint64(now.UnixNano()))
+	putTimestamp(out[:tsPrefixLen], now)
 	copy(out[tsPrefixLen:], payload)
 	return out
+}
+
+func encodeTimestamp(now time.Time) []byte {
+	out := make([]byte, tsPrefixLen)
+	putTimestamp(out, now)
+	return out
+}
+
+func putTimestamp(dst []byte, now time.Time) {
+	binary.BigEndian.PutUint64(dst, uint64(now.UnixNano()))
 }
 
 func decodePayload(raw []byte) (time.Time, []byte, bool) {
@@ -106,20 +138,14 @@ func (b *redisBackend) Enqueue(payload []byte) {
 // Bounded iteration count prevents a hot loop on misconfigured retention.
 func (b *redisBackend) pruneTail(ctx context.Context, now time.Time) {
 	cutoff := now.Add(-time.Duration(currentRetentionSeconds()) * time.Second)
+	encodedCutoff := encodeTimestamp(cutoff)
 	for i := 0; i < maxPruneIterations; i++ {
-		raw, err := b.client.LIndex(ctx, b.key, -1).Bytes()
-		if err != nil {
-			if !errors.Is(err, redis.Nil) {
-				log.Warnf("redisqueue: LINDEX failed: %v", err)
-			}
+		removed, err := pruneTailScript.Run(ctx, b.client, []string{b.key}, encodedCutoff).Int64()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			log.Warnf("redisqueue: prune script failed: %v", err)
 			return
 		}
-		ts, _, ok := decodePayload(raw)
-		if !ok || !ts.Before(cutoff) {
-			return
-		}
-		if err := b.client.RPop(ctx, b.key).Err(); err != nil && !errors.Is(err, redis.Nil) {
-			log.Warnf("redisqueue: RPOP prune failed: %v", err)
+		if removed == 0 {
 			return
 		}
 	}

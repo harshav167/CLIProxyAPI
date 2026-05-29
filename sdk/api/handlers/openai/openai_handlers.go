@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -134,9 +135,10 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	if shouldRouteResponsesBodyViaCodexResponses(modelName, rawJSON) {
 		originalChat := rawJSON
+		downstreamStream := stream
 		rawJSON = codexresponsesconverter.ConvertOpenAIResponsesRequestToCodex(modelName, rawJSON, stream)
-		stream = gjson.GetBytes(rawJSON, "stream").Bool()
-		if stream {
+		rawJSON = stripCursorMetadataForCodexResponses(c, rawJSON)
+		if downstreamStream {
 			h.handleStreamingResponseViaResponses(c, rawJSON, originalChat)
 		} else {
 			h.handleNonStreamingResponseViaResponses(c, rawJSON, originalChat)
@@ -146,15 +148,16 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 
 	if overrideEndpoint, ok := resolveEndpointOverride(modelName, openAIChatEndpoint); ok && overrideEndpoint == openAIResponsesEndpoint {
 		originalChat := rawJSON
+		downstreamStream := stream
 		if shouldTreatAsResponsesFormat(rawJSON) {
 			if hasModelProvider(modelName, "codex") {
 				rawJSON = codexresponsesconverter.ConvertOpenAIResponsesRequestToCodex(modelName, rawJSON, stream)
+				rawJSON = stripCursorMetadataForCodexResponses(c, rawJSON)
 			}
 		} else {
 			rawJSON = codexconverter.ConvertOpenAIRequestToCodex(modelName, rawJSON, stream)
 		}
-		stream = gjson.GetBytes(rawJSON, "stream").Bool()
-		if stream {
+		if downstreamStream {
 			h.handleStreamingResponseViaResponses(c, rawJSON, originalChat)
 		} else {
 			h.handleNonStreamingResponseViaResponses(c, rawJSON, originalChat)
@@ -175,6 +178,20 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		h.handleNonStreamingResponse(c, rawJSON)
 	}
 
+}
+
+func stripCursorMetadataForCodexResponses(c *gin.Context, rawJSON []byte) []byte {
+	if c == nil || c.Request == nil || !strings.HasPrefix(c.Request.UserAgent(), "Cursor/") {
+		return rawJSON
+	}
+	if !gjson.GetBytes(rawJSON, "metadata").Exists() {
+		return rawJSON
+	}
+	updated, err := sjson.DeleteBytes(rawJSON, "metadata")
+	if err != nil {
+		return rawJSON
+	}
+	return updated
 }
 
 // Completions handles the /v1/completions endpoint.
@@ -465,7 +482,7 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	cliCtx = withCursorExecutionSessionID(cliCtx, rawJSON)
+	cliCtx = withCursorExecutionSessionID(cliCtx, c, rawJSON)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
@@ -499,7 +516,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	cliCtx = withCursorExecutionSessionID(cliCtx, rawJSON)
+	cliCtx = withCursorExecutionSessionID(cliCtx, c, rawJSON)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 
 	setSSEHeaders := func() {

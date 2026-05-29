@@ -9,37 +9,22 @@ import (
 	"strings"
 )
 
-// StripPriorityMarker detects a trailing `+fast` or `+priority` marker in a
-// model name and returns the name without the marker plus a flag indicating
-// whether one was present.
-func StripPriorityMarker(model string) (stripped string, isPriority bool) {
-	for _, marker := range []string{"+fast", "+priority"} {
-		if strings.HasSuffix(model, marker) {
-			return strings.TrimSuffix(model, marker), true
-		}
-	}
-	return model, false
-}
-
 // ParsedModel captures the full result of parsing a raw model name from the wire.
 type ParsedModel struct {
-	Raw               string
-	Stripped          string
-	BaseModel         string
-	Suffix            SuffixResult
-	PriorityRequested bool
+	Raw       string
+	Stripped  string
+	BaseModel string
+	Suffix    SuffixResult
 }
 
-// ParseModel performs priority-marker stripping then thinking-suffix parsing.
+// ParseModel performs thinking-suffix parsing for a raw model name.
 func ParseModel(rawModel string) ParsedModel {
-	stripped, isPriority := StripPriorityMarker(rawModel)
-	suffix := ParseSuffix(stripped)
+	suffix := ParseSuffix(rawModel)
 	return ParsedModel{
-		Raw:               rawModel,
-		Stripped:          stripped,
-		BaseModel:         suffix.ModelName,
-		Suffix:            suffix,
-		PriorityRequested: isPriority,
+		Raw:       rawModel,
+		Stripped:  rawModel,
+		BaseModel: suffix.ModelName,
+		Suffix:    suffix,
 	}
 }
 

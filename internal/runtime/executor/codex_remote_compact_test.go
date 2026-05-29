@@ -2,11 +2,14 @@ package executor
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -185,6 +188,37 @@ func TestAdjustKeepTailForPairsKeepsToolCallPairs(t *testing.T) {
 	}
 }
 
+func TestMaybeRemoteCompactSkipsCursorNativeCompaction(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	payload := buildOversizedCompactPayload(t)
+	cfg := &config.Config{}
+	cfg.CodexRemoteCompaction.Enabled = true
+	auth := &cliproxyauth.Auth{
+		ID: "test-auth",
+		Attributes: map[string]string{
+			"api_key":  "test-key",
+			"base_url": server.URL,
+		},
+	}
+
+	out, compacted := maybeRemoteCompact(WithClientUserAgent(context.Background(), "Cursor/1.0"), cfg, auth, payload, "cursor-session")
+	if compacted {
+		t.Fatal("Cursor traffic should use native compaction, not proxy remote compaction")
+	}
+	if called {
+		t.Fatal("Cursor traffic called remote /responses/compact")
+	}
+	if string(out) != string(payload) {
+		t.Fatal("Cursor payload should pass through unchanged when remote compaction is skipped")
+	}
+}
+
 // TestCompactCooldownLifecycle exercises the full markCompactFailure →
 // compactInCooldown → expiry → compactCooldownPrune path.
 func TestCompactCooldownLifecycle(t *testing.T) {
@@ -235,6 +269,20 @@ func TestCompactCooldownLifecycle(t *testing.T) {
 	if stillThere {
 		t.Fatalf("compactCooldownPrune should remove orphaned expired entries that no lookup would revisit")
 	}
+}
+
+func buildOversizedCompactPayload(t *testing.T) []byte {
+	t.Helper()
+	items := make([]string, 0, remoteCompactMinKeepTurns+3)
+	items = append(items, `{"type":"message","role":"user","content":"head"}`)
+	for i := 0; i < remoteCompactMinKeepTurns+2; i++ {
+		items = append(items, `{"type":"message","role":"user","content":"`+strings.Repeat("x", 40_000)+`"}`)
+	}
+	body := []byte(`{"model":"gpt-5.5","instructions":"test","input":[` + strings.Join(items, ",") + `]}`)
+	if len(body) < remoteCompactThresholdBytes {
+		t.Fatalf("test payload too small: got %d want >= %d", len(body), remoteCompactThresholdBytes)
+	}
+	return body
 }
 
 // TestCompactInCooldownEmptySessionKey confirms the helper short-circuits

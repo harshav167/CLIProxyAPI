@@ -25,10 +25,32 @@ type convertGeminiResponseToOpenAIChatParams struct {
 	// FunctionIndex tracks tool call indices per candidate index to support multiple candidates.
 	FunctionIndex    map[int]int
 	SanitizedNameMap map[string]string
+	// ThoughtTextActive tracks Gemini thought text spans that arrive as plain text chunks
+	// without the `thought` flag, identified by a sentinel marker in the first chunk.
+	ThoughtTextActive map[int]bool
 }
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
 var functionCallIDCounter uint64
+
+// geminiThoughtSentinelMaxPrefixLen caps how far into a text chunk the sentinel
+// marker may appear before being treated as a thought boundary. Keeps the scan
+// cheap and avoids matching mid-content occurrences of the literal string.
+const geminiThoughtSentinelMaxPrefixLen = 32
+
+// normalizeGeminiSentinelThoughtText detects a Gemini sentinel-thought marker
+// (`>thought\n` or `>thought\r\n`) near the start of a text chunk. When found,
+// the marker and everything before it is stripped and the second return value
+// is true, signalling that this chunk (and subsequent ones from the same
+// candidate until a non-text part arrives) should be routed to reasoning_content.
+func normalizeGeminiSentinelThoughtText(text string) (string, bool) {
+	for _, marker := range []string{">thought\n", ">thought\r\n"} {
+		if idx := strings.Index(text, marker); idx >= 0 && idx <= geminiThoughtSentinelMaxPrefixLen {
+			return text[idx+len(marker):], true
+		}
+	}
+	return text, false
+}
 
 // ConvertGeminiResponseToOpenAI translates a single chunk of a streaming response from the
 // Gemini API format to the OpenAI Chat Completions streaming format.
@@ -48,9 +70,10 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	// Initialize parameters if nil.
 	if *param == nil {
 		*param = &convertGeminiResponseToOpenAIChatParams{
-			UnixTimestamp:    0,
-			FunctionIndex:    make(map[int]int),
-			SanitizedNameMap: util.SanitizedToolNameMap(originalRequestRawJSON),
+			UnixTimestamp:     0,
+			FunctionIndex:     make(map[int]int),
+			SanitizedNameMap:  util.SanitizedToolNameMap(originalRequestRawJSON),
+			ThoughtTextActive: make(map[int]bool),
 		}
 	}
 
@@ -61,6 +84,9 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	}
 	if p.SanitizedNameMap == nil {
 		p.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
+	}
+	if p.ThoughtTextActive == nil {
+		p.ThoughtTextActive = make(map[int]bool)
 	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
@@ -173,9 +199,17 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 					}
 
 					if partTextResult.Exists() {
-						text := partTextResult.String()
+						text, sentinelThought := normalizeGeminiSentinelThoughtText(partTextResult.String())
+						partThought := partResult.Get("thought").Bool()
+						isThoughtText := partThought || sentinelThought || p.ThoughtTextActive[candidateIndex]
+						if partThought || sentinelThought {
+							p.ThoughtTextActive[candidateIndex] = true
+						}
+						if text == "" {
+							continue
+						}
 						// Handle text content, distinguishing between regular content and reasoning/thoughts.
-						if partResult.Get("thought").Bool() {
+						if isThoughtText {
 							template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", text)
 						} else {
 							template, _ = sjson.SetBytes(template, "choices.0.delta.content", text)
@@ -184,6 +218,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 					} else if functionCallResult.Exists() {
 						// Handle function call content.
 						hasFunctionCall = true
+						p.ThoughtTextActive[candidateIndex] = false
 						toolCallsResult := gjson.GetBytes(template, "choices.0.delta.tool_calls")
 
 						// Retrieve the function index for this specific candidate.
@@ -207,6 +242,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 						template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallTemplate)
 					} else if inlineDataResult.Exists() {
+						p.ThoughtTextActive[candidateIndex] = false
 						data := inlineDataResult.Get("data").String()
 						if data == "" {
 							continue
@@ -231,6 +267,10 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
 					}
 				}
+			}
+
+			if finishReason != "" {
+				p.ThoughtTextActive[candidateIndex] = false
 			}
 
 			if hasFunctionCall {
@@ -336,6 +376,7 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 
 			partsResult := candidate.Get("content.parts")
 			hasFunctionCall := false
+			thoughtTextActive := false
 			if partsResult.IsArray() {
 				partsResults := partsResult.Array()
 				for i := 0; i < len(partsResults); i++ {
@@ -348,18 +389,25 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 					}
 
 					if partTextResult.Exists() {
+						text, sentinelThought := normalizeGeminiSentinelThoughtText(partTextResult.String())
+						partThought := partResult.Get("thought").Bool()
+						isThoughtText := partThought || sentinelThought || thoughtTextActive
+						if partThought || sentinelThought {
+							thoughtTextActive = true
+						}
 						// Append text content, distinguishing between regular content and reasoning.
-						if partResult.Get("thought").Bool() {
+						if isThoughtText {
 							oldVal := gjson.GetBytes(choiceTemplate, "message.reasoning_content").String()
-							choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.reasoning_content", oldVal+partTextResult.String())
+							choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.reasoning_content", oldVal+text)
 						} else {
 							oldVal := gjson.GetBytes(choiceTemplate, "message.content").String()
-							choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.content", oldVal+partTextResult.String())
+							choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.content", oldVal+text)
 						}
 						choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.role", "assistant")
 					} else if functionCallResult.Exists() {
 						// Append function call content to the tool_calls array.
 						hasFunctionCall = true
+						thoughtTextActive = false
 						toolCallsResult := gjson.GetBytes(choiceTemplate, "message.tool_calls")
 						if !toolCallsResult.Exists() || !toolCallsResult.IsArray() {
 							choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.tool_calls", []byte(`[]`))
@@ -374,6 +422,7 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 						choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.role", "assistant")
 						choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.tool_calls.-1", functionCallItemTemplate)
 					} else if inlineDataResult.Exists() {
+						thoughtTextActive = false
 						data := inlineDataResult.Get("data").String()
 						if data != "" {
 							mimeType := inlineDataResult.Get("mimeType").String()

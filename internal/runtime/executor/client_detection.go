@@ -3,6 +3,8 @@ package executor
 import (
 	"context"
 	"strings"
+
+	"github.com/gin-gonic/gin"
 )
 
 // eventTypesDroidSupports enumerates the OpenAI Responses API stream event
@@ -63,6 +65,12 @@ func clientUserAgentFromContext(ctx context.Context) string {
 		return ""
 	}
 	v, _ := ctx.Value(clientUserAgentCtxKey{}).(string)
+	if v != "" {
+		return v
+	}
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return ginCtx.GetHeader("User-Agent")
+	}
 	return v
 }
 
@@ -77,6 +85,13 @@ func IsDroidClient(ctx context.Context) bool {
 		return true
 	}
 	return strings.HasPrefix(v, "factory-cli/")
+}
+
+func shouldForwardEventToClient(ctx context.Context, eventType string) bool {
+	if !IsDroidClient(ctx) {
+		return true
+	}
+	return IsEventTypeSupportedByDroid(eventType)
 }
 
 // IsCursorClient reports whether the inbound client is Cursor (User-Agent

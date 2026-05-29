@@ -66,7 +66,7 @@ func RewriteCursorSystemPromptIdentityAndIntegrity(text string) (string, bool) {
 	return withIntegrity, true
 }
 
-const cursorGPT54ExecutionPersistencePatch = `<execution_persistence>
+const cursorGPTExecutionPersistencePatch = `<execution_persistence>
 These instructions clarify how to execute coding tasks in Cursor. They do not override explicit user intent, safety, data-loss, privacy, or higher-priority instructions.
 First classify the user's requested outcome before acting:
 Before classifying a request as implementation, determine whether the user authorized concrete edits.
@@ -252,7 +252,7 @@ If a test or lint count was gathered before later edits, label it as stale rathe
 When uncertain, downgrade status instead of upgrading it. Prefer "partially wired, not yet verified", "local slice landed, global completion blocked", or "scaffold exists, behavioral loop still open" over false confidence.
 </execution_integrity_contract>`
 
-const cursorGPT54MainGoalPatch = `<main_goal>
+const cursorGPTMainGoalPatch = `<main_goal>
 Your main goal is to satisfy the USER's requested outcome, denoted by the <user_query> tag, end to end.
 "End to end" depends on the task mode:
 - For review, research, audit, compare, explain, proposal, planning, architecture, migration, or "how should we change this" requests, complete the requested investigation and deliver the analysis or proposal. Do not edit files unless concrete edits are explicitly authorized.
@@ -262,7 +262,7 @@ Following the USER means respecting whether they asked for analysis/proposal or 
 Only end the turn when the requested outcome for the current task mode is complete, verified where applicable, or blocked by a real missing input, destructive decision, external dependency, or safety constraint.
 </main_goal>`
 
-const cursorGPT54IntermediaryUpdatesPatch = `## Intermediary updates
+const cursorGPTIntermediaryUpdatesPatch = `## Intermediary updates
 - Intermediary updates go to the ` + "`commentary`" + ` channel and are not final answers.
 - Use updates to keep the user oriented during substantial work, but never use them as a substitute for action.
 - Before substantial tool use, send at most one short update stating the immediate first action, then continue with tool calls in the same turn.
@@ -275,10 +275,10 @@ const cursorGPT54IntermediaryUpdatesPatch = `## Intermediary updates
 - When blocked, state the exact blocker and the minimum user input needed. Do not report routine remaining work as a blocker.
 </working_with_the_user>`
 
-// ApplyCursorGPT54SystemPromptUpgrade patches Cursor's GPT-5.4 system prompt
+// ApplyCursorGPTSystemPromptUpgrade patches Cursor's GPT system prompt
 // toward execution persistence. It is intentionally idempotent and only matches
 // Cursor's XML-style system prompt shape.
-func ApplyCursorGPT54SystemPromptUpgrade(text string) (string, bool) {
+func ApplyCursorGPTSystemPromptUpgrade(text string) (string, bool) {
 	if !strings.Contains(text, "<general>") ||
 		!strings.Contains(text, "<mode_selection>") ||
 		!strings.Contains(text, "<main_goal>") {
@@ -292,7 +292,7 @@ func ApplyCursorGPT54SystemPromptUpgrade(text string) (string, bool) {
 		modeIdx := strings.Index(out, "<mode_selection>")
 		generalEndIdx := strings.Index(out, "</general>")
 		if modeIdx >= 0 && generalEndIdx >= 0 && generalEndIdx < modeIdx {
-			out = out[:modeIdx] + cursorGPT54ExecutionPersistencePatch + "\n\n" + out[modeIdx:]
+			out = out[:modeIdx] + cursorGPTExecutionPersistencePatch + "\n\n" + out[modeIdx:]
 			changed = true
 		}
 	}
@@ -317,7 +317,7 @@ func ApplyCursorGPT54SystemPromptUpgrade(text string) (string, bool) {
 	}
 
 	oldMainGoal := "<main_goal>\nYour main goal is to follow the USER's instructions at each message, denoted by the <user_query> tag.\n</main_goal>"
-	if updated := strings.Replace(out, oldMainGoal, cursorGPT54MainGoalPatch, 1); updated != out {
+	if updated := strings.Replace(out, oldMainGoal, cursorGPTMainGoalPatch, 1); updated != out {
 		out = updated
 		changed = true
 	}
@@ -326,8 +326,8 @@ func ApplyCursorGPT54SystemPromptUpgrade(text string) (string, bool) {
 		endIdx := strings.Index(out[idx:], "</working_with_the_user>")
 		if endIdx >= 0 {
 			sectionEnd := idx + endIdx + len("</working_with_the_user>")
-			if out[idx:sectionEnd] != cursorGPT54IntermediaryUpdatesPatch {
-				out = out[:idx] + cursorGPT54IntermediaryUpdatesPatch + out[sectionEnd:]
+			if out[idx:sectionEnd] != cursorGPTIntermediaryUpdatesPatch {
+				out = out[:idx] + cursorGPTIntermediaryUpdatesPatch + out[sectionEnd:]
 				changed = true
 			}
 		}
@@ -352,28 +352,28 @@ func ApplyCursorExecutionIntegrityContract(text string) (string, bool) {
 	return strings.TrimRight(text, "\n") + "\n\n" + cursorExecutionIntegrityContractPatch, true
 }
 
-// ApplyCursorGPT54SystemPromptUpgradeToPayload rewrites system prompt text in
+// ApplyCursorGPTSystemPromptUpgradeToPayload rewrites system prompt text in
 // common OpenAI/Codex payload locations: instructions, messages[].content, and
 // input[].content. The payload is returned unchanged when no Cursor prompt shape
 // is found.
-func ApplyCursorGPT54SystemPromptUpgradeToPayload(payload []byte) []byte {
+func ApplyCursorGPTSystemPromptUpgradeToPayload(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
 
 	out := payload
 	if instructions := gjson.GetBytes(out, "instructions"); instructions.Type == gjson.String {
-		if patched, ok := ApplyCursorGPT54SystemPromptUpgrade(instructions.String()); ok {
+		if patched, ok := ApplyCursorGPTSystemPromptUpgrade(instructions.String()); ok {
 			out, _ = sjson.SetBytes(out, "instructions", patched)
 		}
 	}
 
-	out = applyCursorGPT54UpgradeToMessageArray(out, "messages")
-	out = applyCursorGPT54UpgradeToMessageArray(out, "input")
+	out = applyCursorGPTUpgradeToMessageArray(out, "messages")
+	out = applyCursorGPTUpgradeToMessageArray(out, "input")
 	return out
 }
 
-func applyCursorGPT54UpgradeToMessageArray(payload []byte, arrayPath string) []byte {
+func applyCursorGPTUpgradeToMessageArray(payload []byte, arrayPath string) []byte {
 	items := gjson.GetBytes(payload, arrayPath)
 	if !items.IsArray() {
 		return payload
@@ -386,15 +386,15 @@ func applyCursorGPT54UpgradeToMessageArray(payload []byte, arrayPath string) []b
 			continue
 		}
 		base := fmt.Sprintf("%s.%d.content", arrayPath, i)
-		out = applyCursorGPT54UpgradeToContent(out, base)
+		out = applyCursorGPTUpgradeToContent(out, base)
 	}
 	return out
 }
 
-func applyCursorGPT54UpgradeToContent(payload []byte, contentPath string) []byte {
+func applyCursorGPTUpgradeToContent(payload []byte, contentPath string) []byte {
 	content := gjson.GetBytes(payload, contentPath)
 	if content.Type == gjson.String {
-		if patched, ok := ApplyCursorGPT54SystemPromptUpgrade(content.String()); ok {
+		if patched, ok := ApplyCursorGPTSystemPromptUpgrade(content.String()); ok {
 			payload, _ = sjson.SetBytes(payload, contentPath, patched)
 		}
 		return payload
@@ -410,7 +410,7 @@ func applyCursorGPT54UpgradeToContent(payload []byte, contentPath string) []byte
 		if text.Type != gjson.String {
 			continue
 		}
-		if patched, ok := ApplyCursorGPT54SystemPromptUpgrade(text.String()); ok {
+		if patched, ok := ApplyCursorGPTSystemPromptUpgrade(text.String()); ok {
 			out, _ = sjson.SetBytes(out, textPath, patched)
 		}
 	}

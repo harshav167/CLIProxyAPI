@@ -328,3 +328,14 @@ records the actual post-rebase state, not the pre-Phase-1 plan-anticipated
 state. The new fork remains dormant (not in production); cpapi-plus@b5cd8425
 plus its Phase 1 thermo-fixup working tree remains the production source of
 truth until the deltas above are reconciled.
+
+## Dev Utility Deferral
+
+`cmd/mcpdebug/main.go` and `cmd/protocheck/main.go` are intentionally deferred.
+They are dev-time debug utilities for `internal/auth/cursor/proto`, and that
+proto package is already present in the fork.
+
+These commands have no runtime dependency on anything else in `cpapi-plus`.
+The migration bar is shipping runtime customizations, not scratch tools. If
+they are needed later, port them verbatim with the same v6-to-v7 import rewrite
+used for migrated tests.
