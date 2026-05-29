@@ -164,7 +164,15 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 		body = helps.EnsureClaudeCacheControl(body)
 	}
 	body = helps.EnsureClaudeUserPromptCacheAnchor(body)
-	if IsCursorClient(ctx) {
+	// The top-level automatic cache_control is a request-level breakpoint that
+	// renders BEFORE tools/system/messages in Anthropic's prefix chain. When
+	// global cache scope is enabled, a scoped system block exists later in the
+	// chain, and a non-global top-level breakpoint before it triggers a 400
+	// ("a block with scope:global was found after content with a narrower cache
+	// scope"). Canonical Claude Code never sends a top-level cache_control (all
+	// 2026-05-29 Opus 4.8 gist captures have it null), so skip it in the
+	// global-scope path to match Claude Code exactly.
+	if IsCursorClient(ctx) && !(e.cfg != nil && e.cfg.ClaudeCursorGlobalCacheScope) {
 		body = helps.EnsureCursorClaudeAutomaticPromptCacheControl(body)
 	}
 	body = helps.EnforceClaudeCacheControlLimit(body, 4)
