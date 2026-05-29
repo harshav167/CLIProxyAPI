@@ -2091,18 +2091,68 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if blocks[1].Get("text").String() != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("blocks[1] should be agent block, got %q", blocks[1].Get("text").String())
 	}
-	if blocks[1].Get("cache_control.scope").String() != "global" {
-		t.Fatalf("blocks[1] should have cache_control.scope=global")
+	// blocks[1] (agentBlock) must NOT carry scope:"global" — tool definitions
+	// render before system blocks and don't carry scope:"global", so a
+	// scope:"global" anchor here would break Anthropic's prefix-chain validator
+	// when tools are present (observed 2026-05-29 as the live Cursor 400).
+	if blocks[1].Get("cache_control.scope").String() != "" {
+		t.Fatalf("blocks[1] must not have cache_control.scope; got %q", blocks[1].Get("cache_control.scope").String())
+	}
+	if blocks[1].Get("cache_control.ttl").String() != "1h" {
+		t.Fatalf("blocks[1] should have cache_control.ttl=1h, got %q", blocks[1].Get("cache_control.ttl").String())
 	}
 	if blocks[2].Get("text").String() != expectedClaudeCodeStaticPrompt() {
 		t.Fatalf("blocks[2] should be static Claude Code prompt, got %q", blocks[2].Get("text").String())
 	}
-	if blocks[2].Get("cache_control.scope").String() != "global" {
-		t.Fatalf("blocks[2] should have cache_control.scope=global")
+	// blocks[2] (last system block) is bare-ephemeral by default. The
+	// scope:"global" opt-in lives behind cfg.ClaudeCursorGlobalCacheScope and
+	// is exercised by the dedicated *_GlobalScope test case below.
+	if blocks[2].Get("cache_control.scope").String() != "" {
+		t.Fatalf("blocks[2] must be bare-scope by default; got scope=%q", blocks[2].Get("cache_control.scope").String())
+	}
+	if blocks[2].Get("cache_control.ttl").String() != "1h" {
+		t.Fatalf("blocks[2] should have cache_control.ttl=1h, got %q", blocks[2].Get("cache_control.ttl").String())
 	}
 
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("You are a helpful assistant.")+"hi" {
 		t.Fatalf("messages[0].content should include forwarded system prompt, got %q", got)
+	}
+}
+
+// Regression: when ClaudeCursorGlobalCacheScope is enabled, the FALLBACK
+// system-prompt path (used when Cursor identity regex doesn't match) must
+// put scope:"global" on the LAST block only, never on agentBlock — otherwise
+// Anthropic's prefix-chain validator rejects the request with the exact 400
+// observed live on 2026-05-29:
+//
+//	`cache_control.scope: "global"` is only valid when every preceding block
+//	is also globally scoped. ... tool definitions render before `system`
+//	blocks, so `scope: "global"` on `system[0]` is not a true prefix when
+//	tools are present.
+func TestCheckSystemInstructionsWithSigningMode_FallbackGlobalScopeOnLastOnly(t *testing.T) {
+	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
+
+	out := checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.63", "", "", true)
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
+	}
+	// agentBlock must remain bare to keep the prefix chain valid (tools render
+	// before system, and tools never carry scope:"global").
+	if blocks[1].Get("cache_control.scope").String() != "" {
+		t.Fatalf("blocks[1] must NEVER have scope:global; got %q", blocks[1].Get("cache_control.scope").String())
+	}
+	if blocks[1].Get("cache_control.ttl").String() != "1h" {
+		t.Fatalf("blocks[1] should have ttl=1h, got %q", blocks[1].Get("cache_control.ttl").String())
+	}
+	// LAST block gets scope:"global" when the flag is on, matching the
+	// 2026-05-29 Opus 4.8 capture pattern.
+	if blocks[2].Get("cache_control.scope").String() != "global" {
+		t.Fatalf("blocks[2] should carry scope=global when flag is on; got %q", blocks[2].Get("cache_control.scope").String())
+	}
+	if blocks[2].Get("cache_control.ttl").String() != "1h" {
+		t.Fatalf("blocks[2] should have ttl=1h, got %q", blocks[2].Get("cache_control.ttl").String())
 	}
 }
 

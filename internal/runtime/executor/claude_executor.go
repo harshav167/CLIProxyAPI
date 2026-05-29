@@ -1436,8 +1436,17 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		}
 	}
 
-	globalCache := map[string]string{"scope": "global", "ttl": "1h"}
-	agentBlock := helps.BuildClaudeTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", globalCache)
+	// Cache anchor positioning matches Anthropic's prefix-chain rule:
+	//   - earlier blocks: bare ephemeral ttl (no scope)
+	//   - LAST block: optional scope:"global", gated on useGlobalScopeOnLast
+	// Putting scope:"global" on agentBlock here would violate the validator
+	// because tool definitions render BEFORE system blocks and don't carry
+	// scope:"global", so agentBlock at system[1] is "not a true prefix when
+	// tools are present" (Anthropic's exact error wording, observed 2026-05-29).
+	// Mirror the Cursor rewriter's two-block pattern: bare ttl on the early
+	// anchor, optional scope:"global" on the LAST anchor.
+	bareCache := map[string]string{"ttl": "1h"}
+	agentBlock := helps.BuildClaudeTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", bareCache)
 	staticPrompt := strings.Join([]string{
 		helps.ClaudeCodeIntro,
 		helps.ClaudeCodeSystem,
@@ -1445,7 +1454,11 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		helps.ClaudeCodeToneAndStyle,
 		helps.ClaudeCodeOutputEfficiency,
 	}, "\n\n")
-	staticBlock := helps.BuildClaudeTextBlock(staticPrompt, globalCache)
+	lastCache := map[string]string{"ttl": "1h"}
+	if useGlobalScopeOnLast {
+		lastCache["scope"] = "global"
+	}
+	staticBlock := helps.BuildClaudeTextBlock(staticPrompt, lastCache)
 
 	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
