@@ -110,6 +110,9 @@ func (s *FileBodySource) CreatePart(prefix string) (*os.File, error) {
 		return nil, fmt.Errorf("file body source has been cleaned")
 	}
 	prefix = sanitizeTempPrefix(prefix)
+	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
+		return nil, errMkdir
+	}
 	file, errCreate := os.CreateTemp(s.dir, prefix+"-*.tmp")
 	if errCreate != nil {
 		return nil, errCreate
@@ -166,17 +169,26 @@ func (s *FileBodySource) WriteTo(w io.Writer) (int64, error) {
 	}
 	paths := s.Paths()
 	var total int64
-	for i, path := range paths {
-		if i > 0 {
+	wrote := false
+	for _, path := range paths {
+		file, errOpen := os.Open(path)
+		if errOpen != nil {
+			if os.IsNotExist(errOpen) {
+				// Upstream (2bcc7622) added missing-file tolerance: skip
+				// rotated/deleted parts instead of erroring out.
+				continue
+			}
+			return total, errOpen
+		}
+		if wrote {
 			n, errWrite := io.WriteString(w, "\n")
 			total += int64(n)
 			if errWrite != nil {
+				if errClose := file.Close(); errClose != nil {
+					log.WithError(errClose).Warn("failed to close log part file")
+				}
 				return total, errWrite
 			}
-		}
-		file, errOpen := os.Open(path)
-		if errOpen != nil {
-			return total, errOpen
 		}
 		n, errCopy := io.Copy(w, file)
 		total += n
@@ -189,6 +201,7 @@ func (s *FileBodySource) WriteTo(w io.Writer) (int64, error) {
 		if errCopy != nil {
 			return total, errCopy
 		}
+		wrote = true
 	}
 	return total, nil
 }
@@ -226,7 +239,7 @@ func (s *FileBodySource) Cleanup() error {
 		}
 	}
 	if dir != "" {
-		if errRemove := os.Remove(dir); errRemove != nil && !os.IsNotExist(errRemove) && firstErr == nil {
+		if errRemove := os.RemoveAll(dir); errRemove != nil && firstErr == nil {
 			firstErr = errRemove
 		}
 	}

@@ -198,6 +198,13 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	upstreamStream := prepared.from != prepared.to
 
+	// SetTranslatedReasoningEffort is upstream 11f0f906: log the reasoning
+	// effort as it appears in the final translated payload sent upstream.
+	// We call it once here (and once in ExecuteStream) instead of inside
+	// prepareMessagesRequest because reporter is owned by the caller and
+	// prepared.bodyForUpstream is the right input.
+	reporter.SetTranslatedReasoningEffort(prepared.bodyForUpstream, prepared.to.String())
+
 	url := fmt.Sprintf("%s/v1/messages?beta=true", prepared.baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(prepared.bodyForUpstream))
 	if err != nil {
@@ -223,6 +230,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	})
 
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
+	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -321,6 +329,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 
+	// Upstream 11f0f906: log reasoning effort as sent upstream.
+	reporter.SetTranslatedReasoningEffort(prepared.bodyForUpstream, prepared.to.String())
+
 	url := fmt.Sprintf("%s/v1/messages?beta=true", prepared.baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(prepared.bodyForUpstream))
 	if err != nil {
@@ -346,6 +357,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	})
 
 	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
+	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
