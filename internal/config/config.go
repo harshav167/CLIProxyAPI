@@ -165,6 +165,19 @@ type Config struct {
 	// naturally use different prompt-cache entries.
 	GPTUpgrade bool `yaml:"gpt-upgrade" json:"gpt-upgrade"`
 
+	// ClaudeCursorGlobalCacheScope opts the Cursor BYOK Claude rewrite path
+	// into adding `scope:"global"` to the LAST system block's cache_control,
+	// mirroring the canonical Claude Code Opus 4.8 capture pattern. Disabled
+	// by default because a 2026-05-11 attempt to add scope:global on the
+	// FIRST system block triggered Anthropic prefix-chain validator 400s.
+	// The 2026-05-29 Opus 4.8 captures show Anthropic places scope:global on
+	// the LAST system text block (not the first); with prompt-caching-scope-
+	// 2026-01-05 + extended-cache-ttl-2025-04-11 already in our beta set,
+	// flipping this on should restore main-agent ↔ subagent global cache
+	// sharing without re-triggering the validator. Flag-gated so we can roll
+	// back fast without rebuilding if 400s reappear.
+	ClaudeCursorGlobalCacheScope bool `yaml:"claude-cursor-global-cache-scope" json:"claude-cursor-global-cache-scope"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 

@@ -727,6 +727,22 @@ func stripUnsupportedAnthropicFields(body []byte) []byte {
 	return body
 }
 
+// clientInventedBetas enumerates betas that DO NOT come from Anthropic and
+// should be stripped before forwarding upstream. Currently the only known
+// entry is Cursor's `max-effort-2026-01-24` (Cursor-internal opt-in for the
+// thinking-max alias; Claude Code itself never sends it).
+var clientInventedBetas = map[string]struct{}{
+	"max-effort-2026-01-24": {},
+}
+
+// isClientInventedBeta reports whether the supplied beta name is in the
+// client-invented allowlist (i.e. should be stripped from the outgoing
+// Anthropic-Beta header).
+func isClientInventedBeta(name string) bool {
+	_, ok := clientInventedBetas[strings.TrimSpace(name)]
+	return ok
+}
+
 // extractAndRemoveBetas extracts the "betas" array from the body and removes it.
 // Returns the extracted betas as a string slice and the modified body.
 func extractAndRemoveBetas(body []byte) ([]string, []byte) {
@@ -948,50 +964,53 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		deviceProfile = helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
 	}
 
-	// Hybrid baseBetas — upstream's curated cross-client safe set, plus the
-	// real-Claude-Code betas that gate features WE actually inject:
-	//   - effort-2025-11-24            gates output_config.effort (payload.override
-	//                                  injects this on *-thinking-high aliases).
-	//   - cache-diagnosis-2026-04-07   surfaces split 5m/1h cache_creation
-	//                                  reporting, required to verify ttl:"1h"
-	//                                  cache_control injection works.
-	//   - context-1m-2025-08-07        unconditional default; Cursor BYOK
-	//                                  conversations exceed 200K tokens routinely
-	//                                  via cached prefix; cheap to enable always.
-	// Dropped redact-thinking-2026-02-12: that beta enables Anthropic's
-	// `redacted_thinking` content blocks (encrypted, hidden from user). Without
-	// it Anthropic emits plain `thinking` blocks for everything — more visible
-	// reasoning, no encrypted/hidden segments.
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,token-efficient-tools-2026-03-28,effort-2025-11-24,cache-diagnosis-2026-04-07,context-1m-2025-08-07"
-	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
-		baseBetas = val
-		if !strings.Contains(val, "oauth") {
-			baseBetas += ",oauth-2025-04-20"
-		}
-	}
-	if !strings.Contains(baseBetas, "interleaved-thinking") {
-		baseBetas += ",interleaved-thinking-2025-05-14"
-	}
-	if !strings.Contains(baseBetas, "prompt-caching-scope-2026-01-05") {
-		baseBetas += ",prompt-caching-scope-2026-01-05"
-	}
-	// effort-2025-11-24 gates the output_config.effort field. payload.override
-	// injects this on *-thinking-high aliases. Force-preserve so client
-	// Anthropic-Beta overrides don't strip it.
-	if !strings.Contains(baseBetas, "effort-2025-11-24") {
-		baseBetas += ",effort-2025-11-24"
-	}
-	// cache-diagnosis-2026-04-07 surfaces split 5m/1h cache_creation reporting,
-	// required to verify ttl:"1h" injection works. Force-preserve.
-	if !strings.Contains(baseBetas, "cache-diagnosis-2026-04-07") {
-		baseBetas += ",cache-diagnosis-2026-04-07"
-	}
-	// context-1m-2025-08-07 enables 1M context window on Opus 4.7. Default-on
-	// because Cursor BYOK conversations exceed 200K tokens routinely (cached
-	// prefix). Force-preserve.
-	if !strings.Contains(baseBetas, "context-1m-2025-08-07") {
-		baseBetas += ",context-1m-2025-08-07"
-	}
+	// We are talking to Anthropic via Claude Code OAuth (or fall back to API key
+	// against the Anthropic base URL). Either way the most reliable behavior is
+	// to send the canonical Claude Code beta set — the literal string a real
+	// claude-cli/2.1.156 ships on every /v1/messages call (verified 2026-05-29
+	// via Proxyman captures against api.anthropic.com on claude-opus-4-8).
+	//
+	// Why we ignore the client's inbound Anthropic-Beta header entirely:
+	//   - Cursor BYOK Claude traffic sends `Anthropic-Beta: max-effort-2026-01-24`
+	//     ONLY on the thinking-max alias. That beta is a Cursor-internal opt-in;
+	//     Claude Code itself never sends it. Forwarding it doesn't help and
+	//     could trip Anthropic anti-abuse heuristics that distinguish "looks like
+	//     Claude Code" from "looks like a 3rd party calling the OAuth surface".
+	//   - The previous "overwrite base with client header" path (pre-2026-05-29)
+	//     silently dropped claude-code-20250219, structured-outputs-2025-12-15,
+	//     fast-mode-2026-02-01, and token-efficient-tools-2026-03-28 from the
+	//     wire any time a client sent its own Anthropic-Beta — confirmed by
+	//     inspecting docker/logs/cliproxy/cursor-1.0 upstream traces.
+	//
+	// Betas confirmed in 2026-05-29 Opus 4.8 Proxyman capture (claude-cli/2.1.156):
+	//   claude-code-20250219, oauth-2025-04-20, context-1m-2025-08-07,
+	//   interleaved-thinking-2025-05-14, redact-thinking-2026-02-12,
+	//   thinking-token-count-2026-05-13, context-management-2025-06-27,
+	//   prompt-caching-scope-2026-01-05, mid-conversation-system-2026-04-07,
+	//   advisor-tool-2026-03-01, effort-2025-11-24, extended-cache-ttl-2025-04-11,
+	//   cache-diagnosis-2026-04-07.
+	//
+	// We deliberately DROP redact-thinking-2026-02-12: it enables Anthropic's
+	// encrypted `redacted_thinking` content blocks (hidden from user). Without
+	// it Anthropic emits plain `thinking` blocks — more visible reasoning, no
+	// encrypted/hidden segments. This is a fork policy choice, not parity gap.
+	//
+	// We deliberately DROP advisor-tool-2026-03-01: it gates a Claude Code
+	// product feature whose semantics we have not characterized. Adding it
+	// without understanding it risks unintended server-side behavior. Revisit
+	// if/when we explicitly want that feature.
+	//
+	// We keep context-management-2025-06-27 even though we don't yet inject
+	// the matching context_management.edits[] field. The beta header alone
+	// is a server-side no-op — it just gates the schema. Keeping it on costs
+	// nothing and lets us turn on server-side clear_thinking/clear_tool_uses
+	// edits later without a header dance.
+	//
+	// Extras kept from upstream's curated cross-client safe set: structured-outputs-2025-12-15,
+	// fast-mode-2026-02-01, token-efficient-tools-2026-03-28. These don't appear
+	// in Claude Code but are additive Anthropic features; harmless to send.
+	baseBetas := "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,structured-outputs-2025-12-15,fast-mode-2026-02-01,token-efficient-tools-2026-03-28"
+	_ = ginHeaders // client Anthropic-Beta header intentionally ignored; see comment above
 
 	hasClaude1MHeader := false
 	if ginHeaders != nil {
@@ -1006,6 +1025,13 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	// Merge extra betas from request body and request flags.
+	//
+	// Filter: body-extracted betas pass through ONLY if they match the
+	// canonical Anthropic beta naming pattern AND are not in a known
+	// non-Anthropic / client-invented allowlist. The current explicit
+	// reject is `max-effort-2026-01-24`, a Cursor-internal opt-in that
+	// Claude Code itself never sends. Forwarding it makes our traffic
+	// look less like Claude Code without measurable upside.
 	if len(extraBetas) > 0 || hasClaude1MHeader {
 		existingSet := make(map[string]bool)
 		for _, b := range strings.Split(baseBetas, ",") {
@@ -1016,10 +1042,14 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		}
 		for _, beta := range extraBetas {
 			beta = strings.TrimSpace(beta)
-			if beta != "" && !existingSet[beta] {
-				baseBetas += "," + beta
-				existingSet[beta] = true
+			if beta == "" || existingSet[beta] {
+				continue
 			}
+			if isClientInventedBeta(beta) {
+				continue
+			}
+			baseBetas += "," + beta
+			existingSet[beta] = true
 		}
 		if hasClaude1MHeader && !existingSet["context-1m-2025-08-07"] {
 			baseBetas += ",context-1m-2025-08-07"
@@ -1093,7 +1123,10 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 }
 
 func checkSystemInstructions(payload []byte) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.63", "", "")
+	// CountTokens path: no cfg in scope, so global-scope flag stays off here.
+	// (Token counting doesn't affect cache anchoring on the real /v1/messages
+	// path, which has cfg via applyCloaking.)
+	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.63", "", "", false)
 }
 
 func isClaudeOAuthToken(apiKey string) bool {
@@ -1355,7 +1388,7 @@ func reverseRemapOAuthToolNamesFromStreamLine(line []byte, reverseMap map[string
 }
 
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "")
+	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "", false)
 }
 
 // checkSystemInstructionsWithSigningMode injects Claude Code-style system blocks:
@@ -1366,7 +1399,7 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 //	system[3]: system instructions (no cache_control)
 //	system[4]: doing tasks (no cache_control)
 //	system[5]: user system messages moved to first user message
-func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
+func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string, useGlobalScopeOnLast bool) []byte {
 	system := gjson.GetBytes(payload, "system")
 
 	// Extract original message text for fingerprint computation (before billing injection).
@@ -1397,7 +1430,7 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		if helps.LooksLikeCursorSubagent(payload) {
 			cacheTTL = "5m"
 		}
-		if cursorSystemResult, ok := helps.RewriteCursorSystemPromptBlocks(system, billingBlock, cacheTTL); ok {
+		if cursorSystemResult, ok := helps.RewriteCursorSystemPromptBlocks(system, billingBlock, cacheTTL, useGlobalScopeOnLast); ok {
 			payload, _ = sjson.SetRawBytes(payload, "system", []byte(cursorSystemResult))
 			return payload
 		}
@@ -1497,7 +1530,8 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		billingVersion := helps.DefaultClaudeVersion(cfg)
 		entrypoint := helps.ParseClaudeEntrypointFromUA(clientUserAgent)
 		workload := helps.GetClaudeWorkloadFromContext(ctx)
-		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
+		useGlobalScopeOnLast := cfg != nil && cfg.ClaudeCursorGlobalCacheScope
+		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload, useGlobalScopeOnLast)
 	}
 
 	// Inject fake user ID

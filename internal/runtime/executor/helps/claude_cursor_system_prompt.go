@@ -47,11 +47,19 @@ func LooksLikeCursorSubagent(payload []byte) bool {
 }
 
 // RewriteCursorSystemPromptBlocks rewrites Cursor's identity-line sentinels and
-// places a single cache_control breakpoint with scope:"global" on the last text
-// block at the supplied TTL. Caller is responsible for tagging the last tool
-// entry with a matching anchor so the prefix chain (tools → system) is
-// globally scoped end-to-end.
-func RewriteCursorSystemPromptBlocks(system gjson.Result, billingBlock string, ttl string) (string, bool) {
+// places two cache_control breakpoints (first + last system text block) at the
+// supplied TTL.
+//
+// When useGlobalScopeOnLast is true, the LAST text block's cache_control adds
+// scope:"global", mirroring the 2026-05-29 canonical Claude Code Opus 4.8 capture
+// pattern (last system block is `{"type":"ephemeral","ttl":"1h","scope":"global"}`,
+// earlier blocks are bare ttl). This is the position our 2026-05-11 attempt missed
+// — that attempt put scope:"global" on the FIRST block, which violated Anthropic's
+// prefix-chain validator. The LAST-block position is what claude-cli/2.1.156 ships
+// and what Anthropic accepts.
+//
+// Flag-gated via cfg.ClaudeCursorGlobalCacheScope so prod can roll back fast.
+func RewriteCursorSystemPromptBlocks(system gjson.Result, billingBlock string, ttl string, useGlobalScopeOnLast bool) (string, bool) {
 	if !system.IsArray() {
 		return "", false
 	}
@@ -134,23 +142,26 @@ func RewriteCursorSystemPromptBlocks(system gjson.Result, billingBlock string, t
 				}
 			}
 		}
-		// PATCH 2026-05-11 v6: scope:"global" reverted. Anchor is bare ephemeral
-		// at the requested TTL. We attempted scope:"global" earlier today (matching
-		// the literal byte shape of real Claude Code requests) and got 400s from
-		// Anthropic's prefix-chain validator. Dropping the billing block to free
-		// up scope:"global" then tripped Anthropic's anti-abuse 429s. Net: keep
-		// billing block + bare cache_control. The 1h-TTL win remains; only
-		// cross-account global sharing is given up.
+		// First text block: bare ephemeral with requested TTL (matches Claude
+		// Code Opus 4.8 capture's earlier-system-block pattern).
 		anchorCC := fmt.Sprintf(`{"type":"ephemeral","ttl":%q}`, ttl)
 		if updated, err := sjson.SetRawBytes([]byte(systemBlocks[firstTextIdx]), "cache_control", []byte(anchorCC)); err == nil {
 			systemBlocks[firstTextIdx] = string(updated)
 		}
-		// Last text block: bare anchor (only if distinct from firstTextIdx;
-		// otherwise the single block already carries the scope:"global" entry
-		// and we don't want to overwrite it).
+		// Last text block: optionally tag with scope:"global" so the cache
+		// prefix is shared globally (e.g. main-agent ↔ subagent for the same
+		// account). Mirrors the 2026-05-29 canonical Claude Code Opus 4.8
+		// capture where Anthropic places scope:"global" on the LAST system
+		// text block. Falls back to a bare ttl-only anchor when the flag is
+		// off (the historical safe behavior from PATCH 2026-05-11 v6).
 		if lastTextIdx > firstTextIdx {
-			bareCC := fmt.Sprintf(`{"type":"ephemeral","ttl":%q}`, ttl)
-			if updated, err := sjson.SetRawBytes([]byte(systemBlocks[lastTextIdx]), "cache_control", []byte(bareCC)); err == nil {
+			var lastCC string
+			if useGlobalScopeOnLast {
+				lastCC = fmt.Sprintf(`{"type":"ephemeral","ttl":%q,"scope":"global"}`, ttl)
+			} else {
+				lastCC = fmt.Sprintf(`{"type":"ephemeral","ttl":%q}`, ttl)
+			}
+			if updated, err := sjson.SetRawBytes([]byte(systemBlocks[lastTextIdx]), "cache_control", []byte(lastCC)); err == nil {
 				systemBlocks[lastTextIdx] = string(updated)
 			}
 		}

@@ -136,6 +136,185 @@ func TestApplyClaudeHeaders_PreservesPromptCachingBetaAndAddsContext1M(t *testin
 	}
 }
 
+func TestApplyClaudeHeaders_ForcePreservesClaudeCodeOpus48Betas(t *testing.T) {
+	// Regression test for the 3 betas confirmed in the 2026-05-29 Proxyman
+	// captures of claude-cli/2.1.156 hitting api.anthropic.com against
+	// claude-opus-4-8 (Opus 4.8). They MUST be force-preserved even when a
+	// client supplies a narrower Anthropic-Beta override; otherwise:
+	//   - thinking-token-count-2026-05-13 → usage.output_tokens_details.thinking_tokens
+	//     stops being reported (Opus 4.8 flow 46 in our capture surfaced 58 thinking
+	//     tokens via this beta).
+	//   - mid-conversation-system-2026-04-07 → Anthropic intermittently rejects
+	//     mid-conversation system inserts that Cursor BYOK + Claude Code both send.
+	//   - extended-cache-ttl-2025-04-11 → explicit ttl:"1h" cache_control enablement.
+	resetClaudeDeviceProfileCache()
+
+	// Simulate a narrow client override that omits all three new betas.
+	incoming := http.Header{}
+	incoming.Set("Anthropic-Beta", "structured-outputs-2025-12-15")
+
+	req := newClaudeHeaderTestRequest(t, incoming)
+	auth := &cliproxyauth.Auth{
+		ID: "auth-opus48-betas",
+		Attributes: map[string]string{
+			"api_key": "key-opus48-betas",
+		},
+	}
+
+	applyClaudeHeaders(req, auth, "key-opus48-betas", true, nil, &config.Config{})
+
+	betas := req.Header.Get("Anthropic-Beta")
+	for _, want := range []string{
+		"thinking-token-count-2026-05-13",
+		"mid-conversation-system-2026-04-07",
+		"extended-cache-ttl-2025-04-11",
+	} {
+		if !strings.Contains(betas, want) {
+			t.Errorf("Anthropic-Beta = %q, want %q force-preserved", betas, want)
+		}
+	}
+}
+
+func TestApplyClaudeHeaders_StripsCursorMaxEffortBetaFromBody(t *testing.T) {
+	// Regression test for the 2026-05-29 finding: Cursor sends
+	// `max-effort-2026-01-24` in the request body's `betas` field (extracted
+	// by extractAndRemoveBetas) only on the thinking-max alias. That beta is
+	// Cursor-internal — Claude Code itself never sends it. Forwarding it
+	// upstream makes our traffic look less like Claude Code without measurable
+	// upside, so the body-merge step now strips it via isClientInventedBeta.
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-strip-cursor-beta",
+		Attributes: map[string]string{
+			"api_key": "key-strip-cursor-beta",
+		},
+	}
+
+	extraBetas := []string{"max-effort-2026-01-24", "some-legitimate-anthropic-beta-2026-01-01"}
+	applyClaudeHeaders(req, auth, "key-strip-cursor-beta", true, extraBetas, &config.Config{})
+
+	betas := req.Header.Get("Anthropic-Beta")
+	if strings.Contains(betas, "max-effort-2026-01-24") {
+		t.Errorf("max-effort-2026-01-24 should be stripped from outgoing header; got %q", betas)
+	}
+	// Legitimate extras should still pass through.
+	if !strings.Contains(betas, "some-legitimate-anthropic-beta-2026-01-01") {
+		t.Errorf("legitimate body-supplied beta should pass through; got %q", betas)
+	}
+}
+
+func TestApplyClaudeHeaders_IgnoresClientInboundAnthropicBetaHeader(t *testing.T) {
+	// Regression test for the 2026-05-29 finding: pre-fix, when a client sent
+	// an `Anthropic-Beta` HTTP header (Cursor does, with `max-effort-2026-01-24`),
+	// the line `baseBetas = val` REPLACED our entire 14-beta hardcoded set.
+	// The `if !Contains` re-adds covered only a handful of betas, so
+	// `claude-code-20250219`, `structured-outputs-2025-12-15`, `fast-mode-2026-02-01`,
+	// `token-efficient-tools-2026-03-28` were silently dropped from the wire
+	// any time a client sent its own Anthropic-Beta header.
+	//
+	// Fix: ignore the client's inbound Anthropic-Beta header entirely and
+	// always send the canonical Claude Code set we control.
+	resetClaudeDeviceProfileCache()
+
+	incoming := http.Header{}
+	incoming.Set("Anthropic-Beta", "max-effort-2026-01-24")
+	req := newClaudeHeaderTestRequest(t, incoming)
+	auth := &cliproxyauth.Auth{
+		ID: "auth-ignore-client-beta",
+		Attributes: map[string]string{
+			"api_key": "key-ignore-client-beta",
+		},
+	}
+
+	applyClaudeHeaders(req, auth, "key-ignore-client-beta", true, nil, &config.Config{})
+
+	betas := req.Header.Get("Anthropic-Beta")
+	// Must include the full canonical set even though client sent only one beta.
+	for _, want := range []string{
+		"claude-code-20250219",
+		"oauth-2025-04-20",
+		"context-1m-2025-08-07",
+		"interleaved-thinking-2025-05-14",
+		"thinking-token-count-2026-05-13",
+		"context-management-2025-06-27",
+		"prompt-caching-scope-2026-01-05",
+		"mid-conversation-system-2026-04-07",
+		"effort-2025-11-24",
+		"extended-cache-ttl-2025-04-11",
+		"cache-diagnosis-2026-04-07",
+		"structured-outputs-2025-12-15",
+		"fast-mode-2026-02-01",
+		"token-efficient-tools-2026-03-28",
+	} {
+		if !strings.Contains(betas, want) {
+			t.Errorf("canonical Anthropic-Beta should include %q; got %q", want, betas)
+		}
+	}
+	// Client's max-effort-2026-01-24 from the header should NOT leak through.
+	if strings.Contains(betas, "max-effort-2026-01-24") {
+		t.Errorf("client inbound Anthropic-Beta header value should be ignored; got %q", betas)
+	}
+}
+
+func TestApplyClaudeHeaders_DropsAdvisorToolBetaForFork(t *testing.T) {
+	// Regression test: advisor-tool-2026-03-01 was briefly added to our base
+	// set during 2026-05-29 investigation, then dropped because it gates a
+	// Claude Code product feature whose semantics we have not characterized.
+	// Until we understand what advisor-tool does on the Anthropic backend,
+	// it stays out of our base set.
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-no-advisor",
+		Attributes: map[string]string{
+			"api_key": "key-no-advisor",
+		},
+	}
+
+	applyClaudeHeaders(req, auth, "key-no-advisor", true, nil, &config.Config{})
+
+	betas := req.Header.Get("Anthropic-Beta")
+	if strings.Contains(betas, "advisor-tool-2026-03-01") {
+		t.Errorf("advisor-tool-2026-03-01 should not be in base set; got %q", betas)
+	}
+}
+
+func TestApplyClaudeHeaders_DefaultBetaSetIncludesOpus48Betas(t *testing.T) {
+	// Belt-and-suspenders: with NO client Anthropic-Beta header at all, the
+	// default base set must already include the 3 Opus 4.8 betas. This is the
+	// path Cursor BYOK and other clients with no Anthropic-Beta hit.
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, http.Header{})
+	auth := &cliproxyauth.Auth{
+		ID: "auth-default-betas",
+		Attributes: map[string]string{
+			"api_key": "key-default-betas",
+		},
+	}
+
+	applyClaudeHeaders(req, auth, "key-default-betas", true, nil, &config.Config{})
+
+	betas := req.Header.Get("Anthropic-Beta")
+	for _, want := range []string{
+		"thinking-token-count-2026-05-13",
+		"mid-conversation-system-2026-04-07",
+		"extended-cache-ttl-2025-04-11",
+		// Pre-existing default betas must still be present so we don't regress.
+		"prompt-caching-scope-2026-01-05",
+		"cache-diagnosis-2026-04-07",
+		"context-1m-2025-08-07",
+		"effort-2025-11-24",
+	} {
+		if !strings.Contains(betas, want) {
+			t.Errorf("default Anthropic-Beta = %q, want %q present", betas, want)
+		}
+	}
+}
+
 func TestApplyClaudeHeaders_AddsContext1MFromAuthAttribute(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 
