@@ -1436,17 +1436,31 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		}
 	}
 
-	// Cache anchor positioning matches Anthropic's prefix-chain rule:
-	//   - earlier blocks: bare ephemeral ttl (no scope)
-	//   - LAST block: optional scope:"global", gated on useGlobalScopeOnLast
-	// Putting scope:"global" on agentBlock here would violate the validator
-	// because tool definitions render BEFORE system blocks and don't carry
-	// scope:"global", so agentBlock at system[1] is "not a true prefix when
-	// tools are present" (Anthropic's exact error wording, observed 2026-05-29).
-	// Mirror the Cursor rewriter's two-block pattern: bare ttl on the early
-	// anchor, optional scope:"global" on the LAST anchor.
-	bareCache := map[string]string{"ttl": "1h"}
-	agentBlock := helps.BuildClaudeTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", bareCache)
+	// Cache anchor layout MIRRORS the canonical Claude Code 2.1.156 Opus 4.8
+	// Proxyman capture, verified 2026-05-29:
+	//   system[0] billing header   — NO cache_control
+	//   system[1] agentBlock        — NO cache_control
+	//   system[2] staticBlock LAST  — cache_control { ttl=1h [+ scope:global] }
+	//
+	// Why no cache_control on system[0] / system[1]:
+	// Anthropic's prefix-chain rule for scope:"global" requires the
+	// scope:"global" block to be the FIRST cache_control breakpoint in the
+	// (tools → system → messages) chain. If we put a bare-scope cache_control
+	// on system[0] (billing) the validator says: "A block with scope:'global'
+	// was found after content with a narrower cache scope." Confirmed live
+	// 2026-05-29 against Opus 4.8 (Anthropic's prefix-chain validator).
+	//
+	// Claude Code achieves this by leaving billing + agent intro
+	// cache-control-free and ONLY anchoring at the last system block. We do
+	// the same. The trade is one breakpoint (down from three), but that one
+	// breakpoint at scope:"global" actually shares the cache prefix across
+	// the main agent ↔ subagent boundary, which the previous three-bare
+	// breakpoints never did.
+	//
+	// useGlobalScopeOnLast (cfg.ClaudeCursorGlobalCacheScope) decides whether
+	// to tag the lone anchor with scope:"global". Off = bare ttl (1 anchor,
+	// no global sharing). On = ttl + scope:"global" (Claude Code parity).
+	agentBlock := helps.BuildClaudeTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
 	staticPrompt := strings.Join([]string{
 		helps.ClaudeCodeIntro,
 		helps.ClaudeCodeSystem,

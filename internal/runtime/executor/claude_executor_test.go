@@ -2091,22 +2091,23 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if blocks[1].Get("text").String() != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("blocks[1] should be agent block, got %q", blocks[1].Get("text").String())
 	}
-	// blocks[1] (agentBlock) must NOT carry scope:"global" — tool definitions
-	// render before system blocks and don't carry scope:"global", so a
-	// scope:"global" anchor here would break Anthropic's prefix-chain validator
-	// when tools are present (observed 2026-05-29 as the live Cursor 400).
-	if blocks[1].Get("cache_control.scope").String() != "" {
-		t.Fatalf("blocks[1] must not have cache_control.scope; got %q", blocks[1].Get("cache_control.scope").String())
+	// blocks[0] (billing) and blocks[1] (agentBlock) must NOT carry
+	// cache_control at all. Anthropic's prefix-chain rule on Opus 4.8
+	// requires the scope:"global" anchor to be the FIRST cache_control
+	// breakpoint; any earlier bare-cache_control block makes scope:"global"
+	// "appear after content with a narrower cache scope" and the request
+	// is 400'd. Mirrors the canonical Claude Code 2.1.156 Opus 4.8 capture.
+	if blocks[0].Get("cache_control").Exists() {
+		t.Fatalf("blocks[0] (billing) must NOT have cache_control; got %s", blocks[0].Get("cache_control").Raw)
 	}
-	if blocks[1].Get("cache_control.ttl").String() != "1h" {
-		t.Fatalf("blocks[1] should have cache_control.ttl=1h, got %q", blocks[1].Get("cache_control.ttl").String())
+	if blocks[1].Get("cache_control").Exists() {
+		t.Fatalf("blocks[1] (agentBlock) must NOT have cache_control; got %s", blocks[1].Get("cache_control").Raw)
 	}
 	if blocks[2].Get("text").String() != expectedClaudeCodeStaticPrompt() {
 		t.Fatalf("blocks[2] should be static Claude Code prompt, got %q", blocks[2].Get("text").String())
 	}
-	// blocks[2] (last system block) is bare-ephemeral by default. The
-	// scope:"global" opt-in lives behind cfg.ClaudeCursorGlobalCacheScope and
-	// is exercised by the dedicated *_GlobalScope test case below.
+	// blocks[2] (LAST system block) is the ONLY anchor. Default is bare
+	// ephemeral ttl; scope:"global" is opt-in via cfg.ClaudeCursorGlobalCacheScope.
 	if blocks[2].Get("cache_control.scope").String() != "" {
 		t.Fatalf("blocks[2] must be bare-scope by default; got scope=%q", blocks[2].Get("cache_control.scope").String())
 	}
@@ -2138,13 +2139,15 @@ func TestCheckSystemInstructionsWithSigningMode_FallbackGlobalScopeOnLastOnly(t 
 	if len(blocks) != 3 {
 		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
-	// agentBlock must remain bare to keep the prefix chain valid (tools render
-	// before system, and tools never carry scope:"global").
-	if blocks[1].Get("cache_control.scope").String() != "" {
-		t.Fatalf("blocks[1] must NEVER have scope:global; got %q", blocks[1].Get("cache_control.scope").String())
+	// billing + agentBlock must remain cache_control-free so the LAST
+	// scope:"global" anchor is the FIRST cache_control in the prefix chain.
+	// Anthropic's prefix-chain validator on Opus 4.8 rejects any earlier
+	// bare-cache_control block as "narrower cache scope before global".
+	if blocks[0].Get("cache_control").Exists() {
+		t.Fatalf("blocks[0] (billing) must NOT have cache_control; got %s", blocks[0].Get("cache_control").Raw)
 	}
-	if blocks[1].Get("cache_control.ttl").String() != "1h" {
-		t.Fatalf("blocks[1] should have ttl=1h, got %q", blocks[1].Get("cache_control.ttl").String())
+	if blocks[1].Get("cache_control").Exists() {
+		t.Fatalf("blocks[1] (agentBlock) must NOT have cache_control; got %s", blocks[1].Get("cache_control").Raw)
 	}
 	// LAST block gets scope:"global" when the flag is on, matching the
 	// 2026-05-29 Opus 4.8 capture pattern.

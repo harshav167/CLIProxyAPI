@@ -56,11 +56,13 @@ func TestRewriteCursorSystemPromptBlocks_GlobalScopeOnLastWhenEnabled(t *testing
 	firstBlock := blocks[0]
 	lastBlock := blocks[len(blocks)-1]
 
-	if got := firstBlock.Get("cache_control.ttl").String(); got != "1h" {
-		t.Errorf("first block cache_control.ttl = %q, want %q", got, "1h")
-	}
-	if scope := firstBlock.Get("cache_control.scope").String(); scope != "" {
-		t.Errorf("first block cache_control.scope = %q, want empty (bare anchor); block=%s", scope, firstBlock.Raw)
+	// Single-anchor layout (matches canonical Claude Code 2.1.156 Opus 4.8
+	// capture): cache_control ONLY on the last system block. Earlier blocks
+	// must remain cache_control-free so the scope:"global" anchor is the
+	// FIRST cache_control in the prefix chain. Anthropic's prefix-chain
+	// validator rejects bare-cache_control before scope:"global".
+	if firstBlock.Get("cache_control").Exists() {
+		t.Errorf("first block must NOT have cache_control (single-anchor layout); got %s", firstBlock.Get("cache_control").Raw)
 	}
 
 	if got := lastBlock.Get("cache_control.ttl").String(); got != "1h" {
