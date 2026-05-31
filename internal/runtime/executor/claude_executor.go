@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -57,6 +58,38 @@ const claudeToolPrefix = helps.ClaudeToolPrefix
 
 // oauthToolRenameMap aliases the reserved rename map in helps for OAuth remapping.
 var oauthToolRenameMap = helps.ClaudeOAuthToolRenameMap
+
+func sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx context.Context, body []byte, baseModel string) []byte {
+	sanitized, report := sigcompat.SanitizeClaudeMessagesForClaudeUpstream(body, baseModel)
+	logClaudeSignatureSanitizeReport(ctx, baseModel, report)
+	return sanitized
+}
+
+func logClaudeSignatureSanitizeReport(ctx context.Context, baseModel string, report sigcompat.SignatureSanitizeReport) {
+	if report.DroppedBlocks == 0 && report.DroppedSignatures == 0 && report.ReplacedSignatures == 0 {
+		return
+	}
+
+	fields := log.Fields{
+		"component":           "signature_sanitizer",
+		"executor":            "claude",
+		"action":              "sanitize_claude_messages",
+		"target_provider":     string(report.TargetProvider),
+		"target_model":        baseModel,
+		"preserved":           report.Preserved,
+		"dropped_blocks":      report.DroppedBlocks,
+		"dropped_signatures":  report.DroppedSignatures,
+		"replaced_signatures": report.ReplacedSignatures,
+	}
+	if len(report.Decisions) > 0 {
+		decision := report.Decisions[0]
+		fields["first_block_kind"] = string(decision.BlockKind)
+		fields["first_detected_provider"] = string(decision.DetectedProvider)
+		fields["first_reason"] = decision.Reason
+	}
+
+	helps.LogWithRequestID(ctx).WithFields(fields).Debug("claude executor: sanitized signature history before upstream")
+}
 
 // The reverse map is now computed per-request in remapOAuthToolNames so that
 // only names the client actually caused us to rewrite are restored on the
@@ -203,6 +236,11 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 	if oauthToken {
 		prepared.bodyForUpstream, prepared.oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(prepared.bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
+	// Upstream signature sanitize (merged from upstream/main): drop/replace
+	// incompatible signature history before forwarding to the Claude upstream.
+	// Runs after OAuth tool-name remapping and before cch signing so the body
+	// signed is the exact body sent.
+	prepared.bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, prepared.bodyForUpstream, prepared.baseModel)
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		prepared.bodyForUpstream = signAnthropicMessagesBody(prepared.bodyForUpstream)
 	}
@@ -612,6 +650,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if isClaudeOAuthToken(apiKey) {
 		body, _ = prepareClaudeOAuthToolNamesForUpstream(body, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
+	body = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, body, baseModel)
 
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
