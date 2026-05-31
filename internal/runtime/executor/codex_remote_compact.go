@@ -515,22 +515,26 @@ func adjustKeepTailForPairs(items []gjson.Result, keepHead, keepTail int) int {
 		firstType := firstRetained.Get("type").String()
 		lastType := lastCompacted.Get("type").String()
 
-		// Case 1: retained function_call_output needs its matching
-		// function_call. Grow tail until the function_call (by call_id)
-		// is included — that way the pair evicts together.
-		if firstType == "function_call_output" {
+		// Case 1: retained *_output needs its matching call. Grow tail until
+		// the call (by call_id) is included — that way the pair evicts
+		// together. Applies to both function_call/function_call_output and
+		// custom_tool_call/custom_tool_call_output pairs; the Responses API
+		// rejects a retained output whose call lives in the compacted middle.
+		if firstType == "function_call_output" || firstType == "custom_tool_call_output" {
+			callType := callTypeForOutput(firstType)
 			callID := firstRetained.Get("call_id").String()
-			if callID != "" && !tailContainsMatchingFunctionCall(items, boundary, callID) {
+			if callID != "" && !tailContainsMatchingType(items, boundary, callType, callID) {
 				keepTail++
 				continue
 			}
 		}
-		// Case 2: compacted-side function_call whose output is retained.
-		// Grow tail so the function_call is also retained (pair stays
-		// in the tail, no orphan compaction).
-		if lastType == "function_call" {
+		// Case 2: compacted-side call whose output is retained. Grow tail so
+		// the call is also retained (pair stays in the tail, no orphan
+		// compaction). Applies to both function_call and custom_tool_call.
+		if lastType == "function_call" || lastType == "custom_tool_call" {
+			outputType := outputTypeForCall(lastType)
 			callID := lastCompacted.Get("call_id").String()
-			if callID != "" && tailContainsMatchingFunctionCallOutput(items, boundary, callID) {
+			if callID != "" && tailContainsMatchingType(items, boundary, outputType, callID) {
 				keepTail++
 				continue
 			}
@@ -550,24 +554,37 @@ func adjustKeepTailForPairs(items []gjson.Result, keepHead, keepTail int) int {
 	return keepTail
 }
 
-// tailContainsMatchingFunctionCall reports whether the items slice at
-// indices [boundary, len(items)) contains a function_call with the given
-// call_id. Used by adjustKeepTailForPairs case 1.
-func tailContainsMatchingFunctionCall(items []gjson.Result, boundary int, callID string) bool {
-	for i := boundary; i < len(items); i++ {
-		if items[i].Get("type").String() == "function_call" && items[i].Get("call_id").String() == callID {
-			return true
-		}
+// callTypeForOutput maps a tool-call output item type to its matching call
+// item type (function_call_output → function_call,
+// custom_tool_call_output → custom_tool_call).
+func callTypeForOutput(outputType string) string {
+	switch outputType {
+	case "custom_tool_call_output":
+		return "custom_tool_call"
+	default:
+		return "function_call"
 	}
-	return false
 }
 
-// tailContainsMatchingFunctionCallOutput reports whether the items slice at
-// indices [boundary, len(items)) contains a function_call_output with the
-// given call_id. Used by adjustKeepTailForPairs case 2.
-func tailContainsMatchingFunctionCallOutput(items []gjson.Result, boundary int, callID string) bool {
+// outputTypeForCall maps a tool-call item type to its matching output item
+// type (function_call → function_call_output,
+// custom_tool_call → custom_tool_call_output).
+func outputTypeForCall(callType string) string {
+	switch callType {
+	case "custom_tool_call":
+		return "custom_tool_call_output"
+	default:
+		return "function_call_output"
+	}
+}
+
+// tailContainsMatchingType reports whether the items slice at indices
+// [boundary, len(items)) contains an item of the given type with the given
+// call_id. Used by adjustKeepTailForPairs cases 1 and 2 for both
+// function_call/output and custom_tool_call/output pairs.
+func tailContainsMatchingType(items []gjson.Result, boundary int, itemType, callID string) bool {
 	for i := boundary; i < len(items); i++ {
-		if items[i].Get("type").String() == "function_call_output" && items[i].Get("call_id").String() == callID {
+		if items[i].Get("type").String() == itemType && items[i].Get("call_id").String() == callID {
 			return true
 		}
 	}

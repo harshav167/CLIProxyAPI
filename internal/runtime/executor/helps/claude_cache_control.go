@@ -87,6 +87,106 @@ func EnsureCursorClaudeAutomaticPromptCacheControl(payload []byte) []byte {
 	return updated
 }
 
+// StripClaudeCacheControlsBeforeGlobalAnchor removes every cache_control that
+// renders BEFORE the system blocks in Anthropic's prefix chain
+// (top-level request cache_control + all tool-level cache_control).
+//
+// Anthropic's prefix-chain validator rejects a scope:"global" breakpoint when
+// any preceding block carries a narrower (bare) cache scope:
+//
+//	"A block with scope:'global' was found after content with a narrower cache
+//	 scope. Note that tool definitions render before system blocks, so
+//	 scope:'global' on system[0] is not a true prefix when tools are present."
+//
+// The Cursor system rewriter places the scope:"global" anchor on a system
+// block, but inbound Cursor payloads frequently arrive with their own bare
+// tool-level or top-level cache_control that survives our pipeline (because
+// CountClaudeCacheControls is non-zero, EnsureClaudeCacheControl is skipped,
+// and EnforceClaudeCacheControlLimit is a no-op under the limit). Those bare
+// breakpoints render before the global system anchor and trip the 400.
+//
+// Canonical Claude Code never sends a top-level cache_control and keeps tools
+// cache-control-free in the global-scope layout, so stripping them here both
+// matches Claude Code and guarantees the system global anchor is the first
+// breakpoint in the chain.
+//
+// Self-guarding: it only strips when the outgoing payload ACTUALLY contains a
+// scope:"global" anchor (in system or message content). This makes it correct
+// for ANY cloaked Claude client — not just Cursor — and a safe no-op when no
+// global anchor was emitted (e.g. cloaking didn't apply), so it never removes
+// a client's legitimate caching when there is nothing to protect.
+func StripClaudeCacheControlsBeforeGlobalAnchor(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	if !ClaudePayloadHasGlobalCacheAnchor(payload) {
+		return payload
+	}
+	if gjson.GetBytes(payload, "cache_control").Exists() {
+		if updated, err := sjson.DeleteBytes(payload, "cache_control"); err == nil {
+			payload = updated
+		}
+	}
+	tools := gjson.GetBytes(payload, "tools")
+	if tools.IsArray() {
+		count := int(tools.Get("#").Int())
+		for i := 0; i < count; i++ {
+			path := fmt.Sprintf("tools.%d.cache_control", i)
+			if gjson.GetBytes(payload, path).Exists() {
+				if updated, err := sjson.DeleteBytes(payload, path); err == nil {
+					payload = updated
+				}
+			}
+		}
+	}
+	return payload
+}
+
+// ClaudePayloadHasGlobalCacheAnchor reports whether the payload carries a
+// cache_control with scope:"global" anywhere in the prefix chain (top-level,
+// tools, system, or message content). Used to decide whether the pre-anchor
+// strip needs to run at all.
+func ClaudePayloadHasGlobalCacheAnchor(payload []byte) bool {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return false
+	}
+	root := gjson.ParseBytes(payload)
+	if root.Get("cache_control.scope").String() == "global" {
+		return true
+	}
+	found := false
+	scan := func(item gjson.Result) bool {
+		if item.Get("cache_control.scope").String() == "global" {
+			found = true
+			return false
+		}
+		return true
+	}
+	if tools := root.Get("tools"); tools.IsArray() {
+		tools.ForEach(func(_, item gjson.Result) bool { return scan(item) })
+	}
+	if found {
+		return true
+	}
+	if system := root.Get("system"); system.IsArray() {
+		system.ForEach(func(_, item gjson.Result) bool { return scan(item) })
+	}
+	if found {
+		return true
+	}
+	if messages := root.Get("messages"); messages.IsArray() {
+		messages.ForEach(func(_, msg gjson.Result) bool {
+			content := msg.Get("content")
+			if !content.IsArray() {
+				return true
+			}
+			content.ForEach(func(_, item gjson.Result) bool { return scan(item) })
+			return !found
+		})
+	}
+	return found
+}
+
 func AllClaudeCacheControlsUseTTL(payload []byte, ttl string) bool {
 	found := false
 	ok := true

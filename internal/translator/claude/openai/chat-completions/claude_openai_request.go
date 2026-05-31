@@ -402,7 +402,17 @@ func applyClaudeCodeThinkingParity(out []byte, modelName string, root gjson.Resu
 	if !isClaudeCodeOpusThinkingAlias(modelName) {
 		return out
 	}
-	if toolChoiceType := strings.ToLower(strings.TrimSpace(root.Get("tool_choice.type").String())); toolChoiceType == "any" || toolChoiceType == "tool" {
+	// Skip when the request forces tool use. Anthropic rejects extended
+	// thinking combined with a forced tool_choice, so adding thinking here
+	// would produce an invalid request. The forced forms arrive in TWO
+	// dialects (this handler is reached by both Anthropic-shaped Cursor BYOK
+	// traffic AND OpenAI-shaped clients), and the OpenAI forms are only
+	// converted to Anthropic any/tool LATER in this function — so we must
+	// detect them on the raw input here:
+	//   - Anthropic shape: tool_choice:{type:"any"|"tool"}
+	//   - OpenAI string:   tool_choice:"required"   (-> {type:"any"})
+	//   - OpenAI object:   tool_choice:{type:"function"} (-> {type:"tool"})
+	if claudeRequestForcesToolChoice(root) {
 		return out
 	}
 	if strings.EqualFold(gjson.GetBytes(out, "thinking.type").String(), "disabled") {
@@ -436,6 +446,30 @@ func applyClaudeCodeThinkingParity(out []byte, modelName string, root gjson.Resu
 	}
 	out, _ = sjson.SetBytes(out, "output_config.effort", effort)
 	return out
+}
+
+// claudeRequestForcesToolChoice reports whether the inbound request forces tool
+// use, across both Anthropic and OpenAI tool_choice dialects. Anthropic forbids
+// extended thinking together with a forced tool choice, so the thinking-parity
+// path must treat any of these as "forced" and skip injecting thinking:
+//   - Anthropic object: {type:"any"} or {type:"tool"}
+//   - OpenAI string:    "required"
+//   - OpenAI object:    {type:"function", ...}
+func claudeRequestForcesToolChoice(root gjson.Result) bool {
+	toolChoice := root.Get("tool_choice")
+	if !toolChoice.Exists() {
+		return false
+	}
+	switch toolChoice.Type {
+	case gjson.String:
+		return strings.EqualFold(strings.TrimSpace(toolChoice.String()), "required")
+	case gjson.JSON:
+		switch strings.ToLower(strings.TrimSpace(toolChoice.Get("type").String())) {
+		case "any", "tool", "function":
+			return true
+		}
+	}
+	return false
 }
 
 func isClaudeCodeOpusThinkingAlias(modelName string) bool {

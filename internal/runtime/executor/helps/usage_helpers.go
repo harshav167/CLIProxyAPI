@@ -3,6 +3,8 @@ package helps
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +43,12 @@ type UsageReporter struct {
 }
 
 func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
-	apiKey := APIKeyFromContext(ctx)
+	// Fingerprint the inbound client API key immediately. The raw key is the
+	// secret clients use to authenticate TO the proxy; it must never be stamped
+	// into usage records (which surface in stats and the redis queue payload).
+	// A stable non-secret fingerprint preserves per-key grouping/dedup without
+	// exposing the credential.
+	apiKey := FingerprintAPIKey(APIKeyFromContext(ctx))
 	alias := usage.RequestedModelAliasFromContext(ctx)
 	if alias == "" {
 		alias = model
@@ -351,6 +358,30 @@ func (r *usageTTFTReadCloser) Read(p []byte) (int, error) {
 		r.once.Do(r.mark)
 	}
 	return n, errRead
+}
+
+// apiKeyFingerprintPrefix labels fingerprints so a redacted value is visibly
+// distinguishable from a raw key in logs/stats and never mistaken for one.
+const apiKeyFingerprintPrefix = "fp_"
+
+// FingerprintAPIKey converts a raw inbound client API key into a stable,
+// non-secret identifier suitable for usage records, stats grouping, and the
+// redis queue payload. It returns "" for an empty key (unchanged grouping for
+// keyless requests) and otherwise "fp_" + the first 16 hex chars of the
+// SHA-256 digest. The digest is one-way, so the original key cannot be
+// recovered, while identical keys still map to identical fingerprints (so
+// per-key aggregation and dedup keep working).
+func FingerprintAPIKey(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, apiKeyFingerprintPrefix) {
+		// Already fingerprinted (defensive against double application).
+		return trimmed
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return apiKeyFingerprintPrefix + hex.EncodeToString(sum[:])[:16]
 }
 
 func APIKeyFromContext(ctx context.Context) string {

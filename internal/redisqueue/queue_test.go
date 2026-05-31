@@ -32,6 +32,49 @@ func TestEnqueueBroadcastsToUsageSubscribersAndSkipsQueue(t *testing.T) {
 	})
 }
 
+func TestEnqueuePersistsWhenSubscriberBufferFull(t *testing.T) {
+	withEnabledQueue(t, func() {
+		subscriber, unsubscribe := SubscribeUsage()
+		defer unsubscribe()
+
+		// Fill the subscriber's buffer so the next Enqueue cannot deliver.
+		for i := 0; i < usageSubscriberBuffer; i++ {
+			Enqueue([]byte("fill"))
+		}
+
+		// Drain everything currently buffered so we can isolate the overflow
+		// record below. The buffer now holds usageSubscriberBuffer "fill"
+		// records (deliveries succeeded, so none hit the backend yet).
+		for i := 0; i < usageSubscriberBuffer; i++ {
+			select {
+			case <-subscriber:
+			case <-time.After(time.Second):
+				t.Fatalf("timeout draining buffered fill record %d", i)
+			}
+		}
+
+		// Re-fill the buffer to capacity, then enqueue one more. The overflow
+		// record cannot be delivered (buffer full) and must be persisted to the
+		// backend rather than dropped.
+		for i := 0; i < usageSubscriberBuffer; i++ {
+			Enqueue([]byte("fill2"))
+		}
+		Enqueue([]byte("overflow-record"))
+
+		items := PopOldest(usageSubscriberBuffer + 1)
+		found := false
+		for _, item := range items {
+			if string(item) == "overflow-record" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("overflow record was lost; backend items = %q", items)
+		}
+	})
+}
+
 func TestSetEnabledFalseClosesUsageSubscribers(t *testing.T) {
 	withEnabledQueue(t, func() {
 		subscriber, unsubscribe := SubscribeUsage()

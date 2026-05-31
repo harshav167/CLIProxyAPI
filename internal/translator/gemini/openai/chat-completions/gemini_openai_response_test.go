@@ -37,6 +37,38 @@ func TestConvertGeminiResponseToOpenAIMovesSentinelThoughtTextToReasoning(t *tes
 	}
 }
 
+func TestConvertGeminiResponseToOpenAINativeThoughtDoesNotStickToNextText(t *testing.T) {
+	var param any
+
+	// Native thought part (thought:true) -> reasoning_content.
+	thoughtChunk := []byte(`{"responseId":"r","modelVersion":"gemini-3.1-pro-preview","createTime":"2026-05-15T06:21:08Z","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"let me think","thought":true}]}}]}`)
+	first := ConvertGeminiResponseToOpenAI(context.Background(), "gemini-3.1-pro", nil, nil, thoughtChunk, &param)
+	if len(first) != 1 {
+		t.Fatalf("expected one chunk for thought, got %d", len(first))
+	}
+	if got := gjson.GetBytes(first[0], "choices.0.delta.reasoning_content").String(); got != "let me think" {
+		t.Fatalf("native thought should be reasoning_content, got %q in %s", got, string(first[0]))
+	}
+
+	// Following NORMAL text part (no thought flag, no sentinel) must be visible
+	// content — the native-thought flag must NOT stick to it and hide the answer.
+	answerChunk := []byte(`{"responseId":"r","modelVersion":"gemini-3.1-pro-preview","createTime":"2026-05-15T06:21:08Z","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"the visible answer"}]}}]}`)
+	second := ConvertGeminiResponseToOpenAI(context.Background(), "gemini-3.1-pro", nil, nil, answerChunk, &param)
+	if len(second) != 1 {
+		t.Fatalf("expected one chunk for answer, got %d", len(second))
+	}
+	delta := gjson.GetBytes(second[0], "choices.0.delta")
+	if got := delta.Get("content").String(); got != "the visible answer" {
+		t.Fatalf("answer after native thought should be visible content, got content=%q reasoning=%q in %s",
+			got, delta.Get("reasoning_content").String(), string(second[0]))
+	}
+	// reasoning_content may exist as a default null template field; it must not
+	// carry the answer text.
+	if got := delta.Get("reasoning_content"); got.Raw != "null" && got.String() != "" {
+		t.Fatalf("answer after native thought must NOT be reasoning_content, got %s; body=%s", got.Raw, string(second[0]))
+	}
+}
+
 func TestConvertGeminiResponseToOpenAILeavesNormalTextAsContent(t *testing.T) {
 	var param any
 	chunk := []byte(`{"responseId":"gemini-response","modelVersion":"gemini-3.1-pro-preview","createTime":"2026-05-15T06:21:08Z","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Final answer"}]}}]}`)

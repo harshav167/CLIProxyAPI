@@ -47,16 +47,19 @@ func LooksLikeCursorSubagent(payload []byte) bool {
 }
 
 // RewriteCursorSystemPromptBlocks rewrites Cursor's identity-line sentinels and
-// places two cache_control breakpoints (first + last system text block) at the
-// supplied TTL.
+// places a SINGLE cache_control breakpoint on the LAST system text block at the
+// supplied TTL. All earlier system text blocks are left cache-control-free.
 //
-// When useGlobalScopeOnLast is true, the LAST text block's cache_control adds
+// When useGlobalScopeOnLast is true, that lone last-block cache_control adds
 // scope:"global", mirroring the 2026-05-29 canonical Claude Code Opus 4.8 capture
 // pattern (last system block is `{"type":"ephemeral","ttl":"1h","scope":"global"}`,
-// earlier blocks are bare ttl). This is the position our 2026-05-11 attempt missed
-// — that attempt put scope:"global" on the FIRST block, which violated Anthropic's
-// prefix-chain validator. The LAST-block position is what claude-cli/2.1.156 ships
-// and what Anthropic accepts.
+// all earlier blocks carry NO cache_control). Anthropic's prefix-chain validator
+// requires the scope:"global" anchor to be the FIRST cache_control breakpoint in
+// the tools→system→messages chain; anchoring ONLY the last system block (with
+// nothing carrying cache_control before it) satisfies that. Our 2026-05-11
+// attempt put a bare anchor on the first block and scope:"global" on the last,
+// which violated the rule and 400'd. The single last-block anchor is what
+// claude-cli/2.1.156 ships and what Anthropic accepts.
 //
 // Flag-gated via cfg.ClaudeCursorGlobalCacheScope so prod can roll back fast.
 func RewriteCursorSystemPromptBlocks(system gjson.Result, billingBlock string, ttl string, useGlobalScopeOnLast bool) (string, bool) {
@@ -64,25 +67,50 @@ func RewriteCursorSystemPromptBlocks(system gjson.Result, billingBlock string, t
 		return "", false
 	}
 
-	// PATCH 2026-05-11 v5: allow empty billingBlock to skip the prepend.
-	// Hypothesis being tested: Anthropic's prefix-chain validator treats a
-	// system[0] text block whose content matches the `x-anthropic-billing-header:`
-	// pattern as metadata rather than content, effectively making our scope:"global"
-	// block (which we put on system[1]) act as their "system[0]" — which the
-	// validator rejects when tools are present. Real Claude Code with
-	// CLAUDE_CODE_ATTRIBUTION_HEADER=0 ships system[0] = identity text (not a
-	// billing header) and gets 200 with scope:"global" + tools. Skipping the
-	// billing prepend in the Cursor BYOK path mirrors that behavior.
+	// Layout MUST mirror the canonical Claude Code 2.1.156 Opus 4.8 captures
+	// (gist 3a0a2db78a42c00b0029d8f2cc1c070b, fetched 2026-05-29):
+	//
+	//   system[0] billing header     NO cache_control
+	//   system[1] identity-only line "You are Claude Code, Anthropic's
+	//             official CLI for Claude."   NO cache_control
+	//   system[2] (first cacheable content)   cache_control { ttl [+ scope:"global"] }
+	//   system[3..N] (further content)        cache_control { ttl }  (bare)
+	//
+	// Pre-fix bug (byte-confirmed in
+	// docker/logs/cliproxy/v1-chat-completions-2026-05-29T153252-*.log):
+	// the rewriter prepended ONLY the billing block, then placed the global
+	// anchor on system[1] — which collapsed the canonical identity line and
+	// the actual content into one block. Anthropic 400'd because the global
+	// anchor wasn't on the first cacheable CONTENT block; with tools rendering
+	// before system the validator treats system[1] as effectively system[0]
+	// and rejects "global on system[0] is not a true prefix when tools are
+	// present".
+	//
+	// Fix: ALWAYS prepend the canonical identity-only block as system[1]
+	// (matching Claude Code byte-for-byte), so the global anchor lands on
+	// system[2] (the rewritten Cursor content) with two earlier cc-free
+	// blocks separating it from the tools prefix chain.
 	var systemBlocks []string
 	if strings.TrimSpace(billingBlock) != "" {
 		systemBlocks = []string{billingBlock}
 	}
+	// Canonical identity block, exact byte-for-byte match with the gist
+	// captures' system[1]. No cache_control.
+	identityBlock := BuildClaudeTextBlock(claudeCodeIdentityLine, nil)
+	systemBlocks = append(systemBlocks, identityBlock)
 	matched := false
 	system.ForEach(func(_, part gjson.Result) bool {
 		partRaw := part.Raw
 		if part.Get("type").String() == "text" {
 			if rewritten, ok := RewriteCursorSystemPromptIdentityAndIntegrity(part.Get("text").String()); ok {
-				if rewrittenPart, err := sjson.SetBytes([]byte(part.Raw), "text", rewritten); err == nil {
+				// The standalone identityBlock we prepended already contains
+				// claudeCodeIdentityLine; strip an exact-prefix duplicate (plus
+				// trailing blank lines) from the rewritten content so the
+				// canonical layout stays {billing, identity, content...}
+				// rather than {billing, identity, identity+content...}.
+				trimmed := strings.TrimPrefix(rewritten, claudeCodeIdentityLine)
+				trimmed = strings.TrimLeft(trimmed, "\n\r")
+				if rewrittenPart, err := sjson.SetBytes([]byte(part.Raw), "text", trimmed); err == nil {
 					partRaw = string(rewrittenPart)
 					matched = true
 				}

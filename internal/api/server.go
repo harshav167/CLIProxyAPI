@@ -1207,6 +1207,20 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
 
+	// Reconcile in-memory usage statistics recording from config BEFORE we
+	// accept any request. The usage logger plugin defaults to enabled in its
+	// init() (so cmd/server and tests behave without explicit wiring), and the
+	// non-home SDK startup path reaches Start() without ever calling
+	// UpdateClients — so a configured/default usage-statistics-enabled:false was
+	// previously ignored until the first config UPDATE, leaking in-memory usage
+	// in the meantime. Setting it here makes the configured value authoritative
+	// from startup. Idempotent with the UpdateClients reconcile on later config
+	// changes.
+	if s.cfg != nil {
+		usage.SetStatisticsEnabled(s.cfg.UsageStatisticsEnabled)
+		redisqueue.SetUsageStatisticsEnabled(s.cfg.UsageStatisticsEnabled)
+	}
+
 	addr := s.server.Addr
 	listener, errListen := net.Listen("tcp", addr)
 	if errListen != nil {

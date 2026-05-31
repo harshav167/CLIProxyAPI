@@ -86,6 +86,31 @@ func TestShouldRouteResponsesBodyViaCodexResponsesRequiresDialectAndProvider(t *
 	}
 }
 
+func TestShouldRouteResponsesBodyViaCodexResponsesStripsThinkingSuffix(t *testing.T) {
+	const baseModel = "gpt-5-codex"
+	registry.GetGlobalRegistry().RegisterClient("test-codex-suffix-client", "codex", []*registry.ModelInfo{{ID: baseModel}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient("test-codex-suffix-client")
+	})
+
+	// A suffixed model (thinking suffix uses parenthesis syntax, e.g.
+	// gpt-5-codex(high)) must still resolve to the codex provider and route via
+	// Codex Responses. Before the suffix strip, GetProviderName looked up the
+	// raw suffixed name, found no provider, and bypassed Codex Responses routing
+	// + prompt-cache handling.
+	const suffixedModel = "gpt-5-codex(high)"
+	suffixed := []byte(`{"model":"gpt-5-codex(high)","input":[{"role":"user","content":"hi"}],"stream":true}`)
+	if !shouldRouteResponsesBodyViaCodexResponses(suffixedModel, suffixed) {
+		t.Fatal("suffixed Codex model request should route via Responses after suffix strip")
+	}
+
+	// And the bare base model still routes (no regression).
+	bare := []byte(`{"model":"gpt-5-codex","input":[{"role":"user","content":"hi"}],"stream":true}`)
+	if !shouldRouteResponsesBodyViaCodexResponses(baseModel, bare) {
+		t.Fatal("bare Codex model request should still route via Responses")
+	}
+}
+
 func TestStripCursorMetadataForCodexResponsesOnlyForCursor(t *testing.T) {
 	_, _, cursorCtx, _ := newOpenAIChatStreamTestHandler(t)
 	cursorCtx.Request.Header.Set("User-Agent", "Cursor/1.0")

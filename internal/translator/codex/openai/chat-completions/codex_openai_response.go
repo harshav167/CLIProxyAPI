@@ -29,6 +29,20 @@ type ConvertCliToOpenAIParams struct {
 	HasReceivedArgumentsDelta bool
 	HasToolCallAnnounced      bool
 	LastImageHashByItemID     map[string][32]byte
+	// ItemIndexByID maps an upstream item_id to the Chat Completions
+	// tool_calls index assigned when that item was announced. Codex can
+	// interleave deltas from multiple in-flight tool calls; resolving each
+	// delta by its own item_id (rather than a single shared counter) keeps a
+	// delta from attaching to the wrong tool-call index.
+	ItemIndexByID map[string]int
+	// ArgsDeltaSeenByID records, per upstream item_id, whether any
+	// argument/input delta has already been streamed for that tool call. The
+	// .done handler uses this to decide whether to re-emit the full arguments
+	// (fallback when no deltas arrived) or stay silent. A single global flag
+	// breaks under interleaved tool calls: output_item.added for a SECOND call
+	// would reset the flag, then the FIRST call's .done would wrongly re-emit
+	// its full arguments after its deltas already streamed (duplicated args).
+	ArgsDeltaSeenByID map[string]bool
 }
 
 // ConvertCodexResponseToOpenAI translates a single chunk of a streaming response from the
@@ -55,6 +69,8 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			HasReceivedArgumentsDelta: false,
 			HasToolCallAnnounced:      false,
 			LastImageHashByItemID:     make(map[string][32]byte),
+			ItemIndexByID:             make(map[string]int),
+			ArgsDeltaSeenByID:         make(map[string]bool),
 		}
 	}
 
@@ -175,12 +191,27 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		}
 
 		// Increment index for this new function call item.
-		(*param).(*ConvertCliToOpenAIParams).FunctionCallIndex++
-		(*param).(*ConvertCliToOpenAIParams).HasReceivedArgumentsDelta = false
-		(*param).(*ConvertCliToOpenAIParams).HasToolCallAnnounced = true
+		p := (*param).(*ConvertCliToOpenAIParams)
+		p.FunctionCallIndex++
+		p.HasReceivedArgumentsDelta = false
+		p.HasToolCallAnnounced = true
+		// Bind this upstream item_id to the freshly assigned index so later
+		// argument deltas/done events for the SAME item resolve to the right
+		// Chat Completions tool_calls index even if another tool call is
+		// announced in between (interleaved/parallel tool calls).
+		if itemID := itemResult.Get("id").String(); itemID != "" {
+			if p.ItemIndexByID == nil {
+				p.ItemIndexByID = make(map[string]int)
+			}
+			p.ItemIndexByID[itemID] = p.FunctionCallIndex
+			if p.ArgsDeltaSeenByID == nil {
+				p.ArgsDeltaSeenByID = make(map[string]bool)
+			}
+			p.ArgsDeltaSeenByID[itemID] = false
+		}
 
 		functionCallItemTemplate := []byte(`{"index":0,"id":"","type":"function","function":{"name":"","arguments":""}}`)
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex)
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", p.FunctionCallIndex)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", itemResult.Get("call_id").String())
 
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", itemResult.Get("name").String())
@@ -191,18 +222,39 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
 
 	} else if dataType == "response.function_call_arguments.delta" || dataType == "response.custom_tool_call_input.delta" {
-		(*param).(*ConvertCliToOpenAIParams).HasReceivedArgumentsDelta = true
+		p := (*param).(*ConvertCliToOpenAIParams)
+		p.HasReceivedArgumentsDelta = true
+		if itemID := rootResult.Get("item_id").String(); itemID != "" {
+			if p.ArgsDeltaSeenByID == nil {
+				p.ArgsDeltaSeenByID = make(map[string]bool)
+			}
+			p.ArgsDeltaSeenByID[itemID] = true
+		}
 
 		deltaValue := rootResult.Get("delta").String()
+		toolCallIndex := resolveToolCallIndex(p, rootResult.Get("item_id").String())
 		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex)
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", toolCallIndex)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", deltaValue)
 
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
 
 	} else if dataType == "response.function_call_arguments.done" || dataType == "response.custom_tool_call_input.done" {
-		if (*param).(*ConvertCliToOpenAIParams).HasReceivedArgumentsDelta {
+		p := (*param).(*ConvertCliToOpenAIParams)
+		// Decide whether deltas already streamed for THIS specific tool call.
+		// Prefer the per-item record (keyed by item_id) so interleaved tool
+		// calls don't clobber each other's delta-seen state; fall back to the
+		// global flag only when the event carries no item_id.
+		argsAlreadyStreamed := p.HasReceivedArgumentsDelta
+		if itemID := rootResult.Get("item_id").String(); itemID != "" {
+			if p.ArgsDeltaSeenByID != nil {
+				argsAlreadyStreamed = p.ArgsDeltaSeenByID[itemID]
+			} else {
+				argsAlreadyStreamed = false
+			}
+		}
+		if argsAlreadyStreamed {
 			// Arguments were already streamed via delta events; nothing to emit.
 			return [][]byte{}
 		}
@@ -212,8 +264,9 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		if fullArgs == "" {
 			fullArgs = rootResult.Get("input").String()
 		}
+		toolCallIndex := resolveToolCallIndex(p, rootResult.Get("item_id").String())
 		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex)
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", toolCallIndex)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", fullArgs)
 
 		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
@@ -472,6 +525,24 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 	}
 
 	return template
+}
+
+// resolveToolCallIndex returns the Chat Completions tool_calls index for an
+// upstream tool-call argument event. It prefers the index bound to the event's
+// item_id at announcement time (output_item.added), which keeps interleaved or
+// parallel tool-call deltas attached to the correct index. When the item_id is
+// absent or was never announced (e.g. a stream that skipped output_item.added),
+// it falls back to the running FunctionCallIndex to preserve prior behavior.
+func resolveToolCallIndex(p *ConvertCliToOpenAIParams, itemID string) int {
+	if p == nil {
+		return 0
+	}
+	if itemID != "" && p.ItemIndexByID != nil {
+		if idx, ok := p.ItemIndexByID[itemID]; ok {
+			return idx
+		}
+	}
+	return p.FunctionCallIndex
 }
 
 func mimeTypeFromCodexOutputFormat(outputFormat string) string {

@@ -58,9 +58,23 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// Convert input array to messages
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		inputItems := input.Array()
+		// Prepass: collect the call IDs that have a tool output later in the
+		// input. The adjacency logic (appendRegularMessage/hasAwaitingToolOutput)
+		// uses this to know whether a tool call's output is actually present, so
+		// it can defer intervening regular messages until after the output and
+		// keep the assistant(tool_calls) -> tool(tool_call_id) pair contiguous.
+		//
+		// MUST track BOTH function_call_output AND custom_tool_call_output. The
+		// switch below handles both output types; if the prepass only recorded
+		// function_call_output, a custom_tool_call followed by a regular message
+		// then its custom_tool_call_output would not be seen as "awaiting",
+		// hasAwaitingToolOutput() returns false, the message is NOT deferred, and
+		// it gets inserted between the assistant tool_calls and the tool output —
+		// invalid Chat Completions ordering.
 		outputCallIDs := make(map[string]struct{})
 		for _, item := range inputItems {
-			if item.Get("type").String() != "function_call_output" {
+			itemType := item.Get("type").String()
+			if itemType != "function_call_output" && itemType != "custom_tool_call_output" {
 				continue
 			}
 			callID := strings.TrimSpace(item.Get("call_id").String())

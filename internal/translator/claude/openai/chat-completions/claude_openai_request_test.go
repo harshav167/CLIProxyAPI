@@ -315,6 +315,44 @@ func TestConvertOpenAIRequestToClaude_OpusThinkingPreservesIncomingEffort(t *tes
 	}
 }
 
+func TestConvertOpenAIRequestToClaude_OpusThinkingSkippedForForcedToolChoice(t *testing.T) {
+	// Anthropic rejects extended thinking combined with a forced tool_choice.
+	// The thinking-parity path must skip injecting thinking for ALL forced
+	// forms, including the OpenAI dialects that are only converted to Anthropic
+	// any/tool later in the same function.
+	cases := []struct {
+		name       string
+		toolChoice string
+	}{
+		{"openai_required_string", `"required"`},
+		{"openai_function_object", `{"type":"function","function":{"name":"do_work"}}`},
+		{"anthropic_any", `{"type":"any"}`},
+		{"anthropic_tool", `{"type":"tool","name":"do_work"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inputJSON := `{
+				"messages": [{"role": "user", "content": "hi"}],
+				"tools": [{"type":"function","function":{"name":"do_work","parameters":{"type":"object","properties":{}}}}],
+				"tool_choice": ` + tc.toolChoice + `,
+				"output_config": {"effort": "high"}
+			}`
+			resultJSON := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-8-thinking-high", []byte(inputJSON), true))
+
+			// Parity must NOT have injected extended thinking.
+			if got := resultJSON.Get("thinking.type").String(); got == "enabled" || got == "adaptive" {
+				t.Fatalf("thinking.type = %q, want unset (forced tool choice should suppress thinking); body=%s", got, resultJSON.Raw)
+			}
+			if resultJSON.Get("thinking.budget_tokens").Exists() {
+				t.Fatalf("thinking.budget_tokens should not be set with forced tool choice; body=%s", resultJSON.Raw)
+			}
+			if resultJSON.Get("context_management.edits.0.type").Exists() {
+				t.Fatalf("context_management edits should not be set with forced tool choice; body=%s", resultJSON.Raw)
+			}
+		})
+	}
+}
+
 func TestConvertOpenAIRequestToClaude_OpusThinkingDisabledDoesNotAddParityFields(t *testing.T) {
 	inputJSON := `{
 		"messages": [{"role": "user", "content": "hi"}],

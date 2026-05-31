@@ -4,12 +4,65 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
+
+func TestFingerprintAPIKeyRedactsRawKey(t *testing.T) {
+	const rawKey = "sk-super-secret-client-key-123456"
+	fp := FingerprintAPIKey(rawKey)
+	if fp == "" {
+		t.Fatal("fingerprint is empty for non-empty key")
+	}
+	if strings.Contains(fp, rawKey) || fp == rawKey {
+		t.Fatalf("fingerprint %q leaks raw key", fp)
+	}
+	if !strings.HasPrefix(fp, "fp_") {
+		t.Fatalf("fingerprint %q missing fp_ prefix", fp)
+	}
+	// Stable: identical keys map to identical fingerprints.
+	if again := FingerprintAPIKey(rawKey); again != fp {
+		t.Fatalf("fingerprint not stable: %q vs %q", again, fp)
+	}
+	// Distinct keys map to distinct fingerprints.
+	if other := FingerprintAPIKey("sk-different-key"); other == fp {
+		t.Fatalf("distinct keys collided on fingerprint %q", fp)
+	}
+	// Idempotent: re-fingerprinting a fingerprint is a no-op.
+	if doubled := FingerprintAPIKey(fp); doubled != fp {
+		t.Fatalf("double fingerprint changed value: %q vs %q", doubled, fp)
+	}
+	// Empty stays empty (keyless grouping unchanged).
+	if FingerprintAPIKey("") != "" {
+		t.Fatal("empty key should fingerprint to empty string")
+	}
+}
+
+func TestNewUsageReporterDoesNotStampRawAPIKey(t *testing.T) {
+	const rawKey = "sk-super-secret-client-key-abcdef"
+	gin.SetMode(gin.TestMode)
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Set("userApiKey", rawKey)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	reporter := NewUsageReporter(ctx, "claude", "claude-opus-4-8", nil)
+	record := reporter.buildRecord(usage.Detail{InputTokens: 1}, false)
+
+	if record.APIKey == rawKey || strings.Contains(record.APIKey, rawKey) {
+		t.Fatalf("usage record APIKey leaks raw key: %q", record.APIKey)
+	}
+	if record.Source == rawKey || strings.Contains(record.Source, rawKey) {
+		t.Fatalf("usage record Source leaks raw key: %q", record.Source)
+	}
+	if !strings.HasPrefix(record.APIKey, "fp_") {
+		t.Fatalf("usage record APIKey not fingerprinted: %q", record.APIKey)
+	}
+}
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	data := []byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)

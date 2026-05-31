@@ -27,6 +27,14 @@ func runFullCachePipeline(body []byte, useGlobalScopeOnLast, isCursor bool) []by
 	}
 	body = helps.EnforceClaudeCacheControlLimit(body, 4)
 	body = helps.NormalizeClaudeCacheControlTTL(body)
+	// Mirror claude_executor.go prepareMessagesRequest: on the global-scope path
+	// strip every cache_control rendering BEFORE the system global anchor
+	// (top-level + tool-level) so the anchor leads the prefix chain. This step
+	// is what the original harness omitted; without it an inbound top-level/tool
+	// cache_control survives and 400s.
+	if useGlobalScopeOnLast {
+		body = helps.StripClaudeCacheControlsBeforeGlobalAnchor(body)
+	}
 	return body
 }
 
@@ -151,6 +159,49 @@ func representativeCursorClaudeBody() []byte {
 	return []byte(body)
 }
 
+// representativeCursorClaudeBodyWithPreAnchorCacheControls builds the worst-case
+// inbound shape: Cursor sends its own bare top-level cache_control AND a bare
+// tool-level cache_control, both of which render BEFORE the system blocks in
+// Anthropic's prefix chain. With the global flag on, the system rewrite emits a
+// scope:"global" anchor; if these pre-anchor bare controls survive, the request
+// 400s ("a block with scope:global was found after content with a narrower
+// cache scope"). This is the exact scenario the original harness never covered.
+func representativeCursorClaudeBodyWithPreAnchorCacheControls() []byte {
+	sysText := strings.Join([]string{
+		"You are an AI coding assistant, powered by Claude.",
+		"",
+		"You operate in Cursor.",
+		"",
+		"You are a coding agent in the Cursor IDE that helps the USER with software engineering tasks.",
+		"",
+		"<tool_calling>",
+		"Use tools to accomplish the task.",
+		"</tool_calling>",
+	}, "\n")
+
+	body := `{
+		"model": "claude-opus-4-8",
+		"max_tokens": 64000,
+		"stream": true,
+		"thinking": {"type":"adaptive"},
+		"output_config": {"effort":"high"},
+		"cache_control": {"type":"ephemeral"},
+		"system": [
+			{"type":"text","text":` + jsonQuote(sysText) + `,"cache_control":{"type":"ephemeral"}}
+		],
+		"tools": [
+			{"name":"read_file","description":"Read a file","input_schema":{"type":"object","properties":{}}},
+			{"name":"edit_file","description":"Edit a file","input_schema":{"type":"object","properties":{}},"cache_control":{"type":"ephemeral"}}
+		],
+		"messages": [
+			{"role":"user","content":[{"type":"text","text":"first turn question"}]},
+			{"role":"assistant","content":[{"type":"text","text":"first answer"}]},
+			{"role":"user","content":[{"type":"text","text":"second turn question"}]}
+		]
+	}`
+	return []byte(body)
+}
+
 func jsonQuote(s string) string {
 	// minimal JSON string quoting for the fixture builder
 	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`, "\t", `\t`)
@@ -230,5 +281,62 @@ func TestCursorClaudeFullPipelineFlagOn(t *testing.T) {
 	})
 	if globals == 0 {
 		t.Fatalf("flag-on full pipeline produced no surviving scope:global anchor; system=%s", root.Get("system").Raw)
+	}
+}
+
+// TestCursorClaudeFullPipelineFlagOnStripsInboundPreAnchorCacheControls is the
+// regression test for the prefix-chain 400 the deployed strip fixes. It feeds an
+// inbound body carrying BOTH a bare top-level cache_control and a bare tool-level
+// cache_control (which render before system in Anthropic's chain), runs the full
+// flag-on pipeline, and asserts:
+//   - the outgoing payload has NO top-level cache_control,
+//   - NO tool carries cache_control,
+//   - a scope:"global" anchor exists and is the FIRST breakpoint in render order.
+func TestCursorClaudeFullPipelineFlagOnStripsInboundPreAnchorCacheControls(t *testing.T) {
+	in := representativeCursorClaudeBodyWithPreAnchorCacheControls()
+
+	// Sanity: the inbound body really does carry the pre-anchor controls we want
+	// to prove get stripped (otherwise the test would pass vacuously).
+	if !gjson.GetBytes(in, "cache_control").Exists() {
+		t.Fatal("fixture missing inbound top-level cache_control")
+	}
+	var inboundToolCC bool
+	gjson.GetBytes(in, "tools").ForEach(func(_, tool gjson.Result) bool {
+		if tool.Get("cache_control").Exists() {
+			inboundToolCC = true
+			return false
+		}
+		return true
+	})
+	if !inboundToolCC {
+		t.Fatal("fixture missing inbound tool-level cache_control")
+	}
+
+	out := runFullCachePipeline(in, true, true)
+
+	// The global anchor must lead the chain with nothing carrying cache_control
+	// before it (this is the assertion that 400'd in prod before the strip).
+	assertPrefixChainValid(t, out)
+
+	root := gjson.ParseBytes(out)
+	if root.Get("cache_control").Exists() {
+		t.Errorf("top-level cache_control survived the strip; body=%s", string(out))
+	}
+	root.Get("tools").ForEach(func(i, tool gjson.Result) bool {
+		if tool.Get("cache_control").Exists() {
+			t.Errorf("tools[%s] cache_control survived the strip; body=%s", i.String(), string(out))
+		}
+		return true
+	})
+
+	var globals int
+	root.Get("system").ForEach(func(_, blk gjson.Result) bool {
+		if blk.Get("cache_control.scope").String() == "global" {
+			globals++
+		}
+		return true
+	})
+	if globals == 0 {
+		t.Fatalf("no surviving scope:global anchor after strip; system=%s", root.Get("system").Raw)
 	}
 }

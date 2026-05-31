@@ -505,6 +505,13 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
+	// xAI's /responses endpoint rejects service_tier entirely ("Argument not
+	// supported: service_tier"). The Codex translators preserve
+	// service_tier:"priority" because OpenAI's Codex /responses accepts it
+	// (Cursor's "Fast" toggle sends it), but xAI does not, so strip it here on
+	// the xAI path regardless of value. Without this every Cursor Grok request
+	// with Fast mode on 400s before reaching the model.
+	body, _ = sjson.DeleteBytes(body, "service_tier")
 	body = normalizeXAITools(body)
 	body = normalizeXAIInputReasoningItems(body)
 	body = normalizeCodexInstructions(body)

@@ -196,6 +196,53 @@ func TestXAIExecutorOmitsUnsupportedReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestXAIExecutorStripsServiceTier(t *testing.T) {
+	// Cursor's "Fast" toggle sends service_tier:"priority". The Codex translator
+	// preserves it (OpenAI Codex accepts it) but xAI's /responses rejects it with
+	// "Argument not supported: service_tier", 400ing every Cursor Grok request.
+	// The xAI prepare path must strip it. Cover both a "priority" value (the
+	// preserved one) and confirm no service_tier reaches upstream.
+	for _, tier := range []string{"priority", "default", "flex"} {
+		t.Run(tier, func(t *testing.T) {
+			var gotBody []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var errRead error
+				gotBody, errRead = io.ReadAll(r.Body)
+				if errRead != nil {
+					t.Fatalf("read body: %v", errRead)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+			}))
+			defer server.Close()
+
+			exec := NewXAIExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{
+				Provider: "xai",
+				Attributes: map[string]string{
+					"base_url":  server.URL,
+					"auth_kind": "oauth",
+				},
+				Metadata: map[string]any{"access_token": "xai-token"},
+			}
+
+			_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+				Model:   "grok-4.3",
+				Payload: []byte(`{"model":"grok-4.3","input":"hello","service_tier":"` + tier + `"}`),
+			}, cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FormatOpenAIResponse,
+				Stream:       false,
+			})
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if gjson.GetBytes(gotBody, "service_tier").Exists() {
+				t.Fatalf("xai request must not carry service_tier (tier=%q): %s", tier, string(gotBody))
+			}
+		})
+	}
+}
+
 func TestXAIExecutorAppliesThinkingSuffix(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

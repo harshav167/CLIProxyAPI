@@ -83,6 +83,11 @@ func Enqueue(payload []byte) {
 	if len(payload) == 0 {
 		return
 	}
+	// Live SUBSCRIBE fanout and poll-based LPOP are alternative transports, so
+	// we only short-circuit the backend enqueue when the payload was actually
+	// delivered to at least one live subscriber. When there are no subscribers,
+	// or every subscriber's buffer was full (and thus dropped), the record
+	// would otherwise be lost — fall through and persist it to the backend.
 	if publishToUsageSubscribers(payload) {
 		return
 	}
@@ -110,6 +115,12 @@ func SubscribeUsage() (<-chan []byte, func()) {
 	return subscriber, unsubscribe
 }
 
+// publishToUsageSubscribers attempts to fan the payload out to every live
+// subscriber. It reports whether the payload was delivered to at least one
+// subscriber. A subscriber whose buffer is full is dropped (and closed), and
+// does NOT count as a delivery — so when every subscriber is full (or there
+// are none), this returns false and the caller persists the payload to the
+// backend instead of silently losing it.
 func publishToUsageSubscribers(payload []byte) bool {
 	usageSubscribers.mu.Lock()
 	defer usageSubscribers.mu.Unlock()
@@ -118,16 +129,18 @@ func publishToUsageSubscribers(payload []byte) bool {
 		return false
 	}
 
+	delivered := false
 	for id, subscriber := range usageSubscribers.subscribers {
 		cloned := append([]byte(nil), payload...)
 		select {
 		case subscriber <- cloned:
+			delivered = true
 		default:
 			delete(usageSubscribers.subscribers, id)
 			close(subscriber)
 		}
 	}
-	return true
+	return delivered
 }
 
 func unsubscribeUsageSubscriber(id uint64) {

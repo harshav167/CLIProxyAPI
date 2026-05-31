@@ -770,7 +770,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				"response.content_part.done":
 				stopKeepalive()
 			}
-			if eventType == "response.completed" || eventType == "response.done" {
+			switch eventType {
+			case "response.completed", "response.done":
+				// Successful terminal events: stream is done, close cleanly.
+				return
+			case "response.failed", "response.incomplete", "response.error":
+				// Terminal FAILURE events. The failure payload was already
+				// forwarded to the client above; we must also stop the read
+				// loop. Without this return the goroutine keeps blocking on
+				// readCodexWebsocketMessage and the client hangs after a
+				// terminal failure until the idle timeout fires.
+				terminateReason = eventType
+				terminateErr = fmt.Errorf("codex websockets: upstream terminal event %s", eventType)
 				return
 			}
 		}
@@ -1414,16 +1425,27 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.connMu.Lock()
 	conn := sess.conn
 	readerConn := sess.readerConn
+	boundAuthID := sess.authID
+	boundWSURL := sess.wsURL
 	sess.connMu.Unlock()
 	if conn != nil {
-		if readerConn != conn {
-			sess.connMu.Lock()
-			sess.readerConn = conn
-			sess.connMu.Unlock()
-			sess.configureConn(conn)
-			go e.readUpstreamLoop(sess, conn)
+		// The scheduler/auth rotation may have selected a different auth (or
+		// upstream URL) than the one this session's live connection is bound
+		// to. Reusing the existing socket in that case would silently route the
+		// turn through the previous auth, bypassing rotation/failover. Tear the
+		// stale connection down and redial on the newly selected auth/URL.
+		if boundAuthID != authID || boundWSURL != wsURL {
+			e.invalidateUpstreamConn(sess, conn, "auth_or_url_changed", nil)
+		} else {
+			if readerConn != conn {
+				sess.connMu.Lock()
+				sess.readerConn = conn
+				sess.connMu.Unlock()
+				sess.configureConn(conn)
+				go e.readUpstreamLoop(sess, conn)
+			}
+			return conn, nil, nil
 		}
-		return conn, nil, nil
 	}
 
 	conn, resp, errDial := e.dialCodexWebsocket(ctx, auth, wsURL, headers)

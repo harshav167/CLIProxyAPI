@@ -177,6 +177,23 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 	}
 	body = helps.EnforceClaudeCacheControlLimit(body, 4)
 	body = helps.NormalizeClaudeCacheControlTTL(body)
+	// Global-scope path: the system rewrite anchors scope:"global" on a system
+	// block, which must be the FIRST cache_control breakpoint in the
+	// tools→system→messages chain. Inbound payloads can carry their own bare
+	// top-level / tool-level cache_control that survives the pipeline and
+	// renders before the system anchor, tripping Anthropic's prefix-chain 400.
+	// Strip those pre-anchor breakpoints so the global anchor leads the chain.
+	//
+	// Gated on the SAME condition that produces the global anchor
+	// (cfg.ClaudeCursorGlobalCacheScope), NOT on IsCursorClient — the anchor is
+	// emitted for any cloaked Claude request when the flag is on (see
+	// applyCloaking → checkSystemInstructionsWithSigningMode), so a non-Cursor
+	// cloaked request would otherwise keep its pre-anchor cache_control and 400.
+	// The helper itself no-ops when the outgoing payload has no global anchor,
+	// so this is safe for requests cloaking didn't touch.
+	if e.cfg != nil && e.cfg.ClaudeCursorGlobalCacheScope {
+		body = helps.StripClaudeCacheControlsBeforeGlobalAnchor(body)
+	}
 	body = stripUnsupportedAnthropicFields(body)
 
 	prepared.extraBetas, body = extractAndRemoveBetas(body)

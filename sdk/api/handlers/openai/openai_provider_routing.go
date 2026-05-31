@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 )
@@ -36,7 +37,16 @@ func hasModelProvider(modelName string, providers ...string) bool {
 	if modelName == "" || len(providers) == 0 {
 		return false
 	}
-	for _, p := range util.GetProviderName(modelName) {
+	// Strip any thinking suffix (e.g. "gpt-5-codex:thinking-high") before the
+	// registry lookup. GetProviderName matches the registered base ID exactly;
+	// a suffixed name would not match, provider detection would fail, and the
+	// caller would bypass Codex Responses routing + prompt-cache handling.
+	// Every other call site already routes through thinking.ParseSuffix.
+	baseModel := thinking.ParseSuffix(modelName).ModelName
+	if baseModel == "" {
+		baseModel = modelName
+	}
+	for _, p := range util.GetProviderName(baseModel) {
 		for _, want := range providers {
 			if p == want {
 				return true

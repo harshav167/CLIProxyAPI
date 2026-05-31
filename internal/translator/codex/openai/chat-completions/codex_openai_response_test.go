@@ -29,6 +29,61 @@ func TestConvertCodexResponseToOpenAI_StreamSetsModelFromResponseCreated(t *test
 	}
 }
 
+func TestConvertCodexResponseToOpenAI_InterleavedToolCallArgsDoneNoDuplicate(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	modelName := "gpt-5.3-codex"
+
+	// Announce tool call A, stream A's args, announce tool call B (this resets
+	// the OLD global HasReceivedArgumentsDelta flag), stream B's args, then
+	// fire A.done. With per-item tracking, A.done must emit nothing because A's
+	// args already streamed. With the old global flag, B.added reset it and
+	// A.done wrongly re-emitted A's full arguments.
+	feed := func(line string) [][]byte {
+		return ConvertCodexResponseToOpenAI(ctx, modelName, nil, nil, []byte(line), &param)
+	}
+
+	feed(`data: {"type":"response.created","response":{"id":"r1","created_at":1,"model":"gpt-5.3-codex"}}`)
+	feed(`data: {"type":"response.output_item.added","item":{"id":"item_A","type":"function_call","call_id":"call_A","name":"toolA"}}`)
+	feed(`data: {"type":"response.function_call_arguments.delta","item_id":"item_A","delta":"{\"a\":1}"}`)
+	feed(`data: {"type":"response.output_item.added","item":{"id":"item_B","type":"function_call","call_id":"call_B","name":"toolB"}}`)
+	feed(`data: {"type":"response.function_call_arguments.delta","item_id":"item_B","delta":"{\"b\":2}"}`)
+
+	// A.done — args already streamed for item_A, so nothing should be emitted.
+	outADone := feed(`data: {"type":"response.function_call_arguments.done","item_id":"item_A","arguments":"{\"a\":1}"}`)
+	if len(outADone) != 0 {
+		t.Fatalf("A.done should emit nothing (args already streamed); got %d chunks: %s", len(outADone), outADone)
+	}
+
+	// B.done — likewise nothing.
+	outBDone := feed(`data: {"type":"response.function_call_arguments.done","item_id":"item_B","arguments":"{\"b\":2}"}`)
+	if len(outBDone) != 0 {
+		t.Fatalf("B.done should emit nothing (args already streamed); got %d chunks: %s", len(outBDone), outBDone)
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_ToolCallArgsDoneFallbackWhenNoDelta(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	modelName := "gpt-5.3-codex"
+
+	feed := func(line string) [][]byte {
+		return ConvertCodexResponseToOpenAI(ctx, modelName, nil, nil, []byte(line), &param)
+	}
+
+	feed(`data: {"type":"response.created","response":{"id":"r1","created_at":1,"model":"gpt-5.3-codex"}}`)
+	feed(`data: {"type":"response.output_item.added","item":{"id":"item_A","type":"function_call","call_id":"call_A","name":"toolA"}}`)
+
+	// No delta streamed for item_A: done must emit the full arguments fallback.
+	out := feed(`data: {"type":"response.function_call_arguments.done","item_id":"item_A","arguments":"{\"a\":1}"}`)
+	if len(out) != 1 {
+		t.Fatalf("done without prior delta should emit fallback args chunk; got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").String(); got != `{"a":1}` {
+		t.Fatalf("fallback args = %q, want %q", got, `{"a":1}`)
+	}
+}
+
 func TestConvertCodexResponseToOpenAI_FirstChunkUsesRequestModelName(t *testing.T) {
 	ctx := context.Background()
 	var param any

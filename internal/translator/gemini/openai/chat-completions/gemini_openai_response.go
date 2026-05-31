@@ -202,8 +202,24 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						text, sentinelThought := normalizeGeminiSentinelThoughtText(partTextResult.String())
 						partThought := partResult.Get("thought").Bool()
 						isThoughtText := partThought || sentinelThought || p.ThoughtTextActive[candidateIndex]
-						if partThought || sentinelThought {
+						// Stickiness is ONLY for sentinel thoughts: their
+						// continuation chunks arrive as plain text without the
+						// ">thought" marker re-applied, so we must remember we're
+						// inside a sentinel thought block.
+						//
+						// Native thought parts carry thought:true on EVERY part,
+						// so they are judged per-part and must NOT set the sticky
+						// flag — otherwise the following visible-answer part (which
+						// has thought:false and no sentinel) would inherit the flag
+						// and be emitted as reasoning_content, hiding the answer.
+						if sentinelThought {
 							p.ThoughtTextActive[candidateIndex] = true
+						} else if partThought {
+							// Native thought: self-marked per part. Clear any
+							// lingering sentinel stickiness is unnecessary here
+							// (a native thought is still a thought), but do not
+							// set stickiness so the next non-thought part resets.
+							p.ThoughtTextActive[candidateIndex] = false
 						}
 						if text == "" {
 							continue
