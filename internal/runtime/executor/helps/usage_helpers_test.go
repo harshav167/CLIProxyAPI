@@ -33,9 +33,16 @@ func TestFingerprintAPIKeyRedactsRawKey(t *testing.T) {
 	if other := FingerprintAPIKey("sk-different-key"); other == fp {
 		t.Fatalf("distinct keys collided on fingerprint %q", fp)
 	}
-	// Idempotent: re-fingerprinting a fingerprint is a no-op.
-	if doubled := FingerprintAPIKey(fp); doubled != fp {
-		t.Fatalf("double fingerprint changed value: %q vs %q", doubled, fp)
+	// M3: client input that already starts with "fp_" must NOT bypass hashing —
+	// it gets hashed like any other raw material (no verbatim passthrough, no
+	// fingerprint-bucket forgery). The canonical fingerprint is fp_ + 16 hex.
+	forged := "fp_deadbeefdeadbeef"
+	if got := FingerprintAPIKey(forged); got == forged {
+		t.Fatalf("client-supplied fp_-prefixed value bypassed hashing: %q", got)
+	}
+	// Canonical shape: fp_ + 16 hex chars.
+	if len(fp) != len("fp_")+16 {
+		t.Fatalf("fingerprint %q not canonical length", fp)
 	}
 	// Empty stays empty (keyless grouping unchanged).
 	if FingerprintAPIKey("") != "" {

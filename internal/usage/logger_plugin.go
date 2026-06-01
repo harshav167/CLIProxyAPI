@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -67,6 +67,16 @@ type apiStats struct {
 	TotalTokens   int64
 	Models        map[string]*modelStats
 }
+
+// maxModelDetails caps the per-model retained RequestDetail history. The
+// aggregate counters (TotalRequests/TotalTokens and the by-day/by-hour maps)
+// are unbounded-but-cheap scalars; the Details slice is the only per-request
+// growth, and Snapshot() deep-copies it on every management read. Without a cap
+// it grows without bound on a long-running proxy (memory leak + O(history)
+// snapshot latency). Keep only the most recent N as a ring buffer — every
+// other global collection in this codebase (bridge sessions, ws warn-set,
+// session-id cache) is TTL/size-bounded; this matches that discipline.
+const maxModelDetails = 1000
 
 type modelStats struct {
 	TotalRequests int64
@@ -210,6 +220,14 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+	// Bound the retained detail history (ring buffer). Aggregate counters above
+	// already captured this request, so trimming the oldest entries loses only
+	// fine-grained recent-request rows, not totals.
+	if len(modelStatsValue.Details) > maxModelDetails {
+		trimmed := make([]RequestDetail, maxModelDetails)
+		copy(trimmed, modelStatsValue.Details[len(modelStatsValue.Details)-maxModelDetails:])
+		modelStatsValue.Details = trimmed
+	}
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
@@ -385,24 +403,16 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	)
 }
 
+// resolveAPIIdentifier derives the stats grouping key from thread-safe sources
+// only. HandleUsage runs on the usage Manager's background goroutine AFTER the
+// request handler returned and gin recycled its *gin.Context back to the pool,
+// so reading the live gin context here is a data race (and yields recycled/
+// wrong values). The endpoint is captured into the context via a dedicated
+// thread-safe holder (internallogging.WithEndpoint/GetEndpoint) during the
+// request, mirroring internal/redisqueue/plugin.go which solved the same race.
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
-	if ctx != nil {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
-			path := ginCtx.FullPath()
-			if path == "" && ginCtx.Request != nil {
-				path = ginCtx.Request.URL.Path
-			}
-			method := ""
-			if ginCtx.Request != nil {
-				method = ginCtx.Request.Method
-			}
-			if path != "" {
-				if method != "" {
-					return method + " " + path
-				}
-				return path
-			}
-		}
+	if endpoint := strings.TrimSpace(internallogging.GetEndpoint(ctx)); endpoint != "" {
+		return endpoint
 	}
 	if record.Provider != "" {
 		return record.Provider
@@ -410,15 +420,12 @@ func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 	return "unknown"
 }
 
+// resolveSuccess reads the response status from the thread-safe holder rather
+// than the recycled *gin.Context (see resolveAPIIdentifier). Returns true when
+// no status was recorded (treat unknown as success, matching prior behavior and
+// the redisqueue sibling plugin).
 func resolveSuccess(ctx context.Context) bool {
-	if ctx == nil {
-		return true
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return true
-	}
-	status := ginCtx.Writer.Status()
+	status := internallogging.GetResponseStatus(ctx)
 	if status == 0 {
 		return true
 	}

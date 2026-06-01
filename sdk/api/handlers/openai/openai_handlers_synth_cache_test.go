@@ -174,9 +174,9 @@ func TestDeriveCursorSessionIDPrefersCursorConversationId(t *testing.T) {
 	bodyA2 := []byte(`{"model":"gpt-5.4","user":"user-a","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"input":[{"role":"user","content":"turn five has different text"}]}`)
 	bodyB := []byte(`{"model":"gpt-5.4","user":"user-a","metadata":{"cursorConversationId":"6e9c5188-53c5-4207-8a7b-c00d7428979c"},"input":[{"role":"user","content":"turn one"}]}`)
 
-	sessionA1 := deriveCursorSessionID(bodyA1)
-	sessionA2 := deriveCursorSessionID(bodyA2)
-	sessionB := deriveCursorSessionID(bodyB)
+	sessionA1 := deriveCursorSessionID(bodyA1, "")
+	sessionA2 := deriveCursorSessionID(bodyA2, "")
+	sessionB := deriveCursorSessionID(bodyB, "")
 
 	if sessionA1 == "" || !strings.HasPrefix(sessionA1, "cursor-conv-") {
 		t.Fatalf("expected cursorConversationId-derived session, got %q", sessionA1)
@@ -186,6 +186,50 @@ func TestDeriveCursorSessionIDPrefersCursorConversationId(t *testing.T) {
 	}
 	if sessionA1 == sessionB {
 		t.Fatalf("different cursorConversationIds must not share execution session: %q", sessionA1)
+	}
+}
+
+func TestDeriveCursorSessionIDIsolatesByPrincipalSalt(t *testing.T) {
+	// Same client-controlled inputs, different tenant principal salt → MUST
+	// produce different execution sessions (no cross-tenant WS/connection
+	// sharing). Empty salt (auth-disabled) is the unchanged single-tenant path.
+	body := []byte(`{"model":"gpt-5.4","user":"user-a","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"input":[{"role":"user","content":"turn one"}]}`)
+
+	tenantA := deriveCursorSessionID(body, "saltA")
+	tenantB := deriveCursorSessionID(body, "saltB")
+	noSalt := deriveCursorSessionID(body, "")
+
+	if tenantA == "" || tenantB == "" {
+		t.Fatalf("expected derivable sessions, got %q / %q", tenantA, tenantB)
+	}
+	if tenantA == tenantB {
+		t.Fatalf("different principals must not share execution session: %q", tenantA)
+	}
+	if tenantA == noSalt || tenantB == noSalt {
+		t.Fatalf("salted sessions must differ from unsalted: A=%q B=%q none=%q", tenantA, tenantB, noSalt)
+	}
+	// Stable within the same principal.
+	if again := deriveCursorSessionID(body, "saltA"); again != tenantA {
+		t.Fatalf("same principal+inputs must be stable: %q vs %q", again, tenantA)
+	}
+}
+
+func TestSyntheticPromptCacheKeyIsolatesByPrincipal(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"hi"}]}`)
+
+	cA, _ := newTestGinContext(t, "Cursor/1.0")
+	cA.Set("userApiKey", "tenant-A-key")
+	cB, _ := newTestGinContext(t, "Cursor/1.0")
+	cB.Set("userApiKey", "tenant-B-key")
+
+	kA := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(cA, body), "prompt_cache_key").String()
+	kB := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(cB, body), "prompt_cache_key").String()
+
+	if kA == "" || kB == "" {
+		t.Fatalf("expected injected keys, got %q / %q", kA, kB)
+	}
+	if kA == kB {
+		t.Fatalf("different principals must get different synthetic cache keys: %q", kA)
 	}
 }
 

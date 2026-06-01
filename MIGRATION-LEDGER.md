@@ -339,3 +339,49 @@ These commands have no runtime dependency on anything else in `cpapi-plus`.
 The migration bar is shipping runtime customizations, not scratch tools. If
 they are needed later, port them verbatim with the same v6-to-v7 import rewrite
 used for migrated tests.
+
+## Removal: wrongly-ported provider stacks (2026-05-31)
+
+The `f88a5eae` migration commit ported four upstream-only provider stacks that
+were **never part of the user's customizations** and are **not present in
+upstream `router-for-me/CLIProxyAPI` main**: GitLab Duo, CodeBuddy, GitHub
+Copilot, and the Cursor *backend provider* (distinct from the Cursor IDE
+client customizations, which are legitimate and retained).
+
+The port was also incomplete: the implementation packages/executors/login
+helpers (`internal/auth/{copilot,cursor,gitlab,codebuddy}`,
+`internal/runtime/executor/{github_copilot,codebuddy,cursor,gitlab}_executor.go`,
+`internal/cmd/*_login.go`, `sdk/auth/{...}.go`) were absent from the tree, but
+the references to them survived in shared files. After the 2026-05-29 upstream
+sync merge this produced a broken build (`go build ./...` failed on
+`no required module provides package internal/auth/{copilot,cursor,gitlab}`).
+
+Removed all residue (build green, `go vet` clean, 2122 tests pass):
+
+- `internal/api/handlers/management/auth_files.go` — restored to upstream/main
+  (was upstream + 601 lines of GitLab/Copilot/Cursor handlers, 0 legitimate
+  fork changes).
+- `internal/api/server.go` — dropped 4 route registrations
+  (`gitlab-auth-url` GET/POST, `cursor-auth-url`, `github-auth-url`).
+- `cmd/server/main.go` — dropped 5 login flags + dispatch branches
+  (`gitlab-login`, `gitlab-token-login`, `cursor-login`,
+  `github-copilot-login`, `codebuddy-login`).
+- `internal/registry/model_definitions.go` — restored to upstream/main
+  (dropped `GetCodeBuddyModels` / `GetCursorModels` / `GetGitHubCopilotModels`
+  stubs + their channel/lookup wiring).
+- `sdk/cliproxy/service.go` — dropped 4 authenticators, 4 executor
+  registrations, and 4 model-fetch cases.
+- `internal/api/handlers/management/oauth_sessions.go` — dropped the
+  github-copilot/gitlab/cursor cases from `NormalizeOAuthProvider` (matches
+  upstream).
+- `internal/api/handlers/management/oauth_sessions_test.go` — deleted
+  (only exercised the removed github-copilot normalization).
+
+Retained (NOT a backend provider — these are the Cursor IDE client
+customizations and stay): `helps/cursor_system_prompt.go`,
+`RewriteCursorSystemPromptIdentityAndIntegrity`, the GPT prompt-upgrade flag,
+and all Cursor BYOK Claude/Codex request handling.
+
+Verification anchored with GitNexus impact analysis (index re-built at HEAD
+`327b5fac`): `GetCursorModels` blast radius = LOW, 2 direct callers in the same
+file, 0 affected execution flows — confirming the removal is self-contained.

@@ -48,7 +48,8 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	// into usage records (which surface in stats and the redis queue payload).
 	// A stable non-secret fingerprint preserves per-key grouping/dedup without
 	// exposing the credential.
-	apiKey := FingerprintAPIKey(APIKeyFromContext(ctx))
+	rawAPIKey := APIKeyFromContext(ctx)
+	apiKey := FingerprintAPIKey(rawAPIKey)
 	alias := usage.RequestedModelAliasFromContext(ctx)
 	if alias == "" {
 		alias = model
@@ -59,7 +60,10 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		alias:       strings.TrimSpace(alias),
 		requestedAt: time.Now(),
 		apiKey:      apiKey,
-		source:      resolveUsageSource(auth, apiKey),
+		// Pass the RAW key; resolveUsageSource fingerprints credential branches
+		// itself so it hashes raw material exactly once (avoids double-hashing
+		// an already-fp_ value once FingerprintAPIKey stops bypassing fp_).
+		source:      resolveUsageSource(auth, rawAPIKey),
 		authType:    resolveUsageAuthType(auth),
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
 		serviceTier: usage.ServiceTierFromContext(ctx),
@@ -376,10 +380,11 @@ func FingerprintAPIKey(raw string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if strings.HasPrefix(trimmed, apiKeyFingerprintPrefix) {
-		// Already fingerprinted (defensive against double application).
-		return trimmed
-	}
+	// Hash UNCONDITIONALLY — no "already fp_-prefixed" short-circuit. A client
+	// could send key material literally starting with "fp_", and bypassing the
+	// hash for such input would store it verbatim (defeating redaction) and let
+	// a caller forge/collide a fingerprint bucket. Callers pass RAW key material
+	// exactly once; a canonical fingerprint is always "fp_" + 16 hex chars.
 	sum := sha256.Sum256([]byte(trimmed))
 	return apiKeyFingerprintPrefix + hex.EncodeToString(sum[:])[:16]
 }
@@ -439,12 +444,18 @@ func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
 		}
 		if auth.Attributes != nil {
 			if key := strings.TrimSpace(auth.Attributes["api_key"]); key != "" {
-				return key
+				// Never return the raw upstream credential as the usage source —
+				// Source is persisted/exported via RequestDetail and the redis
+				// queue payload. Fingerprint it so the source stays a stable,
+				// non-secret grouping value.
+				return FingerprintAPIKey(key)
 			}
 		}
 	}
 	if trimmed := strings.TrimSpace(ctxAPIKey); trimmed != "" {
-		return trimmed
+		// ctxAPIKey is the raw inbound client key; fingerprint before it can be
+		// persisted as the usage source.
+		return FingerprintAPIKey(trimmed)
 	}
 	return ""
 }

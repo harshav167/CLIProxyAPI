@@ -724,10 +724,6 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
-		mgmt.GET("/gitlab-auth-url", s.mgmt.RequestGitLabToken)
-		mgmt.POST("/gitlab-auth-url", s.mgmt.RequestGitLabPATToken)
-		mgmt.GET("/cursor-auth-url", s.mgmt.RequestCursorToken)
-		mgmt.GET("/github-auth-url", s.mgmt.RequestGitHubToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
