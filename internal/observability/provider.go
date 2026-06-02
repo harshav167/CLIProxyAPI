@@ -83,6 +83,11 @@ func Start(ctx context.Context, cfg *config.Config) (*State, error) {
 	if settings.Metrics {
 		metricExporter, errMetric := newMetricExporter(ctx, settings)
 		if errMetric != nil {
+			// A trace provider may already be globally registered above.
+			// Returning bare here would leak it: the caller stores no state,
+			// so no later Shutdown can ever flush/stop it. Tear down whatever
+			// this partial Start registered before failing.
+			state.Shutdown(ctx)
 			return nil, fmt.Errorf("observability: metric exporter: %w", errMetric)
 		}
 		reader := sdkmetric.NewPeriodicReader(metricExporter, sdkmetric.WithInterval(15*time.Second))
@@ -109,6 +114,11 @@ func Start(ctx context.Context, cfg *config.Config) (*State, error) {
 	if settings.Logs {
 		logExporter, errLog := newLogExporter(ctx, settings)
 		if errLog != nil {
+			// Same leak guard as the metrics branch: trace and/or meter
+			// providers may already be globally registered. Tear them down so
+			// a failed Start never strands global providers the caller can't
+			// reach to Shutdown.
+			state.Shutdown(ctx)
 			return nil, fmt.Errorf("observability: log exporter: %w", errLog)
 		}
 		state.loggerProvider = sdklog.NewLoggerProvider(

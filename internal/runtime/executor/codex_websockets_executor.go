@@ -420,6 +420,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 }
 
 func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	// Guard nil auth before any deref. This used to log auth.ID immediately and
+	// panic on nil; Execute reaches auth only through nil-safe helpers
+	// (codexCreds), so streaming must match that contract.
+	if auth == nil {
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "codex websocket stream: missing auth"}
+	}
 	log.Debugf("Executing Codex Websockets stream request with auth ID: %s, model: %s", auth.ID, req.Model)
 	if ctx == nil {
 		ctx = context.Background()

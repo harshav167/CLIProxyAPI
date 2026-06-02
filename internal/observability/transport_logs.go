@@ -198,7 +198,10 @@ func AnnotateServerSpanFromSummary(ctx context.Context, summary RequestSummary) 
 		return
 	}
 	if summary.Failed {
-		message := strings.TrimSpace(summary.ErrorMessage)
+		// Redact the upstream error before it lands on the span via
+		// RecordError/SetStatus — both export to SigNoz traces and the raw
+		// upstream body can echo secrets.
+		message := RedactStringForLog(strings.TrimSpace(summary.ErrorMessage), 512)
 		if message == "" {
 			message = http.StatusText(summary.ErrorStatus)
 		}

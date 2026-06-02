@@ -1180,6 +1180,11 @@ func (e *AntigravityExecutor) convertStreamToNonStream(stream []byte) []byte {
 
 // ExecuteStream performs a streaming request to the Antigravity API.
 func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	// Guard nil auth before the cooldown branch (which logs auth.ID) and the
+	// usage reporter / downstream credential reads deref it.
+	if auth == nil {
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "antigravity stream: missing auth"}
+	}
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}

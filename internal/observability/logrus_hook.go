@@ -79,5 +79,16 @@ func logrusSeverity(level logrus.Level) otellog.Severity {
 }
 
 func safeLogValue(key string, value any) string {
-	return boundedString(safeHeaderValue(key, fmt.Sprint(value)), 512)
+	// Two layers of redaction:
+	//   1. key-name match (isSecretName via safeHeaderValue) — drops the whole
+	//      value for keys like "authorization", "api_key".
+	//   2. value-pattern match (redactString) — catches secrets that ride on
+	//      BENIGN keys like "error" or "body" (echoed upstream error bodies,
+	//      stack traces with tokens). Without (2), a sk-/Bearer/AIza value on an
+	//      "error" field shipped verbatim to SigNoz.
+	redacted := safeHeaderValue(key, fmt.Sprint(value))
+	if redacted == "<redacted>" {
+		return redacted
+	}
+	return RedactStringForLog(redacted, 512)
 }

@@ -91,7 +91,11 @@ func GinMiddleware() gin.HandlerFunc {
 				span.SetAttributes(attribute.Int("cliproxy.error_status", outcome.ErrorStatus))
 			}
 			if outcome.ErrorMessage != "" {
-				span.SetAttributes(attribute.String("cliproxy.error_message", outcome.ErrorMessage))
+				// Redact before it lands on the span. Upstream error bodies
+				// (JSON/HTML) can echo secrets — the transport-summary LOG path
+				// already redacts via RedactStringForLog, but the span wrote the
+				// raw value, leaking it into SigNoz traces.
+				span.SetAttributes(attribute.String("cliproxy.error_message", RedactStringForLog(outcome.ErrorMessage, 512)))
 			}
 			if outcome.ClientCanceled {
 				span.SetAttributes(attribute.Bool("cliproxy.client_canceled", true))
@@ -104,7 +108,9 @@ func GinMiddleware() gin.HandlerFunc {
 				span.RecordError(httpStatusError{status: status, message: c.Errors.String()})
 				span.SetStatus(codes.Error, c.Errors.String())
 			case outcome.Failed:
-				message := strings.TrimSpace(outcome.ErrorMessage)
+				// Redact before RecordError/SetStatus — upstream error bodies
+				// can echo secrets and both export to SigNoz traces.
+				message := RedactStringForLog(strings.TrimSpace(outcome.ErrorMessage), 512)
 				if message == "" {
 					message = http.StatusText(outcome.ErrorStatus)
 				}
