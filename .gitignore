@@ -29,6 +29,7 @@ auths/*
 docs/*
 !docs/signoz-observability.md
 !docs/signoz-dashboard-cliproxy.json
+!docs/security-backlog.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
