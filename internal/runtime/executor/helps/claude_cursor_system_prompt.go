@@ -12,40 +12,6 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// LooksLikeCursorSubagent returns true when the request shape suggests a
-// short-lived Cursor subagent rather than a parent agent. Used to pick a
-// 5m ephemeral cache TTL over the 1h default, since subagents almost never
-// re-read past the 5m mark and we waste the 2x write premium otherwise.
-//
-// Detection is purely STRUCTURAL — based on tool array size, not tool names.
-// Tool names would couple this code to Cursor's current product strings
-// ("Subagent", "CreatePlan", etc.) which can be renamed at any time.
-//
-// Empirical band (cliproxy logs docker/logs/cliproxy/cursor-1.0/, 2026-05-11,
-// 9 distinct cursorConversationId values):
-//
-//	parent agents:    17-18 tools (full toolset including spawn/plan capabilities)
-//	subagent agents:  14 tools    (trimmed; spawn/plan capabilities removed)
-//	non-Cursor:       0-9 or > 20 tools
-//
-// We classify [10, 16] as subagent-shape. The lower bound rejects bare CLI
-// probes and other non-Cursor clients. The upper bound is permissive on the
-// parent side — only request shapes that *clearly* match the smaller subagent
-// toolset get the 5m downgrade. False positives are cheap (5m on small parent
-// = unchanged correctness, slightly more cache writes); false negatives are
-// the status quo (1h on subagent = wasted money but still works).
-//
-// Caller is responsible for ensuring this function only runs on Cursor traffic
-// (see the RewriteCursorSystemPromptBlocks early-return guard at the call site).
-func LooksLikeCursorSubagent(payload []byte) bool {
-	tools := gjson.GetBytes(payload, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		return false
-	}
-	toolCount := int(tools.Get("#").Int())
-	return toolCount >= 10 && toolCount <= 16
-}
-
 // RewriteCursorSystemPromptBlocks rewrites Cursor's identity-line sentinels and
 // places a SINGLE cache_control breakpoint on the LAST system text block at the
 // supplied TTL. All earlier system text blocks are left cache-control-free.
@@ -145,8 +111,9 @@ func RewriteCursorSystemPromptBlocks(system gjson.Result, billingBlock string, t
 	// left bare-ephemeral cache_control on intermediate system blocks; we strip
 	// all intermediate cache_controls below to keep the chain clean.
 	//
-	// TTL is the caller-supplied value: "1h" for parent agents, "5m" for
-	// subagent-shaped requests.
+	// TTL is the caller-supplied value. Cursor Claude traffic currently uses
+	// 1h for both parent agents and subagent-shaped requests so long-running
+	// subagents do not self-evict large prompt prefixes after five minutes.
 	// Iterate over ALL system blocks (including index 0 when billingBlock was
 	// skipped). When billingBlock is present, system[0] is the billing header
 	// which never carries cache_control; when absent, system[0] is the first
@@ -181,7 +148,8 @@ func RewriteCursorSystemPromptBlocks(system gjson.Result, billingBlock string, t
 		// main-agent ↔ subagent boundaries on the same account, which two bare
 		// anchors never did.
 		//
-		// TTL is caller-supplied: "1h" for parent agents, "5m" for subagents.
+		// TTL is caller-supplied. Cursor Claude traffic currently uses 1h for
+		// both parent agents and subagents.
 		// useGlobalScopeOnLast (cfg.ClaudeCursorGlobalCacheScope) gates the
 		// scope:"global" addition so we can roll back to bare-ttl without a
 		// rebuild if a future Anthropic policy change breaks it.

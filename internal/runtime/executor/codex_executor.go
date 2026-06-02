@@ -982,11 +982,39 @@ func classifyCodexStatusError(statusCode int, body []byte) []byte {
 	if message == "" {
 		message = http.StatusText(statusCode)
 	}
+	// For the context-length code, also rewrite the message so it includes the
+	// canonical OpenAI substring "maximum context length". Cursor, the OpenAI
+	// SDKs, and every downstream client greps this substring to decide whether
+	// to auto-compact and retry. Codex sends "Your input exceeds the context
+	// window..." which Cursor does NOT match — leaving the user stuck on a
+	// hard 400 instead of triggering compaction.
+	if code == "context_length_exceeded" {
+		message = canonicalizeContextLengthMessage(message)
+	}
 	out := []byte(`{"error":{}}`)
 	out, _ = sjson.SetBytes(out, "error.message", message)
 	out, _ = sjson.SetBytes(out, "error.type", errType)
 	out, _ = sjson.SetBytes(out, "error.code", code)
 	return out
+}
+
+// canonicalizeContextLengthMessage rewrites a Codex "context_too_large"
+// message into the canonical OpenAI "maximum context length" phrasing that
+// downstream clients (Cursor, official OpenAI SDKs) pattern-match on to
+// trigger automatic prompt compaction + retry. The upstream Codex string is
+// preserved at the end so the on-call engineer still sees the verbatim
+// provider response.
+func canonicalizeContextLengthMessage(message string) string {
+	trimmed := strings.TrimSpace(message)
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "maximum context length") {
+		return trimmed
+	}
+	canonical := "This model's maximum context length has been exceeded."
+	if trimmed == "" {
+		return canonical
+	}
+	return canonical + " " + trimmed
 }
 
 func codexStatusErrorClassification(statusCode int, body []byte) (code string, errType string, ok bool) {
@@ -1000,8 +1028,13 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 	isInvalidRequest := upstreamType == "" || upstreamType == "invalid_request_error"
 
 	switch {
-	case statusCode == http.StatusRequestEntityTooLarge || upstreamCode == "context_length_exceeded" || upstreamCode == "context_too_large" || isInvalidRequest && (strings.Contains(errorMessage, "context length") || strings.Contains(errorMessage, "context_length") || strings.Contains(errorMessage, "maximum context") || strings.Contains(errorMessage, "too many tokens")):
-		return "context_too_large", "invalid_request_error", true
+	case statusCode == http.StatusRequestEntityTooLarge || upstreamCode == "context_length_exceeded" || upstreamCode == "context_too_large" || isInvalidRequest && (strings.Contains(errorMessage, "context length") || strings.Contains(errorMessage, "context_length") || strings.Contains(errorMessage, "maximum context") || strings.Contains(errorMessage, "too many tokens") || strings.Contains(errorMessage, "context window")):
+		// Emit the canonical OpenAI `context_length_exceeded` code, NOT the
+		// Codex-only `context_too_large`. Cursor and every OpenAI SDK
+		// recognize `context_length_exceeded` and trigger automatic prompt
+		// compaction + retry. `context_too_large` is a Codex-backend variant
+		// most clients ignore — surfacing it as a hard 400 instead.
+		return "context_length_exceeded", "invalid_request_error", true
 	case strings.Contains(lower, "invalid signature in thinking block") || strings.Contains(lower, "invalid_encrypted_content"):
 		return "thinking_signature_invalid", "invalid_request_error", true
 	case upstreamCode == "previous_response_not_found" || strings.Contains(lower, "previous_response_not_found") || strings.Contains(lower, "previous_response_id") && strings.Contains(lower, "not found"):

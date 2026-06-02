@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -55,30 +56,29 @@ func maybeInjectSyntheticPromptCacheKey(c *gin.Context, rawJSON []byte) []byte {
 	// Per-tenant salt so colliding client inputs never cross tenants.
 	salt := principalSalt(c)
 
-	// PREFERRED — derive pck from a client-supplied conversation identifier
-	// when present. Currently recognized:
-	//
-	//   metadata.cursorConversationId — UUID emitted by Cursor BYOK on every
-	//     chat-completions turn; Cursor is the authority on what constitutes
-	//     "one conversation" and (by extension) which subagent runs should
-	//     share their parent's cache. Stable across all turns of a chat.
-	//
-	// Using a client-supplied identifier eliminates two failure modes that
-	// content-hash anchors have:
-	//   1. False collisions — two truly independent chats opened in the same
-	//      workspace state (identical first 4KB of first user message) get
-	//      DIFFERENT cursorConversationIds → different pck → no shared cache
-	//      slot upstream → no mutual eviction.
-	//   2. False splits — if Cursor ever ships subagents that share the parent
-	//      conversation context, they'll naturally inherit cursorConversationId
-	//      → same pck → subagent reuses parent's warm cache automatically.
-	//
-	// Future: add other clients' equivalents here as they surface (e.g. a
-	// `metadata.parent_message_id` or `X-Conversation-Id` header).
-	if convID := gjson.GetBytes(rawJSON, "metadata.cursorConversationId").String(); convID != "" {
-		// Prefix per-source so different identifier semantics never collide
-		// in the upstream cache namespace. sha256-hash so the public key
-		// length stays constant and we don't leak the raw UUID upstream.
+	// Cursor gives each subagent its own cursorConversationId. Keying those
+	// explicit subagent requests on that ID cold-starts every subagent. Use a
+	// shared-prefix cache key only when the request carries an explicit subagent
+	// signal; normal multi-turn Cursor conversations stay keyed by
+	// cursorConversationId below so evolving system context does not churn the
+	// cache key across turns.
+	if strings.HasPrefix(c.Request.UserAgent(), "Cursor/") && cursorHasExplicitSubagentSignal(c, rawJSON) {
+		user := strings.TrimSpace(gjson.GetBytes(rawJSON, "user").String())
+		if group := cursorSubagentCacheGroup(c, rawJSON); user != "" && group != "" {
+			sum := sha256.Sum256([]byte("cli-proxy\x00cursor-subagent\x00" + salt + "\x00" + user + "\x00" + model + "\x00" + group))
+			key := "cli-proxy-" + hex.EncodeToString(sum[:16])
+			out, err := sjson.SetBytes(rawJSON, "prompt_cache_key", key)
+			if err != nil {
+				return rawJSON
+			}
+			return out
+		}
+	}
+
+	// Fallback: derive pck from a client-supplied conversation identifier when
+	// present. This keeps non-Cursor and prefix-less Cursor requests stable
+	// across turns without changing explicit client-provided prompt_cache_key.
+	if convID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.cursorConversationId").String()); convID != "" {
 		sum := sha256.Sum256([]byte("cli-proxy\x00cursor-conv\x00" + salt + "\x00" + model + "\x00" + convID))
 		key := "cli-proxy-" + hex.EncodeToString(sum[:16])
 		out, err := sjson.SetBytes(rawJSON, "prompt_cache_key", key)
@@ -88,7 +88,7 @@ func maybeInjectSyntheticPromptCacheKey(c *gin.Context, rawJSON []byte) []byte {
 		return out
 	}
 
-	// FALLBACK — derive pck from a stable text anchor (first user message,
+	// Fallback: derive pck from a stable text anchor (first user message,
 	// truncated head). Used by clients without a conversation-ID metadata
 	// field: generic openai-sdk consumers, Cursor in legacy modes, future
 	// BYOK paths whose harnesses don't propagate a parent identifier.
@@ -104,6 +104,134 @@ func maybeInjectSyntheticPromptCacheKey(c *gin.Context, rawJSON []byte) []byte {
 		return rawJSON
 	}
 	return out
+}
+
+func cursorSubagentCacheGroup(c *gin.Context, rawJSON []byte) string {
+	if parent := cursorParentCacheAnchor(c, rawJSON); parent != "" {
+		return "parent\x00" + parent
+	}
+	if anchor := cursorSharedPrefixAnchor(rawJSON); anchor != "" {
+		return "prefix\x00" + anchor
+	}
+	return ""
+}
+
+func cursorParentCacheAnchor(c *gin.Context, rawJSON []byte) string {
+	if c != nil && c.Request != nil {
+		for _, header := range []string{
+			"x-codex-parent-thread-id",
+			"x-cursor-parent-conversation-id",
+			"x-cursor-parent-thread-id",
+		} {
+			if value := strings.TrimSpace(c.Request.Header.Get(header)); value != "" {
+				return header + "\x00" + value
+			}
+		}
+	}
+	for _, path := range []string{
+		"metadata.parentConversationId",
+		"metadata.cursorParentConversationId",
+		"metadata.parentThreadId",
+		"metadata.cursorParentThreadId",
+	} {
+		if value := strings.TrimSpace(gjson.GetBytes(rawJSON, path).String()); value != "" {
+			return path + "\x00" + value
+		}
+	}
+	return ""
+}
+
+func cursorHasExplicitSubagentSignal(c *gin.Context, rawJSON []byte) bool {
+	if c != nil && c.Request != nil {
+		for _, header := range []string{
+			"x-openai-subagent",
+			"x-codex-parent-thread-id",
+			"x-cursor-parent-conversation-id",
+			"x-cursor-subagent",
+		} {
+			if strings.TrimSpace(c.Request.Header.Get(header)) != "" {
+				return true
+			}
+		}
+	}
+	for _, path := range []string{
+		"metadata.parentConversationId",
+		"metadata.cursorParentConversationId",
+		"metadata.parentThreadId",
+		"metadata.cursorParentThreadId",
+	} {
+		if strings.TrimSpace(gjson.GetBytes(rawJSON, path).String()) != "" {
+			return true
+		}
+	}
+	if value := gjson.GetBytes(rawJSON, "metadata.isSubagent"); value.Bool() || strings.EqualFold(strings.TrimSpace(value.String()), "true") {
+		return true
+	}
+	if value := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.subagent").String()); value != "" {
+		return true
+	}
+	return false
+}
+
+func cursorSharedPrefixAnchor(rawJSON []byte) string {
+	hasher := sha256.New()
+	wrote := false
+	writePart := func(label, raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		_, _ = hasher.Write([]byte(label))
+		_, _ = hasher.Write([]byte{0})
+		_, _ = hasher.Write([]byte(raw))
+		_, _ = hasher.Write([]byte{0})
+		wrote = true
+	}
+	appendJSON := func(label string, value gjson.Result) {
+		if !value.Exists() {
+			return
+		}
+		writePart(label, value.Raw)
+	}
+
+	appendJSON("instructions", gjson.GetBytes(rawJSON, "instructions"))
+	appendJSON("system", gjson.GetBytes(rawJSON, "system"))
+	appendJSON("tools", gjson.GetBytes(rawJSON, "tools"))
+
+	messages := gjson.GetBytes(rawJSON, "messages")
+	if messages.IsArray() {
+		messages.ForEach(func(_, msg gjson.Result) bool {
+			role := strings.TrimSpace(msg.Get("role").String())
+			if role != "system" && role != "developer" {
+				return true
+			}
+			raw := strings.TrimSpace(msg.Raw)
+			if raw != "" {
+				writePart("message:"+role, raw)
+			}
+			return true
+		})
+	}
+
+	input := gjson.GetBytes(rawJSON, "input")
+	if input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			role := strings.TrimSpace(item.Get("role").String())
+			if role != "system" && role != "developer" {
+				return true
+			}
+			raw := strings.TrimSpace(item.Raw)
+			if raw != "" {
+				writePart("input:"+role, raw)
+			}
+			return true
+		})
+	}
+
+	if !wrote {
+		return ""
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 func firstUserMessageAnchor(rawJSON []byte, maxLen int) string {
@@ -229,9 +357,19 @@ func withCursorExecutionSessionID(ctx context.Context, c *gin.Context, rawJSON [
 	if c == nil || c.Request == nil || !strings.HasPrefix(c.Request.UserAgent(), "Cursor/") {
 		return ctx
 	}
+	ctx = withCursorCacheIdentity(ctx, rawJSON)
 	sessionID := deriveCursorSessionID(rawJSON, principalSalt(c))
 	if sessionID == "" {
 		return ctx
 	}
 	return handlers.WithExecutionSessionID(ctx, sessionID)
+}
+
+func withCursorCacheIdentity(ctx context.Context, rawJSON []byte) context.Context {
+	conversationID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.cursorConversationId").String())
+	promptCacheKey := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String())
+	if conversationID == "" && promptCacheKey == "" {
+		return ctx
+	}
+	return internallogging.WithCacheIdentity(ctx, conversationID, promptCacheKey)
 }

@@ -9,6 +9,9 @@
         "--path",
         "/Users/harsha/Documents/GitHub/claude-tools/ccs/cliproxy/CLIProxyAPI"
       ]
+    },
+    "signoz": {
+      "url": "http://127.0.0.1:57000/mcp"
     }
   }
 }

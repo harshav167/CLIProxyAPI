@@ -19,6 +19,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -4196,6 +4197,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
 		return
 	}
+	observability.RecordAuthRefresh(ctx, err == nil, auth.Provider)
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {

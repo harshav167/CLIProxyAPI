@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/tidwall/gjson"
 )
 
@@ -104,19 +105,17 @@ func TestFirstUserMessageAnchorTruncates(t *testing.T) {
 	}
 }
 
-// TestMaybeInjectSyntheticPromptCacheKeyPrefersCursorConversationId locks
-// the contract: when the body carries metadata.cursorConversationId, the
-// synthetic pck MUST be derived from that UUID rather than from the
-// first-user-message text anchor. This (a) eliminates content-hash
-// collisions between independent chats opened in the same workspace state,
-// and (b) lets Cursor subagents that share their parent's
-// cursorConversationId automatically share the parent's upstream cache slot.
-func TestMaybeInjectSyntheticPromptCacheKeyPrefersCursorConversationId(t *testing.T) {
+func TestMaybeInjectSyntheticPromptCacheKeyPrefersCursorSharedPrefixAnchor(t *testing.T) {
 	c, _ := newTestGinContext(t, "Cursor/1.0")
+	c.Request.Header.Set("x-openai-subagent", "true")
+	c.Request.Header.Set("x-codex-parent-thread-id", "parent-thread")
 
-	// Same first user message, same model, different conversation IDs.
-	bodyA := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"shared opening prompt"}]}`)
-	bodyB := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"6e9c5188-53c5-4207-8a7b-c00d7428979c"},"messages":[{"role":"user","content":"shared opening prompt"}]}`)
+	// Same Cursor user, model, system prefix, and tools, but different
+	// cursorConversationIds and different first user messages. This is the
+	// measured subagent cold-start shape: Cursor gives each subagent a new
+	// conversation ID even though their large reusable prefix is the same.
+	bodyA := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"2fcda40b"},"messages":[{"role":"system","content":"workspace + tool policy"},{"role":"user","content":"subtask A"}],"tools":[{"type":"function","function":{"name":"read_file"}}]}`)
+	bodyB := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"b44d7ec2"},"messages":[{"role":"system","content":"workspace + tool policy"},{"role":"user","content":"subtask B"}],"tools":[{"type":"function","function":{"name":"read_file"}}]}`)
 
 	kA := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyA), "prompt_cache_key").String()
 	kB := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyB), "prompt_cache_key").String()
@@ -124,40 +123,72 @@ func TestMaybeInjectSyntheticPromptCacheKeyPrefersCursorConversationId(t *testin
 	if kA == "" || kB == "" {
 		t.Fatalf("expected non-empty keys, got A=%q B=%q", kA, kB)
 	}
+	if kA != kB {
+		t.Fatalf("shared Cursor parent must produce the same prompt_cache_key across subagent conversation IDs: %q vs %q", kA, kB)
+	}
+
+	differentTools := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"0212397c"},"messages":[{"role":"system","content":"workspace + tool policy"},{"role":"user","content":"subtask C"}],"tools":[{"type":"function","function":{"name":"different_tool"}}]}`)
+	kDifferentTools := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, differentTools), "prompt_cache_key").String()
+	if kDifferentTools == "" {
+		t.Fatal("expected different-tools request to still get a prompt_cache_key")
+	}
+	if kDifferentTools != kA {
+		t.Fatalf("same explicit subagent parent must share prompt_cache_key even when prefix shifts: %q vs %q", kDifferentTools, kA)
+	}
+}
+
+func TestMaybeInjectSyntheticPromptCacheKeyKeepsCursorConversationStableAcrossSystemChanges(t *testing.T) {
+	c, _ := newTestGinContext(t, "Cursor/1.0")
+	bodyA := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"system","content":"workspace context A"},{"role":"user","content":"turn one"}],"tools":[{"type":"function","function":{"name":"read_file"}}]}`)
+	bodyB := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"system","content":"workspace context B with lints"},{"role":"user","content":"turn two"}],"tools":[{"type":"function","function":{"name":"read_file"}},{"type":"function","function":{"name":"list_dir"}}]}`)
+
+	kA := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyA), "prompt_cache_key").String()
+	kB := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyB), "prompt_cache_key").String()
+	if kA == "" || kB == "" {
+		t.Fatalf("expected non-empty keys, got A=%q B=%q", kA, kB)
+	}
+	if kA != kB {
+		t.Fatalf("same Cursor conversation must keep prompt_cache_key stable across system/tool changes: %q vs %q", kA, kB)
+	}
+}
+
+func TestMaybeInjectSyntheticPromptCacheKeyUsesSharedPrefixForExplicitSubagentWithoutParent(t *testing.T) {
+	c, _ := newTestGinContext(t, "Cursor/1.0")
+	c.Request.Header.Set("x-openai-subagent", "true")
+	bodyA := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"2fcda40b"},"messages":[{"role":"system","content":"workspace + tool policy"},{"role":"user","content":"subtask A"}],"tools":[{"type":"function","function":{"name":"read_file"}}]}`)
+	bodyB := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"b44d7ec2"},"messages":[{"role":"system","content":"workspace + tool policy"},{"role":"user","content":"subtask B"}],"tools":[{"type":"function","function":{"name":"read_file"}}]}`)
+
+	kA := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyA), "prompt_cache_key").String()
+	kB := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyB), "prompt_cache_key").String()
+	if kA == "" || kB == "" {
+		t.Fatalf("expected non-empty keys, got A=%q B=%q", kA, kB)
+	}
+	if kA != kB {
+		t.Fatalf("same explicit subagent shared prefix must produce stable prompt_cache_key: %q vs %q", kA, kB)
+	}
+
+	differentTools := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"0212397c"},"messages":[{"role":"system","content":"workspace + tool policy"},{"role":"user","content":"subtask C"}],"tools":[{"type":"function","function":{"name":"different_tool"}}]}`)
+	kDifferentTools := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, differentTools), "prompt_cache_key").String()
+	if kDifferentTools == "" {
+		t.Fatal("expected different-tools request to still get a prompt_cache_key")
+	}
+	if kDifferentTools == kA {
+		t.Fatalf("different reusable prefix without parent anchor must not share prompt_cache_key: %q", kDifferentTools)
+	}
+}
+
+func TestMaybeInjectSyntheticPromptCacheKeyFallsBackToCursorConversationIdWithoutSharedPrefix(t *testing.T) {
+	c, _ := newTestGinContext(t, "Cursor/1.0")
+	bodyA := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"shared opening prompt"}]}`)
+	bodyB := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"6e9c5188-53c5-4207-8a7b-c00d7428979c"},"messages":[{"role":"user","content":"shared opening prompt"}]}`)
+
+	kA := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyA), "prompt_cache_key").String()
+	kB := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyB), "prompt_cache_key").String()
+	if kA == "" || kB == "" {
+		t.Fatalf("expected non-empty keys, got A=%q B=%q", kA, kB)
+	}
 	if kA == kB {
-		t.Errorf("two distinct cursorConversationIds with identical first message must produce DIFFERENT keys; both got %q", kA)
-	}
-
-	// Same conversation ID across two requests (turn 1 vs turn N) MUST
-	// produce the same pck so cache stays warm across turns.
-	bodyA2 := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"completely different content for turn 5"}]}`)
-	kA2 := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, bodyA2), "prompt_cache_key").String()
-	if kA != kA2 {
-		t.Errorf("same cursorConversationId across turns must produce same key; got %q vs %q", kA, kA2)
-	}
-
-	// A subagent inheriting parent's cursorConversationId MUST share parent's
-	// pck even if its first user message is different (proving the new
-	// derivation ignores message content when convID is present).
-	parentBody := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"abcdef00-1111-2222-3333-444455556666"},"messages":[{"role":"user","content":"parent task description"}]}`)
-	subagentBody := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"abcdef00-1111-2222-3333-444455556666"},"messages":[{"role":"user","content":"subtask: research X"}]}`)
-	kParent := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, parentBody), "prompt_cache_key").String()
-	kSub := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, subagentBody), "prompt_cache_key").String()
-	if kParent != kSub {
-		t.Errorf("subagent sharing parent's cursorConversationId must share parent's pck; parent=%q sub=%q", kParent, kSub)
-	}
-
-	// Falls back to message-anchor derivation when cursorConversationId is
-	// absent — keeps existing clients unbroken.
-	plainBody := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"shared opening prompt"}]}`)
-	kPlain := gjson.GetBytes(maybeInjectSyntheticPromptCacheKey(c, plainBody), "prompt_cache_key").String()
-	if kPlain == "" || !strings.HasPrefix(kPlain, "cli-proxy-") {
-		t.Errorf("body without cursorConversationId must still get a valid synthetic pck; got %q", kPlain)
-	}
-	// Anchor-derived key on the same content must NOT collide with either
-	// conv-id-derived key (different prefix in the hash domain separator).
-	if kPlain == kA || kPlain == kB {
-		t.Errorf("anchor-derived key must not collide with conv-id-derived keys; plain=%q A=%q B=%q", kPlain, kA, kB)
+		t.Fatalf("without a reusable prefix, different cursorConversationIds must not share prompt_cache_key: %q", kA)
 	}
 }
 
@@ -250,6 +281,21 @@ func TestWithCursorExecutionSessionID_WrapsWhenSessionDerivable(t *testing.T) {
 
 	if got := withCursorExecutionSessionID(bg, cursorCtx, cursorBody); got == bg {
 		t.Fatalf("expected second wrap to also differ from input")
+	}
+}
+
+func TestWithCursorExecutionSessionIDRecordsCacheIdentity(t *testing.T) {
+	bg := context.Background()
+	cursorCtx, _ := newTestGinContext(t, "Cursor/1.0")
+	body := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"conv-1"},"prompt_cache_key":"cli-proxy-cache","messages":[{"role":"user","content":"hello"}]}`)
+
+	wrapped := withCursorExecutionSessionID(bg, cursorCtx, body)
+	identity := internallogging.GetCacheIdentity(wrapped)
+	if identity.ConversationID != "conv-1" {
+		t.Fatalf("ConversationID = %q, want conv-1", identity.ConversationID)
+	}
+	if identity.PromptCacheKey != "cli-proxy-cache" {
+		t.Fatalf("PromptCacheKey = %q, want cli-proxy-cache", identity.PromptCacheKey)
 	}
 }
 

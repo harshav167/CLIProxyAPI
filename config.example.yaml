@@ -86,6 +86,29 @@ redis-queue:
   db: 0
   key-prefix: "cliproxy:usage"
 
+# Optional OpenTelemetry export for SigNoz and compatible collectors.
+# Disabled by default. When enabled locally, the SigNoz stack listens on the
+# 57000 range via ~/Developer/signoz/signoz/deploy/docker/docker-compose.local-57000.yaml.
+observability:
+  enabled: false
+  service-name: cliproxy
+  environment: local
+  # Emits one redacted per-request summary log to SigNoz with model, status,
+  # latency, token counters, cache hit ratio, and cache_control layout only.
+  transport-logs: false
+  # Opt-in only: attaches redacted, size-bounded request/response bodies.
+  # Keep disabled for tunnel-exposed or shared SigNoz instances.
+  transport-logs-full-body: false
+  otlp:
+    endpoint: http://localhost:57018
+    protocol: http/protobuf
+    headers: {}
+    insecure: true
+    traces: true
+    metrics: true
+    logs: true
+    sample-ratio: 1.0
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""

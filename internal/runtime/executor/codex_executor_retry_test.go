@@ -84,12 +84,16 @@ func TestNewCodexStatusErrClassifiesKnownCodexFailures(t *testing.T) {
 		wantCode   string
 	}{
 		{
+			// Cursor + every OpenAI SDK pattern-match the canonical
+			// `context_length_exceeded` to trigger auto-compaction + retry.
+			// Codex's `context_too_large` is a backend variant most clients
+			// ignore; the proxy must normalize to the canonical code.
 			name:       "context length status",
 			statusCode: http.StatusRequestEntityTooLarge,
 			body:       []byte(`{"error":{"message":"context length exceeded","type":"invalid_request_error","code":"context_length_exceeded"}}`),
 			wantStatus: http.StatusRequestEntityTooLarge,
 			wantType:   "invalid_request_error",
-			wantCode:   "context_too_large",
+			wantCode:   "context_length_exceeded",
 		},
 		{
 			name:       "thinking signature",

@@ -78,7 +78,7 @@ func TestCodexExecutorExecuteSurfacesTerminalStreamError(t *testing.T) {
 	if got := statusCodeFromTestError(t, err); got != http.StatusBadRequest {
 		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
 	}
-	assertCodexErrorCode(t, err.Error(), "invalid_request_error", "context_too_large")
+	assertCodexErrorCode(t, err.Error(), "invalid_request_error", "context_length_exceeded")
 	if !strings.Contains(err.Error(), "Your input exceeds the context window") {
 		t.Fatalf("error message missing upstream context text: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestCodexExecutorExecuteStreamSurfacesTerminalStreamError(t *testing.T) {
 	if got := statusCodeFromTestError(t, streamErr); got != http.StatusBadRequest {
 		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, streamErr)
 	}
-	assertCodexErrorCode(t, streamErr.Error(), "invalid_request_error", "context_too_large")
+	assertCodexErrorCode(t, streamErr.Error(), "invalid_request_error", "context_length_exceeded")
 }
 
 func TestCodexTerminalStreamContextLengthErrFromResponseFailed(t *testing.T) {
@@ -135,7 +135,7 @@ func TestCodexTerminalStreamContextLengthErrFromResponseFailed(t *testing.T) {
 	if got := statusCodeFromTestError(t, err); got != http.StatusBadRequest {
 		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
 	}
-	assertCodexErrorCode(t, err.Error(), "invalid_request_error", "context_too_large")
+	assertCodexErrorCode(t, err.Error(), "invalid_request_error", "context_length_exceeded")
 }
 
 func TestCodexTerminalStreamContextLengthErrFromTopLevelError(t *testing.T) {
@@ -146,7 +146,7 @@ func TestCodexTerminalStreamContextLengthErrFromTopLevelError(t *testing.T) {
 	if got := statusCodeFromTestError(t, err); got != http.StatusBadRequest {
 		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, err)
 	}
-	assertCodexErrorCode(t, err.Error(), "invalid_request_error", "context_too_large")
+	assertCodexErrorCode(t, err.Error(), "invalid_request_error", "context_length_exceeded")
 	if !strings.Contains(err.Error(), "Your input exceeds the context window") {
 		t.Fatalf("error message missing upstream context text: %v", err)
 	}

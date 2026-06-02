@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -126,5 +127,34 @@ func TestApplyHomeOverlayForcesUsageStatisticsEnabled(t *testing.T) {
 	}
 	if !service.cfg.Home.Enabled {
 		t.Fatal("expected home overlay to preserve local home settings")
+	}
+}
+
+func TestApplyObservabilityConfigStopsProvidersWhenDisabled(t *testing.T) {
+	service := &Service{}
+
+	service.applyObservabilityConfig(&config.Config{
+		Observability: config.ObservabilityConfig{
+			Enabled: true,
+			OTLP: config.OTLPConfig{
+				Traces:  false,
+				Metrics: false,
+				Logs:    false,
+			},
+		},
+	})
+	if service.otelState == nil {
+		t.Fatal("expected observability state after enabling observability")
+	}
+	if !observability.Enabled() {
+		t.Fatal("expected observability package to be active after enabling observability")
+	}
+
+	service.applyObservabilityConfig(&config.Config{})
+	if service.otelState != nil {
+		t.Fatal("expected observability state to be cleared after disabling observability")
+	}
+	if observability.Enabled() {
+		t.Fatal("expected observability package to be inactive after disabling observability")
 	}
 }

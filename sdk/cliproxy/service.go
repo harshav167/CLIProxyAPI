@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
@@ -100,6 +101,7 @@ type Service struct {
 	homeClient       *home.Client
 	homeCancel       context.CancelFunc
 	homeLogForwarder *logging.HomeAppLogForwarder
+	otelState        *observability.State
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -246,6 +248,7 @@ func (s *Service) wsOnConnected(channelID string) {
 			}
 		}
 	}
+	observability.RecordWebsocketConnect(context.Background(), "aistudio")
 	now := time.Now().UTC()
 	auth := &coreauth.Auth{
 		ID:         channelID,  // keep channel identifier as ID
@@ -279,6 +282,7 @@ func (s *Service) wsOnDisconnected(channelID string, reason error) {
 		log.Infof("websocket provider disconnected: %s", channelID)
 	}
 	ctx := context.Background()
+	observability.RecordWebsocketDisconnect(ctx, "aistudio", reason)
 	s.emitAuthUpdate(ctx, watcher.AuthUpdate{
 		Action: watcher.AuthUpdateActionDelete,
 		ID:     channelID,
@@ -482,6 +486,11 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	if s == nil {
 		return
 	}
+	reloadStart := time.Now()
+	reloadSuccess := false
+	defer func() {
+		observability.RecordConfigReload(context.Background(), reloadSuccess, time.Since(reloadStart))
+	}()
 
 	s.configUpdateMu.Lock()
 	defer s.configUpdateMu.Unlock()
@@ -552,6 +561,7 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 
 	s.applyRetryConfig(newCfg)
 	s.applyPprofConfig(newCfg)
+	s.applyObservabilityConfig(newCfg)
 	if s.server != nil {
 		s.server.UpdateClients(newCfg)
 	}
@@ -566,6 +576,31 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		s.registerHomeExecutors()
 	}
 	s.rebindExecutors()
+	reloadSuccess = true
+}
+
+func (s *Service) applyObservabilityConfig(cfg *config.Config) {
+	if s == nil {
+		return
+	}
+	if s.otelState != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := s.otelState.Shutdown(shutdownCtx); err != nil {
+			log.Warnf("failed to shutdown observability providers during config reload: %v", err)
+		}
+		cancel()
+		s.otelState = nil
+	}
+	otelState, errObservability := observability.Start(context.Background(), cfg)
+	if errObservability != nil {
+		log.Warnf("observability disabled after config reload failure: %v", errObservability)
+		return
+	}
+	s.otelState = otelState
+	if otelState != nil {
+		settings := observability.Normalize(cfg)
+		log.Infof("observability reloaded: service=%s endpoint=%s", settings.ServiceName, settings.Endpoint)
+	}
 }
 
 func forceHomeRuntimeConfig(cfg *config.Config) {
@@ -768,6 +803,15 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	usage.StartDefault(ctx)
+	observability.RegisterUsagePlugin()
+	if otelState, errObservability := observability.Start(ctx, s.cfg); errObservability != nil {
+		log.Warnf("observability disabled after initialization failure: %v", errObservability)
+	} else {
+		s.otelState = otelState
+		if otelState != nil {
+			log.Infof("observability enabled: service=%s endpoint=%s", s.cfg.Observability.ServiceName, s.cfg.Observability.OTLP.Endpoint)
+		}
+	}
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)
@@ -1031,6 +1075,18 @@ func (s *Service) Shutdown(ctx context.Context) error {
 					shutdownErr = err
 				}
 			}
+		}
+
+		if s.otelState != nil {
+			shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if err := s.otelState.Shutdown(shutdownCtx); err != nil {
+				log.Errorf("failed to shutdown observability providers: %v", err)
+				if shutdownErr == nil {
+					shutdownErr = err
+				}
+			}
+			s.otelState = nil
 		}
 
 		usage.StopDefault()

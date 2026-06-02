@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -42,12 +43,14 @@ type UsageReporter struct {
 	once        sync.Once
 }
 
+func (r *UsageReporter) stampOutcomeIdentity(ctx context.Context) {
+	if r == nil {
+		return
+	}
+	internallogging.SetRequestIdentity(ctx, r.provider, r.model, r.alias, r.apiKey)
+}
+
 func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
-	// Fingerprint the inbound client API key immediately. The raw key is the
-	// secret clients use to authenticate TO the proxy; it must never be stamped
-	// into usage records (which surface in stats and the redis queue payload).
-	// A stable non-secret fingerprint preserves per-key grouping/dedup without
-	// exposing the credential.
 	rawAPIKey := APIKeyFromContext(ctx)
 	apiKey := FingerprintAPIKey(rawAPIKey)
 	alias := usage.RequestedModelAliasFromContext(ctx)
@@ -60,9 +63,6 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		alias:       strings.TrimSpace(alias),
 		requestedAt: time.Now(),
 		apiKey:      apiKey,
-		// Pass the RAW key; resolveUsageSource fingerprints credential branches
-		// itself so it hashes raw material exactly once (avoids double-hashing
-		// an already-fp_ value once FingerprintAPIKey stops bypassing fp_).
 		source:      resolveUsageSource(auth, rawAPIKey),
 		authType:    resolveUsageAuthType(auth),
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
@@ -72,6 +72,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
 	}
+	reporter.stampOutcomeIdentity(ctx)
 	return reporter
 }
 
@@ -169,7 +170,38 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) {
+	if isContextCancellationError(ctx, errs...) {
+		r.publishClientCanceled(ctx)
+		return
+	}
 	r.publishWithOutcome(ctx, usage.Detail{}, true, failFromErrors(errs...))
+}
+
+func (r *UsageReporter) publishClientCanceled(ctx context.Context) {
+	if r == nil {
+		return
+	}
+	internallogging.SetRequestClientCanceled(ctx)
+	r.once.Do(func() {
+		record := r.buildRecord(usage.Detail{}, false, usage.Failure{})
+		r.publishRecord(ctx, record)
+	})
+}
+
+func isContextCancellationError(ctx context.Context, errs ...error) bool {
+	ctxCanceled := ctx != nil && (errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded))
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return true
+		}
+		if ctxCanceled && strings.Contains(strings.ToLower(err.Error()), "context canceled") {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
@@ -184,6 +216,9 @@ func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
 func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed bool, fail usage.Failure) {
 	if r == nil {
 		return
+	}
+	if failed {
+		internallogging.SetRequestOutcome(ctx, true, fail.StatusCode, fail.Body)
 	}
 	detail = normalizeUsageDetailTotal(detail)
 	r.once.Do(func() {
@@ -211,10 +246,6 @@ func hasNonZeroTokenUsage(detail usage.Detail) bool {
 		detail.TotalTokens != 0
 }
 
-// ensurePublished guarantees that a usage record is emitted exactly once.
-// It is safe to call multiple times; only the first call wins due to once.Do.
-// This is used to ensure request counting even when upstream responses do not
-// include any usage fields (tokens), especially for streaming paths.
 func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 	if r == nil {
 		return
@@ -226,6 +257,7 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
+	observability.RecordRequestSummary(ctx, observability.SummaryFromUsage(ctx, record, internallogging.GetRequestSummary(ctx)))
 	usage.PublishRecord(ctx, record)
 }
 
@@ -261,6 +293,22 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Failed:          failed,
 		Fail:            fail,
 		Detail:          detail,
+	}
+}
+
+func (r *UsageReporter) observabilityAttributes() observability.UpstreamAttributes {
+	if r == nil {
+		return observability.UpstreamAttributes{}
+	}
+	return observability.UpstreamAttributes{
+		Provider:        r.provider,
+		Model:           r.model,
+		RequestedModel:  r.alias,
+		AuthType:        r.authType,
+		AuthIndex:       r.authIndex,
+		AuthFingerprint: r.apiKey,
+		ReasoningEffort: r.reasoning,
+		ServiceTier:     r.serviceTier,
 	}
 }
 
@@ -339,7 +387,18 @@ type usageTTFTRoundTripper struct {
 
 func (t usageTTFTRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.reporter.StartResponseTTFT()
-	resp, errRoundTrip := t.base.RoundTrip(req)
+	base := t.base
+	if t.reporter != nil {
+		// WrapTransport now nests its own annotateTransport INSIDE otelhttp,
+		// so upstream identity/outcome/span annotation happens within the
+		// otelhttp client-span context. We must NOT call
+		// AnnotateUpstreamResponse again out here: this outer req carries the
+		// server span, not the client span, so a second call would stamp
+		// upstream attributes onto the wrong span (the exact bug we just
+		// fixed). WrapTransport owns annotation end-to-end.
+		base = observability.WrapTransport(base, t.reporter.observabilityAttributes())
+	}
+	resp, errRoundTrip := base.RoundTrip(req)
 	if errRoundTrip != nil {
 		return resp, errRoundTrip
 	}
@@ -364,27 +423,15 @@ func (r *usageTTFTReadCloser) Read(p []byte) (int, error) {
 	return n, errRead
 }
 
-// apiKeyFingerprintPrefix labels fingerprints so a redacted value is visibly
-// distinguishable from a raw key in logs/stats and never mistaken for one.
 const apiKeyFingerprintPrefix = "fp_"
 
-// FingerprintAPIKey converts a raw inbound client API key into a stable,
-// non-secret identifier suitable for usage records, stats grouping, and the
-// redis queue payload. It returns "" for an empty key (unchanged grouping for
-// keyless requests) and otherwise "fp_" + the first 16 hex chars of the
-// SHA-256 digest. The digest is one-way, so the original key cannot be
-// recovered, while identical keys still map to identical fingerprints (so
-// per-key aggregation and dedup keep working).
+// FingerprintAPIKey converts a client API key into a stable, non-secret
+// grouping value for usage records.
 func FingerprintAPIKey(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return ""
 	}
-	// Hash UNCONDITIONALLY — no "already fp_-prefixed" short-circuit. A client
-	// could send key material literally starting with "fp_", and bypassing the
-	// hash for such input would store it verbatim (defeating redaction) and let
-	// a caller forge/collide a fingerprint bucket. Callers pass RAW key material
-	// exactly once; a canonical fingerprint is always "fp_" + 16 hex chars.
 	sum := sha256.Sum256([]byte(trimmed))
 	return apiKeyFingerprintPrefix + hex.EncodeToString(sum[:])[:16]
 }
@@ -444,17 +491,11 @@ func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
 		}
 		if auth.Attributes != nil {
 			if key := strings.TrimSpace(auth.Attributes["api_key"]); key != "" {
-				// Never return the raw upstream credential as the usage source —
-				// Source is persisted/exported via RequestDetail and the redis
-				// queue payload. Fingerprint it so the source stays a stable,
-				// non-secret grouping value.
 				return FingerprintAPIKey(key)
 			}
 		}
 	}
 	if trimmed := strings.TrimSpace(ctxAPIKey); trimmed != "" {
-		// ctxAPIKey is the raw inbound client key; fingerprint before it can be
-		// persisted as the usage source.
 		return FingerprintAPIKey(trimmed)
 	}
 	return ""
@@ -530,7 +571,14 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		cached = usageNode.Get("input_tokens_details.cached_tokens")
 	}
 	if cached.Exists() {
-		detail.CachedTokens = cached.Int()
+		cacheReadTokens := cached.Int()
+		detail.CachedTokens = cacheReadTokens
+		detail.CacheReadTokens = cacheReadTokens
+		// OpenAI/Codex prompt/input token counts include cached tokens. Normalize
+		// InputTokens to non-cached prompt tokens so cache ratios match Claude semantics.
+		if detail.InputTokens >= cacheReadTokens {
+			detail.InputTokens -= cacheReadTokens
+		}
 	}
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {

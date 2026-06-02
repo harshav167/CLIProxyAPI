@@ -1491,9 +1491,6 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	billingBlock := helps.BuildClaudeTextBlock(billingText, nil)
 	if !strictMode {
 		cacheTTL := "1h"
-		if helps.LooksLikeCursorSubagent(payload) {
-			cacheTTL = "5m"
-		}
 		if cursorSystemResult, ok := helps.RewriteCursorSystemPromptBlocks(system, billingBlock, cacheTTL, useGlobalScopeOnLast); ok {
 			payload, _ = sjson.SetRawBytes(payload, "system", []byte(cursorSystemResult))
 			return payload

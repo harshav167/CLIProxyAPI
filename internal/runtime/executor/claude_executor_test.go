@@ -1351,6 +1351,55 @@ func TestNormalizeCacheControlTTL_PreservesKeyOrderWhenModified(t *testing.T) {
 	}
 }
 
+func TestCheckSystemInstructionsCursorSubagentShapeKeepsOneHourTTL(t *testing.T) {
+	tools := make([]string, 14)
+	for i := range tools {
+		tools[i] = fmt.Sprintf(`{"name":"tool_%02d"}`, i)
+	}
+	systemText := strings.Join([]string{
+		"You are an AI coding assistant, powered by Opus 4.8.",
+		"",
+		"You operate in Cursor.",
+		"",
+		"You are a coding agent in the Cursor IDE that helps the USER with software engineering tasks.",
+		"",
+		"Project metadata lives under .cursor/projects/example.",
+	}, "\n")
+	// Subagent-shaped Cursor request (trimmed 14-tool set). This used to be
+	// gated through a tool-count classifier, but Cursor Claude traffic now
+	// uses 1h TTL for both parent and subagent shapes. This test guards that
+	// the rewrite keeps the 1h TTL and never reintroduces the retired 5m TTL.
+	payload := []byte(fmt.Sprintf(
+		`{"model":"claude-opus-4-8","tools":[%s],"system":[{"type":"text","text":%q}],"messages":[{"role":"user","content":[{"type":"text","text":"go"}]}]}`,
+		strings.Join(tools, ","),
+		systemText,
+	))
+
+	out := checkSystemInstructionsWithSigningMode(payload, false, false, true, "2.1.156", "", "", true)
+	system := gjson.GetBytes(out, "system")
+	if !system.IsArray() {
+		t.Fatalf("rewritten system missing array: %s", out)
+	}
+	foundTTL := false
+	system.ForEach(func(_, block gjson.Result) bool {
+		cc := block.Get("cache_control")
+		if !cc.Exists() {
+			return true
+		}
+		foundTTL = true
+		if got := cc.Get("ttl").String(); got != "1h" {
+			t.Fatalf("subagent-shaped Cursor system cache ttl = %q, want 1h; block=%s", got, block.Raw)
+		}
+		return true
+	})
+	if !foundTTL {
+		t.Fatalf("expected rewritten system cache_control; out=%s", out)
+	}
+	if strings.Contains(string(out), `"ttl":"5m"`) {
+		t.Fatalf("subagent-shaped Cursor request must not use 5m TTL: %s", out)
+	}
+}
+
 func TestEnforceCacheControlLimit_StripsNonLastToolBeforeMessages(t *testing.T) {
 	payload := []byte(`{
 		"tools": [

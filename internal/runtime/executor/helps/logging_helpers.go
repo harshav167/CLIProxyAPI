@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -55,6 +56,7 @@ type upstreamAttempt struct {
 
 // RecordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	recordTransportRequestSummary(ctx, cfg, info)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -103,6 +105,9 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 // RecordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func RecordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
 	logging.SetResponseHeaders(ctx, headers)
+	logging.UpdateRequestSummary(ctx, func(summary *logging.RequestSummary) {
+		summary.Status = status
+	})
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -154,6 +159,7 @@ func RecordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 
 // AppendAPIResponseChunk appends an upstream response chunk to Gin context for request logging.
 func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byte) {
+	recordTransportResponseSummary(ctx, cfg, chunk)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -196,6 +202,7 @@ func AppendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 
 // RecordAPIWebsocketRequest stores an upstream websocket request event in Gin context.
 func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	recordTransportRequestSummary(ctx, cfg, info)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -229,6 +236,9 @@ func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info Ups
 // RecordAPIWebsocketHandshake stores the upstream websocket handshake response metadata.
 func RecordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
 	logging.SetResponseHeaders(ctx, headers)
+	logging.UpdateRequestSummary(ctx, func(summary *logging.RequestSummary) {
+		summary.Status = status
+	})
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -287,6 +297,7 @@ func WebsocketUpgradeRequestURL(rawURL string) string {
 
 // AppendAPIWebsocketResponse stores an upstream websocket response frame in Gin context.
 func AppendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload []byte) {
+	recordTransportResponseSummary(ctx, cfg, payload)
 	if cfg == nil || !cfg.RequestLog {
 		return
 	}
@@ -334,6 +345,137 @@ func RecordAPIWebsocketError(ctx context.Context, cfg *config.Config, stage stri
 func ginContextFrom(ctx context.Context) *gin.Context {
 	ginCtx, _ := ctx.Value("gin").(*gin.Context)
 	return ginCtx
+}
+
+func recordTransportRequestSummary(ctx context.Context, cfg *config.Config, info UpstreamRequestLog) {
+	// Cheap live-state gate (no env reads / no map allocs) — see
+	// recordTransportResponseSummary for the rationale.
+	if cfg == nil || !observability.TransportLogsActive() {
+		return
+	}
+	summary := logging.GetRequestSummary(ctx)
+	summary.Model = firstNonEmpty(gjson.GetBytes(info.Body, "model").String(), summary.Model)
+	summary.RequestedModel = firstNonEmpty(gjson.GetBytes(info.Body, "model").String(), summary.RequestedModel)
+	summary.EndpointFamily = endpointFamilyFromURL(info.URL)
+	summary.Provider = firstNonEmpty(info.Provider, summary.Provider)
+	summary.RequestBytes += int64(len(info.Body))
+	summary.CacheControlSummary = cacheControlSummary(info.Body)
+	if observability.TransportLogsFullBodyActive() {
+		summary.RequestBody = observability.RedactBodyForLog(info.Body, 8192)
+	}
+	logging.SetRequestSummary(ctx, summary)
+}
+
+func recordTransportResponseSummary(ctx context.Context, cfg *config.Config, chunk []byte) {
+	// Cheap gate FIRST. This runs per SSE line across every executor; calling
+	// observability.Normalize(cfg) here did ~6 os.Getenv lookups + 2-3 map
+	// allocations PER CHUNK, including for every user who never enables
+	// observability. TransportLogsActive() reads the already-normalized live
+	// settings (no env, no alloc) so the disabled path costs one atomic load.
+	if cfg == nil || !observability.TransportLogsActive() {
+		return
+	}
+	fullBody := observability.TransportLogsFullBodyActive()
+	logging.UpdateRequestSummary(ctx, func(summary *logging.RequestSummary) {
+		summary.ResponseBytes += int64(len(chunk))
+		if fullBody {
+			if summary.ResponseBody == "" {
+				summary.ResponseBody = observability.RedactBodyForLog(chunk, 8192)
+			} else if len(summary.ResponseBody) < 8192 {
+				summary.ResponseBody = observability.RedactBodyForLog([]byte(summary.ResponseBody+"\n"+string(chunk)), 8192)
+			}
+		}
+	})
+}
+
+func endpointFamilyFromURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Path == "" {
+		return "unknown"
+	}
+	path := parsed.Path
+	switch {
+	case strings.Contains(path, "/messages"):
+		return "claude"
+	case strings.Contains(path, "/responses"):
+		return "responses"
+	case strings.Contains(path, "/chat/completions"):
+		return "openai"
+	case strings.Contains(path, "generateContent"):
+		return "gemini"
+	default:
+		return "other"
+	}
+}
+
+func cacheControlSummary(body []byte) string {
+	var parts []string
+	visit := func(prefix string, value gjson.Result) {
+		if value.IsArray() {
+			index := 0
+			value.ForEach(func(_, item gjson.Result) bool {
+				cc := item.Get("cache_control")
+				if cc.Exists() {
+					parts = append(parts, formatCacheControl(prefix, index, cc))
+				}
+				index++
+				return true
+			})
+			return
+		}
+		cc := value.Get("cache_control")
+		if cc.Exists() {
+			parts = append(parts, formatCacheControl(prefix, 0, cc))
+		}
+	}
+	visit("tools", gjson.GetBytes(body, "tools"))
+	visit("system", gjson.GetBytes(body, "system"))
+	messages := gjson.GetBytes(body, "messages")
+	if messages.IsArray() {
+		msgIndex := 0
+		messages.ForEach(func(_, msg gjson.Result) bool {
+			content := msg.Get("content")
+			if content.IsArray() {
+				index := 0
+				content.ForEach(func(_, item gjson.Result) bool {
+					cc := item.Get("cache_control")
+					if cc.Exists() {
+						parts = append(parts, formatCacheControl(fmt.Sprintf("messages.%d.content", msgIndex), index, cc))
+					}
+					index++
+					return true
+				})
+			}
+			msgIndex++
+			return true
+		})
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ";")
+}
+
+func formatCacheControl(prefix string, index int, cc gjson.Result) string {
+	ttl := strings.TrimSpace(cc.Get("ttl").String())
+	if ttl == "" {
+		ttl = "default"
+	}
+	scope := strings.TrimSpace(cc.Get("scope").String())
+	if scope == "" {
+		scope = "none"
+	}
+	return fmt.Sprintf("%s.%d{ttl=%s,scope=%s}", prefix, index, ttl, scope)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func getAttempts(ginCtx *gin.Context) []*upstreamAttempt {

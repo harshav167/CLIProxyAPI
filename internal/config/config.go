@@ -78,6 +78,9 @@ type Config struct {
 	// instance. When Enabled is false (the default) the in-memory backend is used.
 	RedisQueue RedisQueueConfig `yaml:"redis-queue" json:"redis-queue"`
 
+	// Observability controls optional OpenTelemetry export for traces, logs, and metrics.
+	Observability ObservabilityConfig `yaml:"observability" json:"observability"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -189,6 +192,26 @@ type RedisQueueConfig struct {
 	Password  string `yaml:"password" json:"password"`
 	DB        int    `yaml:"db" json:"db"`
 	KeyPrefix string `yaml:"key-prefix" json:"key-prefix"`
+}
+
+type ObservabilityConfig struct {
+	Enabled               bool       `yaml:"enabled" json:"enabled"`
+	ServiceName           string     `yaml:"service-name" json:"service-name"`
+	Environment           string     `yaml:"environment" json:"environment"`
+	TransportLogs         bool       `yaml:"transport-logs" json:"transport-logs"`
+	TransportLogsFullBody bool       `yaml:"transport-logs-full-body" json:"transport-logs-full-body"`
+	OTLP                  OTLPConfig `yaml:"otlp" json:"otlp"`
+}
+
+type OTLPConfig struct {
+	Endpoint    string            `yaml:"endpoint" json:"endpoint"`
+	Protocol    string            `yaml:"protocol" json:"protocol"`
+	Headers     map[string]string `yaml:"headers" json:"headers"`
+	Insecure    bool              `yaml:"insecure" json:"insecure"`
+	Traces      bool              `yaml:"traces" json:"traces"`
+	Metrics     bool              `yaml:"metrics" json:"metrics"`
+	Logs        bool              `yaml:"logs" json:"logs"`
+	SampleRatio float64           `yaml:"sample-ratio" json:"sample-ratio"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
@@ -695,6 +718,15 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
+	cfg.Observability.ServiceName = "cliproxy"
+	cfg.Observability.Environment = "local"
+	cfg.Observability.OTLP.Endpoint = "http://localhost:57018"
+	cfg.Observability.OTLP.Protocol = "http/protobuf"
+	cfg.Observability.OTLP.Insecure = true
+	cfg.Observability.OTLP.Traces = true
+	cfg.Observability.OTLP.Metrics = true
+	cfg.Observability.OTLP.Logs = true
+	cfg.Observability.OTLP.SampleRatio = 1.0
 	cfg.DisableCooling = false
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
@@ -763,6 +795,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		log.WithField("value", cfg.RedisUsageQueueRetentionSeconds).Warn("redis-usage-queue-retention-seconds too large; clamping to 3600")
 		cfg.RedisUsageQueueRetentionSeconds = 3600
 	}
+
+	cfg.SanitizeObservability()
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
@@ -894,6 +928,37 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
 	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
 	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
+}
+
+func (cfg *Config) SanitizeObservability() {
+	if cfg == nil {
+		return
+	}
+	cfg.Observability.ServiceName = strings.TrimSpace(cfg.Observability.ServiceName)
+	if cfg.Observability.ServiceName == "" {
+		cfg.Observability.ServiceName = "cliproxy"
+	}
+	cfg.Observability.Environment = strings.TrimSpace(cfg.Observability.Environment)
+	if cfg.Observability.Environment == "" {
+		cfg.Observability.Environment = "local"
+	}
+	if !cfg.Observability.TransportLogs {
+		cfg.Observability.TransportLogsFullBody = false
+	}
+	cfg.Observability.OTLP.Endpoint = strings.TrimRight(strings.TrimSpace(cfg.Observability.OTLP.Endpoint), "/")
+	if cfg.Observability.OTLP.Endpoint == "" {
+		cfg.Observability.OTLP.Endpoint = "http://localhost:57018"
+	}
+	cfg.Observability.OTLP.Protocol = strings.ToLower(strings.TrimSpace(cfg.Observability.OTLP.Protocol))
+	if cfg.Observability.OTLP.Protocol == "" {
+		cfg.Observability.OTLP.Protocol = "http/protobuf"
+	}
+	if cfg.Observability.OTLP.SampleRatio <= 0 || cfg.Observability.OTLP.SampleRatio > 1 {
+		cfg.Observability.OTLP.SampleRatio = 1.0
+	}
+	if cfg.Observability.OTLP.Headers == nil {
+		cfg.Observability.OTLP.Headers = map[string]string{}
+	}
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.

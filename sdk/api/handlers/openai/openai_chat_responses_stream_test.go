@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -152,5 +153,14 @@ func TestCursorMetadataFeedsCacheKeyBeforeUpstreamStrip(t *testing.T) {
 	}
 	if got := gjson.GetBytes(stripped, "prompt_cache_key").String(); got != cacheKey {
 		t.Fatalf("prompt_cache_key must survive metadata strip; got %q want %q", got, cacheKey)
+	}
+
+	ctx := withCursorCacheIdentity(context.Background(), withCacheKey)
+	identity := internallogging.GetCacheIdentity(ctx)
+	if identity.ConversationID != "conv" {
+		t.Fatalf("conversation identity = %q, want conv", identity.ConversationID)
+	}
+	if identity.PromptCacheKey != cacheKey {
+		t.Fatalf("prompt cache identity = %q, want %q", identity.PromptCacheKey, cacheKey)
 	}
 }

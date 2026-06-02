@@ -27,6 +27,8 @@ auths/*
 
 # Documentation
 docs/*
+!docs/signoz-observability.md
+!docs/signoz-dashboard-cliproxy.json
 AGENTS.md
 CLAUDE.md
 GEMINI.md
@@ -53,3 +55,9 @@ _bmad-output/*
 .gocache/
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+
+# Local agent scratch / captured traffic (may contain secrets) — never commit
+raw-claude-opus-4.8-and-subagents.folder/
+.cursor/plans/
+.mcp.json
+skills-lock.json

@@ -71,6 +71,27 @@ func TestNewUsageReporterDoesNotStampRawAPIKey(t *testing.T) {
 	}
 }
 
+func TestTrackHTTPClientPreservesTTFTWithObservabilityDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-test", nil)
+	client := reporter.TrackHTTPClient(server.Client())
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if reporter.ttftDuration() <= 0 {
+		t.Fatal("ttft was not recorded")
+	}
+}
+
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	data := []byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
 	detail := ParseOpenAIUsage(data)
@@ -86,6 +107,9 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	if detail.CachedTokens != 4 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 4)
 	}
+	if detail.CacheReadTokens != 4 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 4)
+	}
 	if detail.ReasoningTokens != 5 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 5)
 	}
@@ -94,8 +118,11 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 func TestParseOpenAIUsageResponses(t *testing.T) {
 	data := []byte(`{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":9}}}`)
 	detail := ParseOpenAIUsage(data)
-	if detail.InputTokens != 10 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 10)
+	// OpenAI/Codex prompt_tokens INCLUDE cached_tokens; we subtract so
+	// InputTokens represents non-cached prompt tokens (matches Claude
+	// semantics so cache-hit ratio math is consistent across providers).
+	if detail.InputTokens != 3 {
+		t.Fatalf("input tokens = %d, want %d (10 prompt - 7 cached)", detail.InputTokens, 3)
 	}
 	if detail.OutputTokens != 20 {
 		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 20)
@@ -105,6 +132,9 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.CachedTokens != 7 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 7)
+	}
+	if detail.CacheReadTokens != 7 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 7)
 	}
 	if detail.ReasoningTokens != 9 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
@@ -132,8 +162,9 @@ func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
 	if !ok {
 		t.Fatal("ParseOpenAIStreamUsage() ok = false, want true")
 	}
-	if detail.InputTokens != 8 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 8)
+	// See TestParseOpenAIUsageResponses — input excludes cached.
+	if detail.InputTokens != 5 {
+		t.Fatalf("input tokens = %d, want %d (8 prompt - 3 cached)", detail.InputTokens, 5)
 	}
 	if detail.OutputTokens != 5 {
 		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 5)
@@ -144,8 +175,25 @@ func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
 	if detail.CachedTokens != 3 {
 		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 3)
 	}
+	if detail.CacheReadTokens != 3 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 3)
+	}
 	if detail.ReasoningTokens != 2 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 2)
+	}
+}
+
+func TestParseCodexUsageMapsCachedTokensToCacheRead(t *testing.T) {
+	data := []byte(`{"response":{"usage":{"input_tokens":51,"output_tokens":2,"total_tokens":53,"input_tokens_details":{"cached_tokens":44}}}}`)
+	detail, ok := ParseCodexUsage(data)
+	if !ok {
+		t.Fatal("ParseCodexUsage() ok = false, want true")
+	}
+	if detail.CachedTokens != 44 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 44)
+	}
+	if detail.CacheReadTokens != 44 {
+		t.Fatalf("cache read tokens = %d, want %d", detail.CacheReadTokens, 44)
 	}
 }
 

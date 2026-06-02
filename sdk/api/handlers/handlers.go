@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/context"
 )
 
@@ -409,6 +410,21 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx, cancel := context.WithCancel(parentCtx)
 
+	// Re-attach the inbound OTel server span to the execution context.
+	// parentCtx is intentionally context.Background() (callers isolate the
+	// upstream lifecycle from the request's own cancellation/deadline and
+	// bridge cancellation via the goroutine below), but that also strips the
+	// trace lineage that GinMiddleware put on c.Request.Context(). Without
+	// this, provider/upstream spans and the request-summary annotations
+	// become orphan roots instead of children of the inbound HTTP span, so
+	// trace correlation in SigNoz breaks. Propagate ONLY the span (trace
+	// context) — not cancellation — so the isolation design is preserved.
+	if requestCtx != nil {
+		if span := trace.SpanFromContext(requestCtx); span.SpanContext().IsValid() {
+			newCtx = trace.ContextWithSpan(newCtx, span)
+		}
+	}
+
 	endpoint := ""
 	if c != nil && c.Request != nil {
 		path := strings.TrimSpace(c.FullPath())
@@ -429,6 +445,8 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = logging.WithResponseStatusHolder(newCtx)
 	newCtx = logging.WithResponseHeadersHolder(newCtx)
+	newCtx = logging.WithRequestSummaryHolder(newCtx)
+	newCtx = logging.WithRequestOutcomeHolder(newCtx)
 
 	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {

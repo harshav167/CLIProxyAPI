@@ -32,6 +32,36 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsRecordPreservesCacheReadWriteSplit(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "claude-opus-4-8",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:         100,
+			OutputTokens:        20,
+			CachedTokens:        90,
+			CacheReadTokens:     80,
+			CacheCreationTokens: 10,
+			TotalTokens:         120,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["claude-opus-4-8"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	tokens := details[0].Tokens
+	if tokens.CacheReadTokens != 80 {
+		t.Fatalf("cache_read_tokens = %d, want 80", tokens.CacheReadTokens)
+	}
+	if tokens.CacheCreationTokens != 10 {
+		t.Fatalf("cache_creation_tokens = %d, want 10", tokens.CacheCreationTokens)
+	}
+}
+
 func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
@@ -92,5 +122,55 @@ func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
 	if len(details) != 1 {
 		t.Fatalf("details len = %d, want 1", len(details))
+	}
+}
+
+func TestRequestStatisticsMergeSnapshotDedupDistinguishesCacheSplit(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	snapshot := StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				Models: map[string]ModelSnapshot{
+					"claude-opus-4-8": {
+						Details: []RequestDetail{
+							{
+								Timestamp: timestamp,
+								Source:    "source",
+								AuthIndex: "0",
+								Tokens: TokenStats{
+									InputTokens:         100,
+									OutputTokens:        20,
+									CacheReadTokens:     100,
+									CacheCreationTokens: 0,
+									TotalTokens:         120,
+								},
+							},
+							{
+								Timestamp: timestamp,
+								Source:    "source",
+								AuthIndex: "0",
+								Tokens: TokenStats{
+									InputTokens:         100,
+									OutputTokens:        20,
+									CacheReadTokens:     0,
+									CacheCreationTokens: 100,
+									TotalTokens:         120,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	result := stats.MergeSnapshot(snapshot)
+	if result.Added != 2 || result.Skipped != 0 {
+		t.Fatalf("merge = %+v, want added=2 skipped=0", result)
+	}
+	details := stats.Snapshot().APIs["test-key"].Models["claude-opus-4-8"].Details
+	if len(details) != 2 {
+		t.Fatalf("details len = %d, want 2", len(details))
 	}
 }

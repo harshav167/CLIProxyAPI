@@ -1,0 +1,119 @@
+{
+  "title": "CLIProxyAPI Cache Burn",
+  "description": "Panel checklist for building the SigNoz cache-burn dashboard from CLIProxyAPI OpenTelemetry metrics, traces, and redacted transport-summary logs.",
+  "serviceName": "cliproxy",
+  "variables": [
+    {
+      "name": "service_name",
+      "attribute": "service.name",
+      "default": "cliproxy"
+    },
+    {
+      "name": "environment",
+      "attribute": "deployment.environment"
+    },
+    {
+      "name": "provider",
+      "attribute": "cliproxy.provider"
+    },
+    {
+      "name": "model",
+      "attribute": "cliproxy.model"
+    },
+    {
+      "name": "conversation_id",
+      "attribute": "cliproxy.conversation_id"
+    }
+  ],
+  "panels": [
+    {
+      "title": "Cache Hit Ratio",
+      "signal": "metrics",
+      "formula": "sum(cliproxy.tokens.cache_read) / sum(cliproxy.tokens.input + cliproxy.tokens.cache_read + cliproxy.tokens.cache_creation)",
+      "groupBy": ["cliproxy.provider", "cliproxy.model"],
+      "description": "Primary acceptance panel for cache-burn fixes. Healthy steady-state Cursor Claude/Codex traffic should trend toward 90%+ cache reuse."
+    },
+    {
+      "title": "Cache Creation Volume",
+      "signal": "metrics",
+      "metric": "cliproxy.tokens.cache_creation",
+      "aggregation": "sum",
+      "groupBy": ["cliproxy.provider", "cliproxy.model", "cliproxy.api_key_fingerprint"],
+      "description": "The burn. Spikes here indicate full prefix rewrites or cold subagent starts."
+    },
+    {
+      "title": "Cache Read Volume",
+      "signal": "metrics",
+      "metric": "cliproxy.tokens.cache_read",
+      "aggregation": "sum",
+      "groupBy": ["cliproxy.provider", "cliproxy.model", "cliproxy.api_key_fingerprint"],
+      "description": "Successful cache reuse volume reported by upstream providers."
+    },
+    {
+      "title": "Cache Creation by Conversation",
+      "signal": "metrics",
+      "metric": "cliproxy.tokens.cache_creation",
+      "aggregation": "sum",
+      "groupBy": ["cliproxy.conversation_id", "cliproxy.model"],
+      "description": "Surfaces Codex subagent cold-starts and Claude idle-gap recreations."
+    },
+    {
+      "title": "Top Conversations by Cache Creation",
+      "signal": "logs",
+      "filter": "service.name = 'cliproxy' AND body = 'cliproxy.transport_summary' AND gen_ai.usage.cache_creation_input_tokens > 0",
+      "groupBy": ["cliproxy.conversation_id", "cliproxy.model", "cliproxy.prompt_cache_key"],
+      "aggregation": "sum(gen_ai.usage.cache_creation_input_tokens)",
+      "description": "Request-level transport summaries identify the specific conversations and cache keys that created cache."
+    },
+    {
+      "title": "Per-Request Cache Scatter",
+      "signal": "logs",
+      "filter": "service.name = 'cliproxy' AND body = 'cliproxy.transport_summary'",
+      "x": "gen_ai.usage.input_tokens",
+      "y": "gen_ai.usage.cache_creation_input_tokens",
+      "series": "gen_ai.usage.cache_read_input_tokens",
+      "columns": ["timestamp", "cliproxy.provider", "cliproxy.model", "cliproxy.conversation_id", "cliproxy.cache_hit_ratio", "cliproxy.cache_control_summary"],
+      "description": "Spot read=0 full recreations and inspect cache_control layout without storing prompt text."
+    },
+    {
+      "title": "Upstream TTFT p95/p99",
+      "signal": "metrics",
+      "metric": "cliproxy.upstream.ttft_ms",
+      "aggregation": ["p95", "p99"],
+      "groupBy": ["cliproxy.provider", "cliproxy.model"]
+    },
+    {
+      "title": "Request Rate",
+      "signal": "metrics",
+      "metric": "cliproxy.upstream.requests",
+      "aggregation": "rate",
+      "groupBy": ["cliproxy.provider", "cliproxy.model"]
+    },
+    {
+      "title": "Error Rate",
+      "signal": "metrics",
+      "metric": "cliproxy.upstream.requests",
+      "formula": "sum(where cliproxy.failed = true) / sum(*)",
+      "groupBy": ["cliproxy.provider", "cliproxy.model"]
+    },
+    {
+      "title": "Redacted Transport Summaries",
+      "signal": "logs",
+      "filter": "service.name = 'cliproxy' AND body = 'cliproxy.transport_summary'",
+      "columns": ["timestamp", "cliproxy.provider", "cliproxy.model", "cliproxy.conversation_id", "cliproxy.prompt_cache_key", "http.response.status_code", "cliproxy.cache_hit_ratio", "cliproxy.cache_control_summary"]
+    },
+    {
+      "title": "Container App Logs",
+      "signal": "logs",
+      "filter": "service.name = 'cliproxy'",
+      "columns": ["timestamp", "severity_text", "body", "trace_id", "span_id", "request_id"]
+    }
+  ],
+  "recommendedImports": [
+    "~/Developer/signoz/dashboards/go-runtime/go-runtime-metrics.json",
+    "~/Developer/signoz/dashboards/openai/openai-dashboard.json",
+    "~/Developer/signoz/dashboards/anthropic/anthropic-dashboard.json",
+    "~/Developer/signoz/dashboards/google-gemini/google-gemini-template.json",
+    "~/Developer/signoz/dashboards/codex/codex-dashboard.json"
+  ]
+}
