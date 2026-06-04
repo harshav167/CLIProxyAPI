@@ -60,7 +60,7 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **CLIProxyAPI** (21495 symbols, 67267 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **CLIProxyAPI** (21912 symbols, 68823 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

@@ -21,6 +21,10 @@ logs/*
 conv/*
 config.yaml
 
+# Stray captured request-log dumps that can land in the repo root
+*.folder/
+raw-claude-*
+
 # Development/editor
 bin/*
 .vscode/*
@@ -35,3 +39,9 @@ bin/*
 .bmad/*
 _bmad/*
 _bmad-output/*
+
+# Local code intelligence / agent state
+.codegraph/*
+.gitnexus/*
+.remember/*
+.cocoindex_code/*
