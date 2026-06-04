@@ -689,3 +689,48 @@ func TestDropXAIToolChoiceWithoutTools(t *testing.T) {
 		t.Fatalf("parallel_tool_calls should be dropped with tool_choice: %s", stripped)
 	}
 }
+
+func TestStampXAIInputMessageType(t *testing.T) {
+	// Real droid multi-turn shape: bare user item (no type) alongside an
+	// assistant message item (has type) and typed tool items. Only the bare
+	// role-bearing items should gain type:"message".
+	body := []byte(`{"input":[` +
+		`{"role":"user","content":[{"type":"input_text","text":"hi"}]},` +
+		`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]},` +
+		`{"type":"function_call","name":"f","arguments":"{}"},` +
+		`{"type":"function_call_output","output":"done"},` +
+		`{"role":"system","content":[{"type":"input_text","text":"sys"}]}` +
+		`]}`)
+
+	got := stampXAIInputMessageType(body)
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 5 {
+		t.Fatalf("input length = %d, want 5", len(input))
+	}
+	// [0] bare user -> stamped
+	if input[0].Get("type").String() != "message" {
+		t.Fatalf("input[0] type = %q, want message", input[0].Get("type").String())
+	}
+	// [1] assistant already message -> unchanged
+	if input[1].Get("type").String() != "message" {
+		t.Fatalf("input[1] type = %q, want message", input[1].Get("type").String())
+	}
+	// [2] function_call -> untouched (not role-bearing)
+	if input[2].Get("type").String() != "function_call" {
+		t.Fatalf("input[2] type = %q, want function_call", input[2].Get("type").String())
+	}
+	// [3] function_call_output -> untouched
+	if input[3].Get("type").String() != "function_call_output" {
+		t.Fatalf("input[3] type = %q, want function_call_output", input[3].Get("type").String())
+	}
+	// [4] bare system -> stamped
+	if input[4].Get("type").String() != "message" {
+		t.Fatalf("input[4] type = %q, want message", input[4].Get("type").String())
+	}
+
+	// No input array is a no-op.
+	noInput := stampXAIInputMessageType([]byte(`{"model":"grok-composer-2.5-fast"}`))
+	if gjson.GetBytes(noInput, "input").Exists() {
+		t.Fatalf("unexpected input added: %s", noInput)
+	}
+}

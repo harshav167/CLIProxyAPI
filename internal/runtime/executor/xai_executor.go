@@ -665,7 +665,38 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 		body, _ = sjson.DeleteBytes(body, "reasoning")
 	}
 	body = dropXAIToolChoiceWithoutTools(body)
+	body = stampXAIInputMessageType(body)
 	return body
+}
+
+// stampXAIInputMessageType adds type:"message" to input items that carry a role
+// but no type. xAI's /responses endpoint deserializes each input item against
+// an untagged ModelInput enum and rejects an item it cannot match with HTTP 422
+// "Failed to deserialize the JSON body into the target type: data did not match
+// any variant of untagged enum ModelInput". Multi-turn requests from clients
+// like droid emit user/system items as bare {role, content} (no type) while
+// assistant items already carry type:"message"; OpenAI tolerates the bare form
+// but xAI does not. Items that already declare a type (message, function_call,
+// function_call_output, reasoning, …) are left untouched.
+func stampXAIInputMessageType(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+	updated := body
+	for i, item := range input.Array() {
+		if item.Get("type").Exists() {
+			continue
+		}
+		if !item.Get("role").Exists() {
+			continue
+		}
+		typePath := fmt.Sprintf("input.%d.type", i)
+		if next, err := sjson.SetBytes(updated, typePath, "message"); err == nil {
+			updated = next
+		}
+	}
+	return updated
 }
 
 // dropXAIToolChoiceWithoutTools removes tool_choice (and the now-meaningless
