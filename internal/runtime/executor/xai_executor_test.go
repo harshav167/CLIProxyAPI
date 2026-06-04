@@ -639,3 +639,53 @@ func TestXAIExecutorExecuteVideosUsesNativeEndpointFromRequestPath(t *testing.T)
 		})
 	}
 }
+
+func TestDropXAIToolChoiceWithoutTools(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           string
+		wantToolChoice bool
+	}{
+		{
+			name:           "tool_choice auto without tools is dropped",
+			body:           `{"model":"grok-composer-2.5-fast","tool_choice":"auto","parallel_tool_calls":true}`,
+			wantToolChoice: false,
+		},
+		{
+			name:           "tool_choice with non-empty tools is kept",
+			body:           `{"model":"grok-composer-2.5-fast","tool_choice":"auto","tools":[{"type":"function","name":"f"}]}`,
+			wantToolChoice: true,
+		},
+		{
+			name:           "tool_choice none without tools is preserved",
+			body:           `{"model":"grok-composer-2.5-fast","tool_choice":"none"}`,
+			wantToolChoice: true,
+		},
+		{
+			name:           "tool_choice with empty tools array is dropped",
+			body:           `{"model":"grok-composer-2.5-fast","tool_choice":"required","tools":[]}`,
+			wantToolChoice: false,
+		},
+		{
+			name:           "no tool_choice is a no-op",
+			body:           `{"model":"grok-composer-2.5-fast"}`,
+			wantToolChoice: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dropXAIToolChoiceWithoutTools([]byte(tt.body))
+			if has := gjson.GetBytes(got, "tool_choice").Exists(); has != tt.wantToolChoice {
+				t.Fatalf("tool_choice present = %t, want %t (body=%s)", has, tt.wantToolChoice, got)
+			}
+		})
+	}
+
+	// When tool_choice is stripped, the now-meaningless parallel_tool_calls
+	// must go with it so the request stays internally consistent.
+	stripped := dropXAIToolChoiceWithoutTools([]byte(`{"tool_choice":"auto","parallel_tool_calls":true}`))
+	if gjson.GetBytes(stripped, "parallel_tool_calls").Exists() {
+		t.Fatalf("parallel_tool_calls should be dropped with tool_choice: %s", stripped)
+	}
+}
