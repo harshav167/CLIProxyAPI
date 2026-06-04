@@ -109,7 +109,13 @@ func RecordRequestSummary(ctx context.Context, summary RequestSummary) {
 			otellog.String("span_id", spanContext.SpanID().String()),
 		)
 	}
-	if state.settings.TransportLogsFullBody {
+	// Emit bodies when full-body capture is on, OR when the request failed
+	// (error-only capture). The latter makes upstream 4xx/5xx — especially
+	// request-translation rejections like a 422 from a provider — debuggable
+	// straight from SigNoz without needing to SSH into the host. Client
+	// cancellations are not failures and stay body-free.
+	emitBodies := state.settings.TransportLogsFullBody || (summary.Failed && !summary.ClientCanceled)
+	if emitBodies {
 		record.AddAttributes(
 			otellog.String("cliproxy.request_body_redacted", boundedString(summary.RequestBody, 8192)),
 			otellog.String("cliproxy.response_body_redacted", boundedString(summary.ResponseBody, 8192)),
@@ -207,6 +213,13 @@ func AnnotateServerSpanFromSummary(ctx context.Context, summary RequestSummary) 
 		}
 		if message == "" {
 			message = "upstream request failed"
+		}
+		// Attach the redacted request body to the failed span so a 4xx/5xx —
+		// especially a request-translation rejection — can be root-caused from
+		// the trace alone. RequestBody is already redacted + 8KB-capped at
+		// capture time; bound again defensively for the span attribute.
+		if body := boundedString(summary.RequestBody, 8192); body != "" {
+			span.SetAttributes(attribute.String("cliproxy.request_body_redacted", body))
 		}
 		span.RecordError(httpStatusError{status: summary.ErrorStatus, message: message})
 		span.SetStatus(codes.Error, message)

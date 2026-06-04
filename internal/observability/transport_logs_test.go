@@ -123,6 +123,32 @@ func TestCacheHitRatioOpenAIStyleNormalizedInput(t *testing.T) {
 	}
 }
 
+func TestEmitBodiesGatedByFailureOrFullBody(t *testing.T) {
+	// The emit decision in RecordRequestSummary: bodies ship when full-body is
+	// on, OR when the request failed and was not a client cancellation.
+	emit := func(fullBody, failed, clientCanceled bool) bool {
+		return fullBody || (failed && !clientCanceled)
+	}
+	cases := []struct {
+		name           string
+		fullBody       bool
+		failed         bool
+		clientCanceled bool
+		want           bool
+	}{
+		{"success no fullbody -> no body", false, false, false, false},
+		{"failure no fullbody -> body (error-only capture)", false, true, false, true},
+		{"client cancel no fullbody -> no body", false, true, true, false},
+		{"success fullbody -> body", true, false, false, true},
+		{"failure fullbody -> body", true, true, false, true},
+	}
+	for _, tc := range cases {
+		if got := emit(tc.fullBody, tc.failed, tc.clientCanceled); got != tc.want {
+			t.Errorf("%s: emit=%t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestRecordRequestSummaryDisabledNoop(t *testing.T) {
 	previous := active()
 	SetActive(nil)

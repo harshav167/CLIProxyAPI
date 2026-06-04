@@ -360,9 +360,12 @@ func recordTransportRequestSummary(ctx context.Context, cfg *config.Config, info
 	summary.Provider = firstNonEmpty(info.Provider, summary.Provider)
 	summary.RequestBytes += int64(len(info.Body))
 	summary.CacheControlSummary = cacheControlSummary(info.Body)
-	if observability.TransportLogsFullBodyActive() {
-		summary.RequestBody = observability.RedactBodyForLog(info.Body, 8192)
-	}
+	// Always buffer the redacted, size-capped request body in memory so it is
+	// available if the request fails. It is only EMITTED to the log/span when
+	// full-body capture is on or the request failed (see RecordRequestSummary);
+	// buffering it here costs one redaction + an 8KB string per request and
+	// makes upstream 4xx/5xx debuggable from telemetry without prod access.
+	summary.RequestBody = observability.RedactBodyForLog(info.Body, 8192)
 	logging.SetRequestSummary(ctx, summary)
 }
 
