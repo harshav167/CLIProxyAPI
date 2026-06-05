@@ -245,6 +245,31 @@ func TestDeriveCursorSessionIDIsolatesByPrincipalSalt(t *testing.T) {
 	}
 }
 
+func TestDeriveCursorSessionIDSaltsExplicitPromptCacheKey(t *testing.T) {
+	// An explicit client-supplied prompt_cache_key must be salted per principal
+	// for the derived session ID (so two tenants choosing the same key don't
+	// collide onto one WebSocket), while staying stable within a principal.
+	body := []byte(`{"model":"gpt-5.4","prompt_cache_key":"shared-key-123","input":[{"role":"user","content":"hi"}]}`)
+
+	tenantA := deriveCursorSessionID(body, "saltA")
+	tenantB := deriveCursorSessionID(body, "saltB")
+
+	if tenantA == "" || tenantB == "" {
+		t.Fatalf("expected derivable sessions, got %q / %q", tenantA, tenantB)
+	}
+	if tenantA == tenantB {
+		t.Fatalf("same explicit prompt_cache_key under different principals must not collide: %q", tenantA)
+	}
+	// Must not leak the raw key verbatim into the session ID.
+	if strings.Contains(tenantA, "shared-key-123") {
+		t.Fatalf("derived session ID leaked raw prompt_cache_key: %q", tenantA)
+	}
+	// Stable within the same principal.
+	if again := deriveCursorSessionID(body, "saltA"); again != tenantA {
+		t.Fatalf("same principal+key must be stable: %q vs %q", again, tenantA)
+	}
+}
+
 func TestSyntheticPromptCacheKeyIsolatesByPrincipal(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.5","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"hi"}]}`)
 

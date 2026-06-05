@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -60,8 +61,19 @@ var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 	sessions: make(map[string]*codexWebsocketSession),
 }
 
+// codexWebsocketSessionIdleTTL bounds how long an idle session (no request
+// activity) may remain resident before it is evicted and its upstream socket
+// closed. Cursor HTTP traffic derives stable session IDs (one per
+// conversation), so without eviction every distinct conversation would leak a
+// session + read/ping loop indefinitely.
+const codexWebsocketSessionIdleTTL = 30 * time.Minute
+
 type codexWebsocketSession struct {
 	sessionID string
+
+	// lastUsedUnix is updated (atomically) whenever the session is fetched for a
+	// request; the idle reaper uses it to evict stale sessions.
+	lastUsedUnix atomic.Int64
 
 	reqMu sync.Mutex
 
@@ -654,6 +666,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		defer close(out)
 		defer func() {
 			if sess != nil {
+				// If this stream terminated because the downstream client
+				// canceled (ctx.Done), the upstream socket may still be
+				// draining stale events / carrying previous_response_id state.
+				// Invalidate it so a later request on this session dials a
+				// fresh connection instead of reusing a poisoned one.
+				if terminateReason == "context_done" {
+					e.invalidateUpstreamConn(sess, conn, "client_canceled", terminateErr)
+				}
 				sess.clearActive(readCh)
 				sess.reqMu.Unlock()
 				return
@@ -1487,15 +1507,56 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if store.sessions == nil {
 		store.sessions = make(map[string]*codexWebsocketSession)
 	}
+	// Opportunistically evict idle sessions (and close their sockets) so stable
+	// Cursor-derived session IDs don't accumulate unboundedly.
+	e.reapIdleSessionsLocked(store)
+	now := time.Now().Unix()
 	if sess, ok := store.sessions[sessionID]; ok && sess != nil {
+		sess.lastUsedUnix.Store(now)
 		return sess
 	}
 	sess := &codexWebsocketSession{
 		sessionID:            sessionID,
 		upstreamDisconnectCh: make(chan error, 1),
 	}
+	sess.lastUsedUnix.Store(now)
 	store.sessions[sessionID] = sess
 	return sess
+}
+
+// reapIdleSessionsLocked removes sessions idle beyond codexWebsocketSessionIdleTTL
+// and closes their upstream connections. Caller must hold store.mu.
+func (e *CodexWebsocketsExecutor) reapIdleSessionsLocked(store *codexWebsocketSessionStore) {
+	if store == nil || len(store.sessions) == 0 {
+		return
+	}
+	cutoff := time.Now().Add(-codexWebsocketSessionIdleTTL).Unix()
+	for id, sess := range store.sessions {
+		if sess == nil {
+			delete(store.sessions, id)
+			continue
+		}
+		if sess.lastUsedUnix.Load() > cutoff {
+			continue
+		}
+		// Don't evict a session with an in-flight request: reqMu is held for the
+		// duration of a request, so a successful TryLock means it is idle.
+		if !sess.reqMu.TryLock() {
+			continue
+		}
+		sess.connMu.Lock()
+		conn := sess.conn
+		sess.conn = nil
+		sess.readerConn = nil
+		sess.connMu.Unlock()
+		if conn != nil {
+			if errClose := conn.Close(); errClose != nil {
+				log.Errorf("codex websockets executor: close idle session websocket error: %v", errClose)
+			}
+		}
+		sess.reqMu.Unlock()
+		delete(store.sessions, id)
+	}
 }
 
 func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan error {
@@ -2042,9 +2103,17 @@ func forcePassthroughFromContext(ctx context.Context) bool {
 }
 
 func bridgeSessionKey(opts cliproxyexecutor.Options, payload []byte) string {
+	// Prefer the execution-session ID set by the handler. For Cursor traffic
+	// this is already the per-principal salted ID (see deriveCursorSessionID),
+	// so tenant namespacing is preserved on the primary path.
 	if key := helps.ExecutionSessionIDFromOptions(opts); key != "" {
 		return key
 	}
+	// Fallback for callers that supply a raw prompt_cache_key without an
+	// execution-session ID (e.g. direct API clients). This path is unsalted;
+	// it is only reachable in single-tenant/shared-auth use where the key is
+	// already principal-scoped. Multi-tenant deployments should ensure the
+	// handler sets a salted execution-session ID before reaching here.
 	pck := gjson.GetBytes(payload, "prompt_cache_key").String()
 	if strings.HasPrefix(pck, "cli-proxy-") {
 		return ""

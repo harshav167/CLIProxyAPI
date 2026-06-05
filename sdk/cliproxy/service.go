@@ -810,6 +810,24 @@ func (s *Service) Run(ctx context.Context) error {
 			log.Infof("observability enabled: service=%s endpoint=%s", s.cfg.Observability.ServiceName, s.cfg.Observability.OTLP.Endpoint)
 		}
 	}
+	// Configure the usage queue backend the same way the CLI entrypoint does,
+	// so SDK embedders using the public Config get the external Redis/Valkey
+	// backend (durability + cross-process semantics) instead of silently
+	// staying on the in-memory queue.
+	if s.cfg != nil {
+		redisqueue.SetUsageStatisticsEnabled(s.cfg.UsageStatisticsEnabled)
+		redisqueue.SetRetentionSeconds(s.cfg.RedisUsageQueueRetentionSeconds)
+		if s.cfg.RedisQueue.Enabled {
+			if errBackend := redisqueue.ConfigureRedisBackend(redisqueue.RedisBackendConfig{
+				Address:   s.cfg.RedisQueue.Address,
+				Password:  s.cfg.RedisQueue.Password,
+				DB:        s.cfg.RedisQueue.DB,
+				KeyPrefix: s.cfg.RedisQueue.KeyPrefix,
+			}); errBackend != nil {
+				log.Errorf("redisqueue: external backend unavailable, falling back to in-memory: %v", errBackend)
+			}
+		}
+	}
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)

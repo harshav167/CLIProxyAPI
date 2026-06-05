@@ -198,12 +198,16 @@ type RedisQueueConfig struct {
 }
 
 type ObservabilityConfig struct {
-	Enabled               bool       `yaml:"enabled" json:"enabled"`
-	ServiceName           string     `yaml:"service-name" json:"service-name"`
-	Environment           string     `yaml:"environment" json:"environment"`
-	TransportLogs         bool       `yaml:"transport-logs" json:"transport-logs"`
-	TransportLogsFullBody bool       `yaml:"transport-logs-full-body" json:"transport-logs-full-body"`
-	OTLP                  OTLPConfig `yaml:"otlp" json:"otlp"`
+	Enabled               bool   `yaml:"enabled" json:"enabled"`
+	ServiceName           string `yaml:"service-name" json:"service-name"`
+	Environment           string `yaml:"environment" json:"environment"`
+	TransportLogs         bool   `yaml:"transport-logs" json:"transport-logs"`
+	TransportLogsFullBody bool   `yaml:"transport-logs-full-body" json:"transport-logs-full-body"`
+	// TransportLogsErrorBody opts into exporting request/response bodies on
+	// FAILED requests only (for debugging upstream 4xx/5xx) without enabling
+	// full-body capture for all traffic. Bodies are redacted + size-capped.
+	TransportLogsErrorBody bool       `yaml:"transport-logs-error-body" json:"transport-logs-error-body"`
+	OTLP                   OTLPConfig `yaml:"otlp" json:"otlp"`
 }
 
 type OTLPConfig struct {
@@ -952,6 +956,7 @@ func (cfg *Config) SanitizeObservability() {
 	}
 	if !cfg.Observability.TransportLogs {
 		cfg.Observability.TransportLogsFullBody = false
+		cfg.Observability.TransportLogsErrorBody = false
 	}
 	cfg.Observability.OTLP.Endpoint = strings.TrimRight(strings.TrimSpace(cfg.Observability.OTLP.Endpoint), "/")
 	if cfg.Observability.OTLP.Endpoint == "" {

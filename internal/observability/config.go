@@ -18,21 +18,22 @@ const (
 
 // Settings is the normalized observability runtime configuration.
 type Settings struct {
-	Enabled               bool
-	ServiceName           string
-	Environment           string
-	Endpoint              string
-	Protocol              string
-	Headers               map[string]string
-	RedactedHeaders       map[string]string
-	Insecure              bool
-	Traces                bool
-	Metrics               bool
-	Logs                  bool
-	TransportLogs         bool
-	TransportLogsFullBody bool
-	SampleRatio           float64
-	ResourceAttributes    map[string]string
+	Enabled                bool
+	ServiceName            string
+	Environment            string
+	Endpoint               string
+	Protocol               string
+	Headers                map[string]string
+	RedactedHeaders        map[string]string
+	Insecure               bool
+	Traces                 bool
+	Metrics                bool
+	Logs                   bool
+	TransportLogs          bool
+	TransportLogsFullBody  bool
+	TransportLogsErrorBody bool
+	SampleRatio            float64
+	ResourceAttributes     map[string]string
 }
 
 // Normalize resolves YAML and OpenTelemetry environment overrides into a
@@ -66,12 +67,14 @@ func Normalize(cfg *config.Config) Settings {
 		settings.Logs = obs.OTLP.Logs
 		settings.TransportLogs = obs.TransportLogs
 		settings.TransportLogsFullBody = obs.TransportLogsFullBody
+		settings.TransportLogsErrorBody = obs.TransportLogsErrorBody
 		settings.SampleRatio = obs.OTLP.SampleRatio
 	}
 
 	settings.Enabled = envBool("CLIPROXY_OBSERVABILITY_ENABLED", settings.Enabled)
 	settings.TransportLogs = envBool("CLIPROXY_OBSERVABILITY_TRANSPORT_LOGS", settings.TransportLogs)
 	settings.TransportLogsFullBody = envBool("CLIPROXY_OBSERVABILITY_TRANSPORT_LOGS_FULL_BODY", settings.TransportLogsFullBody)
+	settings.TransportLogsErrorBody = envBool("CLIPROXY_OBSERVABILITY_TRANSPORT_LOGS_ERROR_BODY", settings.TransportLogsErrorBody)
 	settings.ServiceName = firstNonEmpty(os.Getenv("OTEL_SERVICE_NAME"), settings.ServiceName)
 	settings.Endpoint = firstNonEmpty(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"), settings.Endpoint)
 	settings.Protocol = firstNonEmpty(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL"), settings.Protocol)
@@ -91,6 +94,7 @@ func Normalize(cfg *config.Config) Settings {
 	}
 	if !settings.TransportLogs {
 		settings.TransportLogsFullBody = false
+		settings.TransportLogsErrorBody = false
 	}
 	settings.Protocol = strings.ToLower(strings.TrimSpace(settings.Protocol))
 	if settings.Protocol == "" {

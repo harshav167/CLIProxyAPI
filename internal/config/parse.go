@@ -24,6 +24,19 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
+	// Mirror LoadConfigOptional's observability defaults so a home/SDK parsed
+	// config that sets observability.enabled also registers exporters (otherwise
+	// Traces/Metrics/Logs default to false and Start publishes an active state
+	// that exports nothing).
+	cfg.Observability.ServiceName = "cliproxy"
+	cfg.Observability.Environment = "local"
+	cfg.Observability.OTLP.Endpoint = "http://localhost:57018"
+	cfg.Observability.OTLP.Protocol = "http/protobuf"
+	cfg.Observability.OTLP.Insecure = true
+	cfg.Observability.OTLP.Traces = true
+	cfg.Observability.OTLP.Metrics = true
+	cfg.Observability.OTLP.Logs = true
+	cfg.Observability.OTLP.SampleRatio = 1.0
 	cfg.DisableCooling = false
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
@@ -84,6 +97,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 	cfg.SanitizeOAuthModelAlias()
 	cfg.SanitizePayloadRules()
+	cfg.SanitizeObservability()
 
 	return &cfg, nil
 }

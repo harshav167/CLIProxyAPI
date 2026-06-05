@@ -109,12 +109,15 @@ func RecordRequestSummary(ctx context.Context, summary RequestSummary) {
 			otellog.String("span_id", spanContext.SpanID().String()),
 		)
 	}
-	// Emit bodies when full-body capture is on, OR when the request failed
-	// (error-only capture). The latter makes upstream 4xx/5xx — especially
-	// request-translation rejections like a 422 from a provider — debuggable
-	// straight from SigNoz without needing to SSH into the host. Client
+	// Emit bodies when full-body capture is on, OR (opt-in) when the request
+	// failed and error-body capture is enabled. The error-body path makes
+	// upstream 4xx/5xx — especially request-translation rejections like a 422
+	// from a provider — debuggable from SigNoz without SSHing into the host, but
+	// it is gated behind transport-logs-error-body because it exports prompt /
+	// completion text, which the default metadata-only mode does not. Client
 	// cancellations are not failures and stay body-free.
-	emitBodies := state.settings.TransportLogsFullBody || (summary.Failed && !summary.ClientCanceled)
+	emitBodies := state.settings.TransportLogsFullBody ||
+		(state.settings.TransportLogsErrorBody && summary.Failed && !summary.ClientCanceled)
 	if emitBodies {
 		record.AddAttributes(
 			otellog.String("cliproxy.request_body_redacted", boundedString(summary.RequestBody, 8192)),
@@ -216,10 +219,13 @@ func AnnotateServerSpanFromSummary(ctx context.Context, summary RequestSummary) 
 		}
 		// Attach the redacted request body to the failed span so a 4xx/5xx —
 		// especially a request-translation rejection — can be root-caused from
-		// the trace alone. RequestBody is already redacted + 8KB-capped at
-		// capture time; bound again defensively for the span attribute.
-		if body := boundedString(summary.RequestBody, 8192); body != "" {
-			span.SetAttributes(attribute.String("cliproxy.request_body_redacted", body))
+		// the trace alone. Gated behind full-body or the error-body opt-in
+		// because it exports prompt text; off by default. RequestBody is already
+		// redacted + 8KB-capped at capture time; bound again defensively here.
+		if st := active(); st != nil && (st.settings.TransportLogsFullBody || st.settings.TransportLogsErrorBody) {
+			if body := boundedString(summary.RequestBody, 8192); body != "" {
+				span.SetAttributes(attribute.String("cliproxy.request_body_redacted", body))
+			}
 		}
 		span.RecordError(httpStatusError{status: summary.ErrorStatus, message: message})
 		span.SetStatus(codes.Error, message)

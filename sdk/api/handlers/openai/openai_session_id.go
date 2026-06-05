@@ -321,12 +321,16 @@ func firstUserMessageAnchorAnyShape(rawJSON []byte, maxLen int) string {
 // client-controlled inputs and share an upstream WebSocket/connection. salt is
 // "" for auth-disabled deployments (single-tenant; behavior unchanged).
 //
-// Note: when the client supplies its own explicit prompt_cache_key (the
-// "cursor-pck-" branch) we trust it as-is — that is a deliberate client-chosen
-// cache identity and the request is already authenticated to this principal.
+// Note: when the client supplies its own explicit prompt_cache_key we use it as
+// the local session anchor, but SALT+HASH it for the derived session ID so two
+// tenants that happen to choose the same key (and share an upstream auth) cannot
+// collide onto the same WebSocket/bridge chain. The raw prompt_cache_key is left
+// untouched in the payload, so upstream cache behavior is unchanged — only the
+// proxy-local session identity is namespaced per principal.
 func deriveCursorSessionID(rawJSON []byte, salt string) string {
 	if pck := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String()); pck != "" && !strings.HasPrefix(pck, "cli-proxy-") {
-		return "cursor-pck-" + pck
+		sum := sha256.Sum256([]byte("cursor-pck\x00" + salt + "\x00" + pck))
+		return "cursor-pck-" + hex.EncodeToString(sum[:12])
 	}
 	if convID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.cursorConversationId").String()); convID != "" {
 		user := strings.TrimSpace(gjson.GetBytes(rawJSON, "user").String())
