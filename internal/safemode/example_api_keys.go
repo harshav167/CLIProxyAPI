@@ -7,6 +7,7 @@ import (
 	"html"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,10 +64,8 @@ func WarningServerURL(cfg *config.Config) string {
 			host = trimmed
 		}
 	}
-	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-		host = "[" + host + "]"
-	}
-	return fmt.Sprintf("%s://%s:%d/", scheme, host, port)
+	// net.JoinHostPort brackets IPv6 hosts correctly (e.g. ::1 -> [::1]:8317).
+	return fmt.Sprintf("%s://%s/", scheme, net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
 // NewExampleAPIKeyWarningHandler serves a setup warning page and leaves all other routes unregistered.
@@ -120,7 +119,7 @@ func StartExampleAPIKeyWarningServer(ctx context.Context, cfg *config.Config, co
 		}
 	}
 
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	listener, errListen := net.Listen("tcp", addr)
 	if errListen != nil {
 		return fmt.Errorf("failed to start warning server: %w", errListen)
@@ -132,6 +131,13 @@ func StartExampleAPIKeyWarningServer(ctx context.Context, cfg *config.Config, co
 	server := &http.Server{
 		Addr:    addr,
 		Handler: NewExampleAPIKeyWarningHandler(configPath, keys),
+		// Timeouts guard this user-facing warning server against Slowloris and
+		// idle-connection resource exhaustion (the handler only serves a small
+		// static page, so generous-but-bounded values are fine).
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
