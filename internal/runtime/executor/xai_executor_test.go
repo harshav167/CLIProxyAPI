@@ -640,56 +640,6 @@ func TestXAIExecutorExecuteVideosUsesNativeEndpointFromRequestPath(t *testing.T)
 	}
 }
 
-func TestDropXAIToolChoiceWithoutTools(t *testing.T) {
-	tests := []struct {
-		name           string
-		body           string
-		wantToolChoice bool
-	}{
-		{
-			name:           "tool_choice auto without tools is dropped",
-			body:           `{"model":"grok-composer-2.5-fast","tool_choice":"auto","parallel_tool_calls":true}`,
-			wantToolChoice: false,
-		},
-		{
-			name:           "tool_choice with non-empty tools is kept",
-			body:           `{"model":"grok-composer-2.5-fast","tool_choice":"auto","tools":[{"type":"function","name":"f"}]}`,
-			wantToolChoice: true,
-		},
-		{
-			name:           "tool_choice none without tools is preserved",
-			body:           `{"model":"grok-composer-2.5-fast","tool_choice":"none"}`,
-			wantToolChoice: true,
-		},
-		{
-			name:           "tool_choice with empty tools array is dropped",
-			body:           `{"model":"grok-composer-2.5-fast","tool_choice":"required","tools":[]}`,
-			wantToolChoice: false,
-		},
-		{
-			name:           "no tool_choice is a no-op",
-			body:           `{"model":"grok-composer-2.5-fast"}`,
-			wantToolChoice: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := dropXAIToolChoiceWithoutTools([]byte(tt.body))
-			if has := gjson.GetBytes(got, "tool_choice").Exists(); has != tt.wantToolChoice {
-				t.Fatalf("tool_choice present = %t, want %t (body=%s)", has, tt.wantToolChoice, got)
-			}
-		})
-	}
-
-	// When tool_choice is stripped, the now-meaningless parallel_tool_calls
-	// must go with it so the request stays internally consistent.
-	stripped := dropXAIToolChoiceWithoutTools([]byte(`{"tool_choice":"auto","parallel_tool_calls":true}`))
-	if gjson.GetBytes(stripped, "parallel_tool_calls").Exists() {
-		t.Fatalf("parallel_tool_calls should be dropped with tool_choice: %s", stripped)
-	}
-}
-
 func TestStampXAIInputMessageType(t *testing.T) {
 	// Real droid multi-turn shape: bare user item (no type) alongside an
 	// assistant message item (has type) and typed tool items. Only the bare
@@ -732,5 +682,59 @@ func TestStampXAIInputMessageType(t *testing.T) {
 	noInput := stampXAIInputMessageType([]byte(`{"model":"grok-composer-2.5-fast"}`))
 	if gjson.GetBytes(noInput, "input").Exists() {
 		t.Fatalf("unexpected input added: %s", noInput)
+	}
+}
+
+func TestNormalizeXAIToolChoiceForTools_DropsWhenToolsEmpty(t *testing.T) {
+	body := []byte(`{"model":"grok-4","tools":[],"tool_choice":"auto","parallel_tool_calls":true,"input":"hi"}`)
+	out := normalizeXAIToolChoiceForTools(body)
+
+	if gjson.GetBytes(out, "tools").Exists() {
+		t.Fatalf("empty tools should be removed: %s", string(out))
+	}
+	if gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice should be removed when tools empty: %s", string(out))
+	}
+	if gjson.GetBytes(out, "parallel_tool_calls").Exists() {
+		t.Fatalf("parallel_tool_calls should be removed when tools empty: %s", string(out))
+	}
+}
+
+func TestNormalizeXAIToolChoiceForTools_DropsWhenToolsMissing(t *testing.T) {
+	body := []byte(`{"model":"grok-4","tool_choice":"auto","input":"hi"}`)
+	out := normalizeXAIToolChoiceForTools(body)
+
+	if gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice should be removed when tools missing: %s", string(out))
+	}
+}
+
+func TestNormalizeXAIToolChoiceForTools_DropsOrphanedParallelToolCalls(t *testing.T) {
+	body := []byte(`{"model":"grok-4","parallel_tool_calls":true,"input":"hi"}`)
+	out := normalizeXAIToolChoiceForTools(body)
+
+	if gjson.GetBytes(out, "parallel_tool_calls").Exists() {
+		t.Fatalf("parallel_tool_calls should be removed when tools missing even without tool_choice: %s", string(out))
+	}
+}
+
+func TestNormalizeXAIToolChoiceForTools_KeepsWhenToolsPresent(t *testing.T) {
+	body := []byte(`{"model":"grok-4","tools":[{"type":"function","name":"Bash"}],"tool_choice":"auto","input":"hi"}`)
+	out := normalizeXAIToolChoiceForTools(body)
+
+	if !gjson.GetBytes(out, "tools").Exists() {
+		t.Fatalf("tools should be kept: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
+		t.Fatalf("tool_choice = %q, want auto: %s", got, string(out))
+	}
+}
+
+func TestNormalizeXAIToolChoiceForTools_NoOpWhenBothAbsent(t *testing.T) {
+	body := []byte(`{"model":"grok-4","input":"hi"}`)
+	out := normalizeXAIToolChoiceForTools(body)
+
+	if gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice should not appear: %s", string(out))
 	}
 }

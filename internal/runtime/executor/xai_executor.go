@@ -513,6 +513,7 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 	// with Fast mode on 400s before reaching the model.
 	body, _ = sjson.DeleteBytes(body, "service_tier")
 	body = normalizeXAITools(body)
+	body = normalizeXAIToolChoiceForTools(body)
 	body = normalizeXAIInputReasoningItems(body)
 	body = normalizeCodexInstructions(body)
 	body = sanitizeXAIResponsesBody(body, baseModel)
@@ -664,7 +665,9 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	if !xaiSupportsReasoningEffort(model) {
 		body, _ = sjson.DeleteBytes(body, "reasoning")
 	}
-	body = dropXAIToolChoiceWithoutTools(body)
+	// tool_choice-without-tools is handled upstream by normalizeXAIToolChoiceForTools
+	// (called in prepareResponsesRequest). We keep stampXAIInputMessageType here:
+	// the 422 "untagged enum ModelInput" fix that upstream does not have.
 	body = stampXAIInputMessageType(body)
 	return body
 }
@@ -697,32 +700,6 @@ func stampXAIInputMessageType(body []byte) []byte {
 		}
 	}
 	return updated
-}
-
-// dropXAIToolChoiceWithoutTools removes tool_choice (and the now-meaningless
-// parallel_tool_calls) when no tools are present. xAI's /responses endpoint
-// rejects that combination with HTTP 400 "A tool_choice was set on the request
-// but no tools were specified." — clients like droid send tool_choice:"auto"
-// with no tools, which OpenAI tolerates but xAI does not. "none" is the one
-// tool_choice value that is meaningful without tools, so it is preserved.
-func dropXAIToolChoiceWithoutTools(body []byte) []byte {
-	toolChoice := gjson.GetBytes(body, "tool_choice")
-	if !toolChoice.Exists() {
-		return body
-	}
-	if toolChoice.Type == gjson.String && toolChoice.String() == "none" {
-		return body
-	}
-	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
-		return body
-	}
-	if updated, err := sjson.DeleteBytes(body, "tool_choice"); err == nil {
-		body = updated
-	}
-	if updated, err := sjson.DeleteBytes(body, "parallel_tool_calls"); err == nil {
-		body = updated
-	}
-	return body
 }
 
 func normalizeXAITools(body []byte) []byte {
@@ -778,6 +755,28 @@ func normalizeXAITools(body []byte) []byte {
 		return body
 	}
 	return updated
+}
+
+// normalizeXAIToolChoiceForTools drops tool_choice and parallel_tool_calls
+// when tools are absent or empty (including after normalizeXAITools filtering).
+// xAI rejects payloads that include tool_choice without any tools defined.
+// Existence checks avoid unnecessary sjson parse/copy passes.
+func normalizeXAIToolChoiceForTools(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	hasTools := tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
+	if hasTools {
+		return body
+	}
+	if tools.Exists() {
+		body, _ = sjson.DeleteBytes(body, "tools")
+	}
+	if gjson.GetBytes(body, "tool_choice").Exists() {
+		body, _ = sjson.DeleteBytes(body, "tool_choice")
+	}
+	if gjson.GetBytes(body, "parallel_tool_calls").Exists() {
+		body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
+	}
+	return body
 }
 
 func normalizeXAITool(tool gjson.Result) ([]byte, bool, bool) {
