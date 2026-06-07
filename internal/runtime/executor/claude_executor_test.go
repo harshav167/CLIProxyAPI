@@ -2653,3 +2653,36 @@ func TestRestoreClaudeOAuthToolNamesFromStreamLine_MixedCaseWithPrefix(t *testin
 		t.Fatalf("Glob should be restored to glob, got: %s", string(out))
 	}
 }
+
+func TestParseClaudeRetryAfter(t *testing.T) {
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	// Non-429 → nil regardless of headers.
+	if got := parseClaudeRetryAfter(http.StatusBadRequest, http.Header{"Retry-After": {"60"}}, nil, now); got != nil {
+		t.Fatalf("non-429 should return nil, got %v", got)
+	}
+
+	// Standard Retry-After delta seconds.
+	if got := parseClaudeRetryAfter(http.StatusTooManyRequests, http.Header{"Retry-After": {"120"}}, nil, now); got == nil || *got != 120*time.Second {
+		t.Fatalf("Retry-After seconds = %v, want 120s", got)
+	}
+
+	// Anthropic unified reset header (epoch seconds ~5h out).
+	reset := now.Add(5 * time.Hour).Unix()
+	h2 := http.Header{"Anthropic-Ratelimit-Unified-Reset": {fmt.Sprintf("%d", reset)}}
+	got := parseClaudeRetryAfter(http.StatusTooManyRequests, h2, nil, now)
+	if got == nil || *got < 4*time.Hour+59*time.Minute || *got > 5*time.Hour {
+		t.Fatalf("unified-reset = %v, want ~5h", got)
+	}
+
+	// Body resets_in_seconds fallback when no headers.
+	body := []byte(`{"error":{"type":"rate_limit_error","resets_in_seconds":3600}}`)
+	if got := parseClaudeRetryAfter(http.StatusTooManyRequests, nil, body, now); got == nil || *got != time.Hour {
+		t.Fatalf("body resets_in_seconds = %v, want 1h", got)
+	}
+
+	// 429 with no hints → nil (conductor uses default backoff).
+	if got := parseClaudeRetryAfter(http.StatusTooManyRequests, http.Header{}, []byte(`{}`), now); got != nil {
+		t.Fatalf("429 with no hints should return nil, got %v", got)
+	}
+}

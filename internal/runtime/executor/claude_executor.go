@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"time"
 
@@ -323,7 +324,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: parseClaudeRetryAfter(httpResp.StatusCode, httpResp.Header, b, time.Now())}
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
@@ -454,7 +455,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: parseClaudeRetryAfter(httpResp.StatusCode, httpResp.Header, b, time.Now())}
 		return nil, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -1686,4 +1687,54 @@ func logClaudeUsageFromLine(model string, line []byte) {
 		return
 	}
 	helps.LogClaudeCacheUsage(model, usageNode)
+}
+
+// parseClaudeRetryAfter extracts a retry-after duration from an Anthropic 429
+// response so the conductor can cool the credential until its real reset window
+// (e.g. the 5-hour subscription cap) instead of falling back to the generic
+// 1s..30m quota backoff. Sources, in priority order:
+//  1. The standard HTTP "Retry-After" header (delta seconds or HTTP-date).
+//  2. Anthropic's "anthropic-ratelimit-unified-reset" header (epoch seconds).
+//  3. The error body's "error.resets_at" (epoch) / "error.resets_in_seconds".
+//
+// Returns nil when the status is not 429 or no hint is present, in which case
+// the conductor's default backoff applies.
+func parseClaudeRetryAfter(statusCode int, header http.Header, body []byte, now time.Time) *time.Duration {
+	if statusCode != http.StatusTooManyRequests {
+		return nil
+	}
+	if header != nil {
+		if raw := strings.TrimSpace(header.Get("Retry-After")); raw != "" {
+			if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+				d := time.Duration(secs) * time.Second
+				return &d
+			}
+			if when, err := http.ParseTime(raw); err == nil {
+				if d := when.Sub(now); d > 0 {
+					return &d
+				}
+			}
+		}
+		for _, key := range []string{"Anthropic-Ratelimit-Unified-Reset", "Anthropic-Ratelimit-Unified-5h-Reset"} {
+			if raw := strings.TrimSpace(header.Get(key)); raw != "" {
+				if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil && epoch > 0 {
+					if d := time.Unix(epoch, 0).Sub(now); d > 0 {
+						return &d
+					}
+				}
+			}
+		}
+	}
+	if len(body) > 0 {
+		if resetsAt := gjson.GetBytes(body, "error.resets_at").Int(); resetsAt > 0 {
+			if d := time.Unix(resetsAt, 0).Sub(now); d > 0 {
+				return &d
+			}
+		}
+		if resetsIn := gjson.GetBytes(body, "error.resets_in_seconds").Int(); resetsIn > 0 {
+			d := time.Duration(resetsIn) * time.Second
+			return &d
+		}
+	}
+	return nil
 }
