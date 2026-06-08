@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,7 @@ type proxyMetrics struct {
 	cacheReadTokens     metric.Int64Counter
 	cacheCreationTokens metric.Int64Counter
 	quotaUtilization    metric.Float64Gauge
+	quotaBurned         metric.Float64Counter
 	activeRequests      metric.Int64UpDownCounter
 	activeStreams       metric.Int64UpDownCounter
 	wsConnections       metric.Int64Counter
@@ -35,6 +37,16 @@ type proxyMetrics struct {
 }
 
 var metrics atomic.Pointer[proxyMetrics]
+
+// quotaLastSeen tracks the last observed utilization per
+// provider|authID|window so RecordQuotaUtilization can derive the positive
+// delta (quota actually burned since the previous reading) and feed the
+// cliproxy.quota.burned counter. A drop in utilization means the limit window
+// reset, which contributes 0 burn rather than a negative delta.
+var (
+	quotaLastSeenMu sync.Mutex
+	quotaLastSeen   = map[string]float64{}
+)
 
 func setProxyMetrics(next proxyMetrics) {
 	metrics.Store(&next)
@@ -56,6 +68,7 @@ func newProxyMetrics() proxyMetrics {
 	cacheReadTokens, _ := meter.Int64Counter("cliproxy.tokens.cache_read", metric.WithDescription("Cache-read input tokens reported by upstream providers"))
 	cacheCreationTokens, _ := meter.Int64Counter("cliproxy.tokens.cache_creation", metric.WithDescription("Cache-creation input tokens reported by upstream providers"))
 	quotaUtilization, _ := meter.Float64Gauge("cliproxy.quota.utilization", metric.WithDescription("Provider-reported quota utilization (0.0-1.0) for a credential and limit window"))
+	quotaBurned, _ := meter.Float64Counter("cliproxy.quota.burned", metric.WithDescription("Cumulative quota fraction burned (sum of positive utilization deltas) per credential and window; pairs with token counters to compute a workload-invariant burn-per-token ratio"))
 	activeRequests, _ := meter.Int64UpDownCounter("cliproxy.http.server.active_requests", metric.WithDescription("Active inbound requests"))
 	activeStreams, _ := meter.Int64UpDownCounter("cliproxy.streams.active", metric.WithDescription("Active streaming or websocket requests"))
 	wsConnections, _ := meter.Int64Counter("cliproxy.websocket.connections", metric.WithDescription("Websocket connections"))
@@ -73,6 +86,7 @@ func newProxyMetrics() proxyMetrics {
 		cacheReadTokens:     cacheReadTokens,
 		cacheCreationTokens: cacheCreationTokens,
 		quotaUtilization:    quotaUtilization,
+		quotaBurned:         quotaBurned,
 		activeRequests:      activeRequests,
 		activeStreams:       activeStreams,
 		wsConnections:       wsConnections,
@@ -198,6 +212,36 @@ func RecordQuotaUtilization(ctx context.Context, provider, authIndex, authID, wi
 		attribute.String("cliproxy.quota_status", emptyDefault(status, "unknown")),
 	}
 	m.quotaUtilization.Record(ctx, utilization, metric.WithAttributes(attrs...))
+
+	// Derive the positive burn delta since the last reading for this exact
+	// credential+window and feed the cumulative burned counter. Pairing
+	// rate(cliproxy.quota.burned) with rate(cliproxy.tokens.*) yields the
+	// workload-invariant "quota burned per token" ratio: it stays flat while
+	// caching/routing are healthy and spikes when a request burns more quota
+	// per token than baseline.
+	if burned := quotaBurnDelta(provider, authID, window, utilization); burned > 0 {
+		m.quotaBurned.Add(ctx, burned, metric.WithAttributes(attrs...))
+	}
+}
+
+// quotaBurnDelta returns how much quota fraction was burned since the previous
+// reading for a credential+window. A non-increasing reading (window reset or
+// noise) returns 0 so the burned counter never goes backward.
+func quotaBurnDelta(provider, authID, window string, utilization float64) float64 {
+	key := provider + "|" + authID + "|" + window
+	quotaLastSeenMu.Lock()
+	defer quotaLastSeenMu.Unlock()
+	prev, seen := quotaLastSeen[key]
+	quotaLastSeen[key] = utilization
+	if !seen {
+		// First reading establishes the baseline; do not retroactively count
+		// the whole utilization as burned in this interval.
+		return 0
+	}
+	if delta := utilization - prev; delta > 0 {
+		return delta
+	}
+	return 0
 }
 
 // RecordQuotaFromHeaders extracts provider-reported quota utilization from an

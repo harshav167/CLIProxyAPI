@@ -50,6 +50,39 @@ func TestParseQuotaSamplesCodexNormalizesPercent(t *testing.T) {
 	}
 }
 
+func TestQuotaBurnDelta(t *testing.T) {
+	// Isolate global state for this credential+window key.
+	quotaLastSeenMu.Lock()
+	delete(quotaLastSeen, "claude|acct-1|5h")
+	quotaLastSeenMu.Unlock()
+
+	// First reading establishes baseline → 0 burn (don't count history).
+	if got := quotaBurnDelta("claude", "acct-1", "5h", 0.50); got != 0 {
+		t.Fatalf("first reading should burn 0, got %v", got)
+	}
+	// Increase → positive delta.
+	if got := quotaBurnDelta("claude", "acct-1", "5h", 0.57); got < 0.0699 || got > 0.0701 {
+		t.Fatalf("0.50->0.57 should burn ~0.07, got %v", got)
+	}
+	// No change → 0.
+	if got := quotaBurnDelta("claude", "acct-1", "5h", 0.57); got != 0 {
+		t.Fatalf("no change should burn 0, got %v", got)
+	}
+	// Window reset (drop) → 0, not negative.
+	if got := quotaBurnDelta("claude", "acct-1", "5h", 0.02); got != 0 {
+		t.Fatalf("reset/drop should burn 0, got %v", got)
+	}
+	// Next increase after reset counts from the new baseline.
+	if got := quotaBurnDelta("claude", "acct-1", "5h", 0.10); got < 0.0799 || got > 0.0801 {
+		t.Fatalf("0.02->0.10 should burn ~0.08, got %v", got)
+	}
+
+	// Separate credential/window keys are independent.
+	if got := quotaBurnDelta("codex", "acct-2", "primary", 0.16); got != 0 {
+		t.Fatalf("independent key first reading should burn 0, got %v", got)
+	}
+}
+
 func TestParseQuotaSamplesIgnoresGarbageAndUnknownProviders(t *testing.T) {
 	// Out-of-range / unparseable Anthropic values yield no samples.
 	h := http.Header{}
