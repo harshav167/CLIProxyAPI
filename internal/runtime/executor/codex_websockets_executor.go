@@ -23,6 +23,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/observability"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -2445,6 +2446,12 @@ func (e *CodexAutoExecutor) wrapBridgedStreamForCapture(sessionKey, model, authI
 		if primary != "" || secondary != "" {
 			log.Infof("codex http-ws bridge: quota session=%s primary_used=%s%% weekly_used=%s%%", sessionKey, primary, secondary)
 		}
+		// Emit the quota utilization gauge so the WS-bridged Codex path feeds the
+		// same cliproxy.quota.utilization series as the HTTP path. ctx is not in
+		// this function's signature; the gauge attributes carry full identity, so
+		// a background context is sufficient for the OTel SDK. authIndex is not in
+		// scope here; authID identifies the credential.
+		observability.RecordQuotaFromHeaders(context.Background(), e.Identifier(), "", authID, result.Headers)
 	}
 
 	wrappedCh := make(chan cliproxyexecutor.StreamChunk)

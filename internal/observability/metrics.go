@@ -3,6 +3,7 @@ package observability
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,7 @@ type proxyMetrics struct {
 	totalTokens         metric.Int64Counter
 	cacheReadTokens     metric.Int64Counter
 	cacheCreationTokens metric.Int64Counter
+	quotaUtilization    metric.Float64Gauge
 	activeRequests      metric.Int64UpDownCounter
 	activeStreams       metric.Int64UpDownCounter
 	wsConnections       metric.Int64Counter
@@ -53,6 +55,7 @@ func newProxyMetrics() proxyMetrics {
 	totalTokens, _ := meter.Int64Counter("cliproxy.tokens.total", metric.WithDescription("Total tokens reported by upstream providers"))
 	cacheReadTokens, _ := meter.Int64Counter("cliproxy.tokens.cache_read", metric.WithDescription("Cache-read input tokens reported by upstream providers"))
 	cacheCreationTokens, _ := meter.Int64Counter("cliproxy.tokens.cache_creation", metric.WithDescription("Cache-creation input tokens reported by upstream providers"))
+	quotaUtilization, _ := meter.Float64Gauge("cliproxy.quota.utilization", metric.WithDescription("Provider-reported quota utilization (0.0-1.0) for a credential and limit window"))
 	activeRequests, _ := meter.Int64UpDownCounter("cliproxy.http.server.active_requests", metric.WithDescription("Active inbound requests"))
 	activeStreams, _ := meter.Int64UpDownCounter("cliproxy.streams.active", metric.WithDescription("Active streaming or websocket requests"))
 	wsConnections, _ := meter.Int64Counter("cliproxy.websocket.connections", metric.WithDescription("Websocket connections"))
@@ -69,6 +72,7 @@ func newProxyMetrics() proxyMetrics {
 		totalTokens:         totalTokens,
 		cacheReadTokens:     cacheReadTokens,
 		cacheCreationTokens: cacheCreationTokens,
+		quotaUtilization:    quotaUtilization,
 		activeRequests:      activeRequests,
 		activeStreams:       activeStreams,
 		wsConnections:       wsConnections,
@@ -163,6 +167,112 @@ func RecordUsage(ctx context.Context, record coreusage.Record) {
 	if record.Detail.CacheCreationTokens > 0 {
 		m.cacheCreationTokens.Add(ctx, record.Detail.CacheCreationTokens, metric.WithAttributes(attrs...))
 	}
+}
+
+// RecordQuotaUtilization emits the provider-reported quota utilization gauge
+// (0.0-1.0) for a single credential and limit window. provider is the upstream
+// identifier (e.g. "claude", "codex"); authIndex/authID identify the credential
+// so per-account burn can be tracked; window is the limit window the value
+// applies to (e.g. "5h", "7d", "primary", "weekly"); status is the
+// provider-reported limiter status (e.g. "allowed"), empty when unknown.
+//
+// Utilization is a point-in-time level, so it is modeled as a gauge: each call
+// overwrites the last value for the matching attribute set. Values outside
+// [0,1] are ignored to avoid polluting the series with parse garbage.
+func RecordQuotaUtilization(ctx context.Context, provider, authIndex, authID, window, status string, utilization float64) {
+	if !Enabled() {
+		return
+	}
+	m := currentMetrics()
+	if m == nil {
+		return
+	}
+	if utilization < 0 || utilization > 1 {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("cliproxy.provider", emptyDefault(provider, "unknown")),
+		attribute.String("cliproxy.auth_index", emptyDefault(authIndex, "unknown")),
+		attribute.String("cliproxy.auth_id", emptyDefault(authID, "unknown")),
+		attribute.String("cliproxy.quota_window", emptyDefault(window, "unknown")),
+		attribute.String("cliproxy.quota_status", emptyDefault(status, "unknown")),
+	}
+	m.quotaUtilization.Record(ctx, utilization, metric.WithAttributes(attrs...))
+}
+
+// RecordQuotaFromHeaders extracts provider-reported quota utilization from an
+// upstream response's headers and emits the gauge for each window it finds.
+// It is a no-op when observability is disabled, headers is nil, or the provider
+// does not expose a continuous utilization signal. Currently supported:
+//
+//   - claude: Anthropic-Ratelimit-Unified-{5h,7d}-Utilization (0.0-1.0) plus the
+//     matching -Status header.
+//   - codex:  x-codex-primary-used-percent and
+//     x-codex-secondary-primary-used-percent (0-100, normalized to 0.0-1.0).
+//
+// Other providers (xai, antigravity, gemini) do not expose a clean continuous
+// utilization header and are intentionally skipped.
+func RecordQuotaFromHeaders(ctx context.Context, provider, authIndex, authID string, headers http.Header) {
+	if !Enabled() || headers == nil {
+		return
+	}
+	for _, sample := range parseQuotaSamples(provider, headers) {
+		RecordQuotaUtilization(ctx, provider, authIndex, authID, sample.window, sample.status, sample.utilization)
+	}
+}
+
+// quotaSample is one parsed (window, utilization, status) reading extracted from
+// an upstream response's headers.
+type quotaSample struct {
+	window      string
+	utilization float64
+	status      string
+}
+
+// parseQuotaSamples extracts provider-reported quota utilization readings from
+// response headers. It is pure (no metric side effects) so it can be unit
+// tested independently of the OTel pipeline. Unknown providers and unparseable
+// values yield no samples.
+func parseQuotaSamples(provider string, headers http.Header) []quotaSample {
+	if headers == nil {
+		return nil
+	}
+	var samples []quotaSample
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude", "anthropic":
+		for _, window := range []string{"5h", "7d"} {
+			raw := strings.TrimSpace(headers.Get("Anthropic-Ratelimit-Unified-" + window + "-Utilization"))
+			if raw == "" {
+				continue
+			}
+			value, err := strconv.ParseFloat(raw, 64)
+			if err != nil || value < 0 || value > 1 {
+				continue
+			}
+			status := strings.TrimSpace(headers.Get("Anthropic-Ratelimit-Unified-" + window + "-Status"))
+			samples = append(samples, quotaSample{window: window, utilization: value, status: status})
+		}
+	case "codex", "openai":
+		// Codex reports used-percent on a 0-100 scale; normalize to 0.0-1.0 to
+		// match the Anthropic utilization convention so both providers share one
+		// gauge series.
+		codexWindows := []struct{ window, header string }{
+			{"primary", "x-codex-primary-used-percent"},
+			{"weekly", "x-codex-secondary-primary-used-percent"},
+		}
+		for _, w := range codexWindows {
+			raw := strings.TrimSpace(headers.Get(w.header))
+			if raw == "" {
+				continue
+			}
+			percent, err := strconv.ParseFloat(raw, 64)
+			if err != nil || percent < 0 || percent > 100 {
+				continue
+			}
+			samples = append(samples, quotaSample{window: w.window, utilization: percent / 100.0})
+		}
+	}
+	return samples
 }
 
 func RecordWebsocketConnect(ctx context.Context, provider string) {

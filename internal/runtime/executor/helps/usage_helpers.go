@@ -324,6 +324,17 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	}
 }
 
+// RecordQuota emits the provider-reported quota utilization gauge from an
+// upstream response's headers, tagged with this reporter's provider/auth
+// identity. Safe to call on every response; it no-ops when the provider does
+// not expose a continuous utilization header.
+func (r *UsageReporter) RecordQuota(ctx context.Context, headers http.Header) {
+	if r == nil {
+		return
+	}
+	observability.RecordQuotaFromHeaders(ctx, r.provider, r.authIndex, r.authID, headers)
+}
+
 func (r *UsageReporter) observabilityAttributes() observability.UpstreamAttributes {
 	if r == nil {
 		return observability.UpstreamAttributes{}
