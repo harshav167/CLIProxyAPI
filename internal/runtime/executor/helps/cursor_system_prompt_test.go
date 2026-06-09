@@ -108,9 +108,20 @@ func TestApplyCursorGPTSystemPromptUpgrade(t *testing.T) {
 		"Do not treat \"how would you implement\", \"proposal\", \"recommend\", \"bridge the gap\", or \"optimize\" as permission to edit.",
 		"Use this mode only when the user has authorized concrete edits or the requested outcome necessarily requires code changes now.",
 		"If the request contains both review/comparison language and broad implementation language, do not edit unless the implementation target is concrete and unambiguous.",
+		"Before any tool use, pin three things:",
+		"Attached files, transcripts, logs, screenshots, canvases, reports, or repositories are evidence sources unless the user explicitly names them as the work target.",
+		"Do not switch the work target to a project, file, repo, or codebase that is merely mentioned inside evidence.",
+		"A plan, option menu, checklist, or task list that you generated yourself does not expand the user's original authorization.",
+		"If the user corrects the scope, asks what they asked for, or says you are working on the wrong target, stop executing immediately",
 		"<execution_integrity_contract>",
 		"The highest-priority behavioral failure mode to avoid is optimizing for local signs of progress",
 		"those structures exist to serve the user's goal; they do not become the goal",
+		"<task_target_boundary>",
+		"Do not confuse evidence with target.",
+		"A transcript about project A can be evidence for fixing prompt layer B",
+		"If the user asks for a failure analysis, audit, report, prompt rewrite, or system-instruction proposal, the deliverable is that analysis/proposal",
+		"<assistant_generated_choice_rule>",
+		"Do not use your own option menu, plan, checklist, or suggested next step to expand scope.",
 		"Your todo list is never the contract.",
 		"Do not silently substitute weaker verification for stronger required verification.",
 		"Before stating a blocker, root cause, or environment explanation as fact, verify it",
@@ -118,12 +129,19 @@ func TestApplyCursorGPTSystemPromptUpgrade(t *testing.T) {
 		"A subsystem proof does not satisfy an integrated-system task",
 		"do not satisfy it by creating a parallel replacement path unless replacement is explicitly authorized",
 		"If the user asks a question, answer the question first.",
+		"<correction_reset_rule>",
+		"If the user says or implies that you are doing the wrong task",
+		"do not resume the prior plan, subagents, implementation, or edits;",
+		"<subagent_cost_discipline>",
+		"Do not launch subagents to rediscover findings already present",
 		"Distinguish clearly between locally complete, externally blocked, and globally complete.",
 		"Do not switch to Plan merely because an implementation task is large",
 		"Do not revert them. If they are unrelated to your task, ignore them and continue.",
 		"Your main goal is to satisfy the USER's requested outcome",
 		"If the user uses broad directional implementation language without a concrete target, the deliverable is a proposal, not a patch.",
 		"Do not convert a review/proposal request into implementation just because a safe edit is possible.",
+		"Attached files, transcripts, logs, screenshots, canvases, reports, or referenced repositories are evidence sources unless the user explicitly names them as the work target.",
+		"if the user asks to fix prompt/system instructions using a transcript as evidence, work on the prompt/system-instruction layer",
 		"Do not announce that you will edit, patch, refactor, or implement unless the user requested concrete edits.",
 		"Do not send repeated updates while merely thinking.",
 	} {
@@ -211,6 +229,9 @@ func TestRewriteCursorSystemPromptIdentityAndIntegrity(t *testing.T) {
 		"You operate in Claude Code.",
 		"<execution_integrity_contract>",
 		"Your todo list is never the contract.",
+		"<task_target_boundary>",
+		"Do not confuse evidence with target.",
+		"<correction_reset_rule>",
 		"</execution_integrity_contract>\n\n<mcp_file_system>",
 	} {
 		if !strings.Contains(out, want) {
@@ -224,5 +245,44 @@ func TestRewriteCursorSystemPromptIdentityAndIntegrity(t *testing.T) {
 	}
 	if strings.Count(again, "<execution_integrity_contract>") != 1 {
 		t.Fatalf("integrity contract should not duplicate:\n%s", again)
+	}
+}
+
+func TestCursorIntegrityContractContainsTranscriptScopeGuards(t *testing.T) {
+	input := strings.Join([]string{
+		"<task_management>",
+		"You have access to the todo_write tool.",
+		"</task_management>",
+		"",
+		"<mcp_file_system>",
+		"Tool instructions.",
+		"</mcp_file_system>",
+	}, "\n")
+
+	out, changed := ApplyCursorExecutionIntegrityContract(input)
+	if !changed {
+		t.Fatal("expected execution integrity contract insertion")
+	}
+
+	for _, want := range []string{
+		"<task_target_boundary>",
+		"requested deliverable: what the user actually asked to receive;",
+		"target: the system, repository, file, prompt layer, API, document, or artifact the user asked you to inspect or modify;",
+		"evidence: transcripts, logs, screenshots, canvases, reports, repos, files, or prior conversations supplied to explain the problem;",
+		"non-targets: systems or repos mentioned inside evidence but not named as the work target.",
+		"Do not confuse evidence with target.",
+		"A transcript about project A can be evidence for fixing prompt layer B",
+		"If the user asks for a failure analysis, audit, report, prompt rewrite, or system-instruction proposal, the deliverable is that analysis/proposal",
+		"<assistant_generated_choice_rule>",
+		"Do not use your own option menu, plan, checklist, or suggested next step to expand scope.",
+		"<correction_reset_rule>",
+		"If the user says or implies that you are doing the wrong task",
+		"do not resume the prior plan, subagents, implementation, or edits;",
+		"<subagent_cost_discipline>",
+		"Do not launch subagents to rediscover findings already present",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("integrity contract missing transcript/scope guard %q:\n%s", want, out)
+		}
 	}
 }
