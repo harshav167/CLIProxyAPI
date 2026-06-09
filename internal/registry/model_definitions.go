@@ -12,6 +12,7 @@ const (
 	xaiBuiltinImageQualityModelID   = "grok-imagine-image-quality"
 	xaiBuiltinVideoModelID          = "grok-imagine-video"
 	xaiBuiltinVideo15PreviewModelID = "grok-imagine-video-1.5-preview"
+	xaiBuiltinComposerModelID       = "grok-composer-2.5-fast"
 )
 
 // staticModelsJSON mirrors the top-level structure of models.json.
@@ -98,9 +99,11 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 }
 
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
-// not depend on remote models.json updates.
+// not depend on remote models.json updates. It also overrides grok-composer-2.5-fast
+// so its advertised context/output window stays correct even when the remote
+// models.json source reports stale values.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
+	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiBuiltinComposerModelInfo())
 }
 
 func codexBuiltinImageModelInfo() *ModelInfo {
@@ -164,6 +167,29 @@ func xaiBuiltinVideo15PreviewModelInfo() *ModelInfo {
 		DisplayName: "Grok Imagine Video 1.5 Preview",
 		Name:        xaiBuiltinVideo15PreviewModelID,
 		Description: "xAI Grok preview video generation model.",
+	}
+}
+
+// xaiBuiltinComposerModelInfo overrides grok-composer-2.5-fast with xAI's
+// advertised 256k context / 256k output window. The remote models.json source
+// (router-for-me/models) reports a stale 128k/32k window, which the 3-hourly
+// updater would otherwise propagate; defining it as a built-in keeps the
+// registry truthful regardless of the remote feed.
+func xaiBuiltinComposerModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  xaiBuiltinComposerModelID,
+		Object:              "model",
+		Created:             1740960000, // 2026-06-01 announcement
+		OwnedBy:             "xai",
+		Type:                "xai",
+		DisplayName:         "Composer 2.5 Fast",
+		Name:                xaiBuiltinComposerModelID,
+		Description:         "xAI Composer 2.5 Fast model for the Responses API.",
+		ContextLength:       256000,
+		MaxCompletionTokens: 256000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high"},
+		},
 	}
 }
 
