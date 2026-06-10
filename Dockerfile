@@ -1,8 +1,6 @@
-FROM golang:1.26-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential git && rm -rf /var/lib/apt/lists/*
 
 COPY go.mod go.sum ./
 
@@ -17,13 +15,20 @@ ARG BUILD_DATE=unknown
 # cross-targeting via GOARCH avoids QEMU-emulating the whole Go build (which is
 # ~5-10x slower); the binary is static (CGO_ENABLED=0) so no cross toolchain is
 # needed.
+#
+# Note on plugin host: internal/pluginhost has cgo loader files (host_callbacks_unix.go,
+# loader_unix.go) gated `//go:build cgo && (linux || darwin || freebsd)` with a
+# parallel no-op loader_unsupported.go used when cgo is off. Building with CGO=0
+# trades runtime .so plugin loading for a static, fast cross-compile — we do not
+# use plugins, so this is the right tradeoff.
+
 ARG TARGETARCH
 
-RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
-FROM debian:bookworm
+FROM alpine:3.23
 
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache tzdata ca-certificates
 
 RUN mkdir /CLIProxyAPI
 
