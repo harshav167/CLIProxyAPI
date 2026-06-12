@@ -185,6 +185,16 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 		return prepared, err
 	}
 
+	// Cursor Fable 5 alias path: when Cursor sends a non-claude-prefixed alias
+	// (f5-*), it skips its ZDR routing gate but also sends a generic custom-model
+	// system prompt + tool set instead of the rich Cursor→Anthropic shape it
+	// uses for real claude-* models. Swap both with a captured snapshot of a
+	// real prod Cursor→Anthropic claude-* request so the upstream Fable 5 call
+	// still sees Cursor's native tools and Cursor's Claude-flavour system
+	// blocks. The model field has already been resolved to the backing
+	// claude-fable-5 model upstream of here, so we key off the inbound req.Model.
+	body = helps.ApplyCursorFableAliasSnapshot(body, req.Model)
+
 	body = applyCloaking(ctx, e.cfg, auth, body, prepared.baseModel, prepared.apiKey)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)

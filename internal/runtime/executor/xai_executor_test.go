@@ -685,6 +685,153 @@ func TestStampXAIInputMessageType(t *testing.T) {
 	}
 }
 
+func TestRewriteOrphanXAICustomToolCalls(t *testing.T) {
+	// Real droid + grok-composer multi-turn shape that triggers the prod 422.
+	// apply_patch is the only orphan: it was stripped from tools by
+	// normalizeXAITool, leaving the prior custom_tool_call + output as orphans.
+	// custom_lookup stays declared as a custom tool, so its history should be
+	// left alone.
+	body := []byte(`{` +
+		`"input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},` +
+		`{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"},` +
+		`{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"applied"}]},` +
+		`{"type":"custom_tool_call","call_id":"c2","name":"custom_lookup","input":"{\"q\":\"x\"}"},` +
+		`{"type":"custom_tool_call_output","call_id":"c2","output":"hit"}` +
+		`],` +
+		`"tools":[` +
+		`{"type":"custom","name":"custom_lookup"},` +
+		`{"type":"function","name":"read_file"}` +
+		`]}`)
+
+	got := rewriteOrphanXAICustomToolCalls(body)
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 5 {
+		t.Fatalf("input length = %d, want 5", len(input))
+	}
+
+	// [1] orphan custom_tool_call -> function_call with arguments wrapped as
+	// a JSON object so xAI's strict deserialiser accepts it.
+	if got, want := input[1].Get("type").String(), "function_call"; got != want {
+		t.Fatalf("input[1] type = %q, want %q", got, want)
+	}
+	args := input[1].Get("arguments")
+	if !args.Exists() || args.Type != gjson.String {
+		t.Fatalf("input[1] arguments missing or not a string: %s", input[1].Raw)
+	}
+	if got, want := args.String(), `{"input":"*** Begin Patch"}`; got != want {
+		t.Fatalf("input[1] arguments = %q, want %q (wrapped JSON object)", got, want)
+	}
+	if input[1].Get("input").Exists() {
+		t.Fatalf("input[1] still has custom-style input: %s", input[1].Raw)
+	}
+
+	// [2] orphan custom_tool_call_output -> function_call_output with flattened string output.
+	if got, want := input[2].Get("type").String(), "function_call_output"; got != want {
+		t.Fatalf("input[2] type = %q, want %q", got, want)
+	}
+	if got, want := input[2].Get("output").String(), "applied"; got != want {
+		t.Fatalf("input[2] output = %q, want %q", got, want)
+	}
+
+	// [3] custom_lookup still declared as a custom tool -> kept as custom_tool_call.
+	if got, want := input[3].Get("type").String(), "custom_tool_call"; got != want {
+		t.Fatalf("input[3] type = %q, want %q (custom tool still declared)", got, want)
+	}
+	// [4] same: keep the output as-is since its sibling call remains custom.
+	if got, want := input[4].Get("type").String(), "custom_tool_call_output"; got != want {
+		t.Fatalf("input[4] type = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteOrphanXAICustomToolCalls_NoToolsArray(t *testing.T) {
+	// When the tools array is missing entirely (e.g. apply_patch was the only
+	// custom tool and tool_choice/parallel_tool_calls scrubbing removed
+	// everything), all custom_tool_call entries become orphans and must be
+	// rewritten.
+	body := []byte(`{"input":[` +
+		`{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"diff"},` +
+		`{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"ok"}]}` +
+		`]}`)
+	got := rewriteOrphanXAICustomToolCalls(body)
+	input := gjson.GetBytes(got, "input").Array()
+	if got, want := input[0].Get("type").String(), "function_call"; got != want {
+		t.Fatalf("input[0] type = %q, want %q", got, want)
+	}
+	if got, want := input[1].Get("type").String(), "function_call_output"; got != want {
+		t.Fatalf("input[1] type = %q, want %q", got, want)
+	}
+	if got, want := input[1].Get("output").String(), "ok"; got != want {
+		t.Fatalf("input[1] output = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeXAIResponsesBodyRewritesOrphanApplyPatchHistory(t *testing.T) {
+	// Reproduces the prod 422: client (droid) sends an apply_patch custom tool
+	// plus its prior custom_tool_call / custom_tool_call_output history. The
+	// full sanitize pipeline must (a) drop apply_patch from tools (handled
+	// elsewhere; this test seeds an empty tools array as if it already ran)
+	// and (b) rewrite the history items to function_call / function_call_output.
+	body := []byte(`{` +
+		`"input":[` +
+		`{"role":"user","content":[{"type":"input_text","text":"go"}]},` +
+		`{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"diff"},` +
+		`{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"ok"}]}` +
+		`],` +
+		`"tools":[]}`)
+	got := sanitizeXAIResponsesBody(body, "grok-composer-2.5-fast")
+	input := gjson.GetBytes(got, "input").Array()
+	if got, want := input[1].Get("type").String(), "function_call"; got != want {
+		t.Fatalf("input[1] type = %q, want %q (full sanitize)", got, want)
+	}
+	if got, want := input[2].Get("type").String(), "function_call_output"; got != want {
+		t.Fatalf("input[2] type = %q, want %q (full sanitize)", got, want)
+	}
+	// And stampXAIInputMessageType must still run after the rewrite so the
+	// bare user item gains type:"message".
+	if got, want := input[0].Get("type").String(), "message"; got != want {
+		t.Fatalf("input[0] type = %q, want %q (stamp after rewrite)", got, want)
+	}
+}
+
+func TestNormalizeXAIFunctionCallArguments(t *testing.T) {
+	// Real droid shape that produces the prod 400: a prior interrupted
+	// ApplyPatch streamed with arguments still empty when the turn ended;
+	// xAI's /responses parser then rejects the whole batch with
+	// "expected JSON object for tool arguments".
+	body := []byte(`{"input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},` +
+		`{"type":"function_call","call_id":"c1","name":"ApplyPatch","arguments":""},` +
+		`{"type":"function_call","call_id":"c2","name":"Read","arguments":"{\"path\":\"/tmp/x\"}"},` +
+		`{"type":"function_call","call_id":"c3","name":"Bash","arguments":"ls"},` +
+		`{"type":"function_call","call_id":"c4","name":"Noop"}` +
+		`]}`)
+
+	got := normalizeXAIFunctionCallArguments(body)
+	input := gjson.GetBytes(got, "input").Array()
+
+	// [0] message item is untouched.
+	if input[0].Get("type").String() != "message" {
+		t.Fatalf("input[0] type changed unexpectedly: %s", input[0].Raw)
+	}
+	// [1] empty arguments -> "{}"
+	if got, want := input[1].Get("arguments").String(), "{}"; got != want {
+		t.Fatalf("input[1] arguments = %q, want %q (empty -> {})", got, want)
+	}
+	// [2] already valid JSON object -> left alone.
+	if got, want := input[2].Get("arguments").String(), `{"path":"/tmp/x"}`; got != want {
+		t.Fatalf("input[2] arguments = %q, want %q (valid JSON kept)", got, want)
+	}
+	// [3] non-JSON-object string -> normalised to "{}" to satisfy xAI.
+	if got, want := input[3].Get("arguments").String(), "{}"; got != want {
+		t.Fatalf("input[3] arguments = %q, want %q (non-JSON -> {})", got, want)
+	}
+	// [4] missing arguments key -> filled with "{}".
+	if got, want := input[4].Get("arguments").String(), "{}"; got != want {
+		t.Fatalf("input[4] arguments = %q, want %q (missing -> {})", got, want)
+	}
+}
+
 func TestNormalizeXAIToolChoiceForTools_DropsWhenToolsEmpty(t *testing.T) {
 	body := []byte(`{"model":"grok-4","tools":[],"tool_choice":"auto","parallel_tool_calls":true,"input":"hi"}`)
 	out := normalizeXAIToolChoiceForTools(body)

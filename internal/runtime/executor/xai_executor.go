@@ -666,10 +666,216 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 		body, _ = sjson.DeleteBytes(body, "reasoning")
 	}
 	// tool_choice-without-tools is handled upstream by normalizeXAIToolChoiceForTools
-	// (called in prepareResponsesRequest). We keep stampXAIInputMessageType here:
-	// the 422 "untagged enum ModelInput" fix that upstream does not have.
+	// (called in prepareResponsesRequest). The remaining normalisers here fix 4xx
+	// cases that upstream does not handle:
+	//  - rewriteOrphanXAICustomToolCalls: 422 "untagged enum ModelInput" for
+	//    custom_tool_call history items whose tool is no longer declared.
+	//  - normalizeXAIFunctionCallArguments: 400 "expected JSON object for tool
+	//    arguments" for function_call items whose arguments are empty or not a
+	//    JSON object string (OpenAI accepts this; xAI rejects it).
+	//  - stampXAIInputMessageType: 422 "untagged enum ModelInput" for bare
+	//    role-bearing items emitted by clients like droid.
+	body = rewriteOrphanXAICustomToolCalls(body)
+	body = normalizeXAIFunctionCallArguments(body)
 	body = stampXAIInputMessageType(body)
 	return body
+}
+
+// normalizeXAIFunctionCallArguments coerces function_call.arguments into the
+// stringified-JSON-object form that xAI's /responses endpoint requires. xAI
+// returns HTTP 400 "expected JSON object for tool arguments" when arguments is
+// missing, an empty string, or any string that does not deserialise into a JSON
+// object (e.g. raw text, "null", numeric strings). OpenAI's parser is lenient
+// here and treats those as "{}", which is why clients like droid sometimes
+// emit empty arguments after an interrupted streaming tool call and never see
+// the problem against OpenAI.
+//
+// This runs after rewriteOrphanXAICustomToolCalls so converted function_call
+// items inherit the same normalisation.
+func normalizeXAIFunctionCallArguments(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+	updated := body
+	for i, item := range input.Array() {
+		if item.Get("type").String() != "function_call" {
+			continue
+		}
+		args := item.Get("arguments")
+		if args.Exists() && args.Type == gjson.String && looksLikeJSONObject(args.String()) {
+			continue
+		}
+		next, err := sjson.SetBytes(updated, fmt.Sprintf("input.%d.arguments", i), "{}")
+		if err == nil {
+			updated = next
+		}
+	}
+	return updated
+}
+
+// looksLikeJSONObject returns true when s is a JSON-encoded object. It does the
+// cheap structural check first to avoid parsing every tool call.
+func looksLikeJSONObject(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return false
+	}
+	var probe map[string]json.RawMessage
+	return json.Unmarshal([]byte(trimmed), &probe) == nil
+}
+
+// rewriteOrphanXAICustomToolCalls converts custom_tool_call / custom_tool_call_output
+// history items that no longer have a matching custom tool declaration into the
+// equivalent function_call / function_call_output form. xAI's /responses ModelInput
+// enum recognises custom_tool_call only when a custom tool by that name is
+// declared in the request's tools array; without that pairing the deserializer
+// errors out with HTTP 422 "untagged enum ModelInput".
+//
+// Two paths produce orphans for xAI:
+//  1. normalizeXAITool drops apply_patch entirely from tools but the model still
+//     emits past custom_tool_call apply_patch entries in `input`.
+//  2. normalizeXAITool rewrites a custom tool's type to function (preserving the
+//     name) so any prior custom_tool_call against that name is no longer matched
+//     by the custom variant of ModelInput.
+//
+// In both cases function_call/function_call_output with the same call_id is a
+// valid ModelInput variant that xAI accepts, even when the named tool is not
+// currently in `tools`. We also flatten function_call_output.output from the
+// array form Codex uses ([{type:"input_text",text:"..."}]) into the string
+// form xAI's deserializer expects.
+func rewriteOrphanXAICustomToolCalls(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+
+	customToolNames := make(map[string]struct{})
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if tool.Get("type").String() != xaiCustomToolType {
+				continue
+			}
+			name := strings.TrimSpace(tool.Get("name").String())
+			if name == "" {
+				continue
+			}
+			customToolNames[name] = struct{}{}
+		}
+	}
+
+	orphanCallIDs := make(map[string]struct{})
+	updated := body
+	for i, item := range input.Array() {
+		if item.Get("type").String() != "custom_tool_call" {
+			continue
+		}
+		name := strings.TrimSpace(item.Get("name").String())
+		if _, declared := customToolNames[name]; declared {
+			continue
+		}
+		next, ok := convertXAICustomToolCallToFunctionCall(updated, i, item)
+		if !ok {
+			continue
+		}
+		updated = next
+		if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+			orphanCallIDs[callID] = struct{}{}
+		}
+	}
+
+	for i, item := range gjson.GetBytes(updated, "input").Array() {
+		if item.Get("type").String() != "custom_tool_call_output" {
+			continue
+		}
+		callID := strings.TrimSpace(item.Get("call_id").String())
+		if _, orphan := orphanCallIDs[callID]; !orphan {
+			continue
+		}
+		next, ok := convertXAICustomToolCallOutputToFunctionCallOutput(updated, i, item)
+		if ok {
+			updated = next
+		}
+	}
+	return updated
+}
+
+// convertXAICustomToolCallToFunctionCall rewrites a single custom_tool_call entry
+// at input[idx] to a function_call. xAI requires function_call.arguments to be
+// a JSON-object-shaped string. Custom tools carry their payload as freeform
+// text under `input` (e.g. a unified diff for apply_patch), so we wrap that
+// text in {"input": "..."} when it is not already a JSON object string.
+// normalizeXAIFunctionCallArguments runs afterwards as a final guard.
+func convertXAICustomToolCallToFunctionCall(body []byte, idx int, item gjson.Result) ([]byte, bool) {
+	updated, err := sjson.SetBytes(body, fmt.Sprintf("input.%d.type", idx), "function_call")
+	if err != nil {
+		return body, false
+	}
+	args := item.Get("arguments")
+	if args.Exists() && args.Type == gjson.String && looksLikeJSONObject(args.String()) {
+		return updated, true
+	}
+
+	var payload string
+	if rawInput := item.Get("input"); rawInput.Exists() {
+		payload = rawInput.String()
+	} else if args.Exists() && args.Type == gjson.String {
+		payload = args.String()
+	}
+
+	if next, errDel := sjson.DeleteBytes(updated, fmt.Sprintf("input.%d.input", idx)); errDel == nil {
+		updated = next
+	}
+
+	encoded := "{}"
+	if strings.TrimSpace(payload) != "" {
+		wrapped := map[string]string{"input": payload}
+		if raw, errMarshal := json.Marshal(wrapped); errMarshal == nil {
+			encoded = string(raw)
+		}
+	}
+	next, errSet := sjson.SetBytes(updated, fmt.Sprintf("input.%d.arguments", idx), encoded)
+	if errSet == nil {
+		updated = next
+	}
+	return updated, true
+}
+
+// convertXAICustomToolCallOutputToFunctionCallOutput rewrites custom_tool_call_output
+// to function_call_output. xAI's function_call_output.output must be a string;
+// the Codex translator sometimes emits it as [{type:"input_text",text:"..."}],
+// which we collapse to the concatenated text.
+func convertXAICustomToolCallOutputToFunctionCallOutput(body []byte, idx int, item gjson.Result) ([]byte, bool) {
+	updated, err := sjson.SetBytes(body, fmt.Sprintf("input.%d.type", idx), "function_call_output")
+	if err != nil {
+		return body, false
+	}
+	output := item.Get("output")
+	if !output.Exists() {
+		return updated, true
+	}
+	if output.Type == gjson.String {
+		return updated, true
+	}
+	if !output.IsArray() {
+		return updated, true
+	}
+	var collected strings.Builder
+	for _, part := range output.Array() {
+		if text := part.Get("text"); text.Exists() {
+			collected.WriteString(text.String())
+			continue
+		}
+		if part.Type == gjson.String {
+			collected.WriteString(part.String())
+		}
+	}
+	next, errSet := sjson.SetBytes(updated, fmt.Sprintf("input.%d.output", idx), collected.String())
+	if errSet != nil {
+		return updated, true
+	}
+	return next, true
 }
 
 // stampXAIInputMessageType adds type:"message" to input items that carry a role
