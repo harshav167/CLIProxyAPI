@@ -385,3 +385,54 @@ and all Cursor BYOK Claude/Codex request handling.
 Verification anchored with GitNexus impact analysis (index re-built at HEAD
 `327b5fac`): `GetCursorModels` blast radius = LOW, 2 direct callers in the same
 file, 0 affected execution flows — confirming the removal is self-contained.
+
+## Upstream Sync — 2026-06-13 (34 commits)
+
+Branch: `sync/upstream-2026-06-13`. Merge-base `21387f5c`, upstream tip
+`94c5a7fd`, merge commit `7dad9253`. Divergence at start: 34 upstream / 53 fork.
+
+Incoming themes: plugin store (install-from-latest-release, unload/config
+preservation), htmlsanitize utilities, antigravity Claude-WebSearch →
+native googleSearch bridge, executor-registration refactor, translator
+stream-specific transforms + cache token aggregation + finish_reason
+correctness, CORS exposed-header fixes.
+
+Conflicts (6 files) and per-file decisions:
+
+- `internal/runtime/executor/claude_executor.go` (5 hunks) — re-applied. Kept
+  our `prepared.*` flow and the Fable alias hook
+  (`ApplyCursorFableAliasSnapshot` still runs after `thinking.ApplyThinking`,
+  before `applyCloaking`). Dropped upstream's re-inlined `from`/`to`/`body`
+  translation vars (unused in our architecture).
+- `internal/api/handlers/management/handler.go` — kept BOTH. Our `usageStats`
+  field/import + upstream's `pluginstore` import and plugin-store fields.
+- `internal/registry/model_definitions_test.go` — kept BOTH test funcs
+  (our grok-composer 256k override test + upstream's antigravity websearch test).
+- `internal/runtime/executor/codex_websockets_executor.go` — restructured.
+  Adopted upstream's `responseFormat` arg rename on `TranslateStream`; kept our
+  raw-fallback synth-error branch (`needsRawFallback` +
+  `synthesizeChatCompletionsErrorChunk`).
+- `internal/translator/gemini/openai/chat-completions/gemini_openai_response.go`
+  (4 hunks) — merged BOTH features. Our `ThoughtTextActive` sentinel-thought
+  routing coexists with upstream's `UpstreamFinishReason` + `SawToolCall`
+  final-chunk finish_reason logic. Streaming-func `hasFunctionCall` removed
+  (superseded by `SawToolCall`); non-stream `hasFunctionCall` untouched.
+- `gemini_openai_response_test.go` — kept BOTH (our 4 sentinel-thought tests +
+  upstream's `TestGeminiFinishReasonOnlyOnFinalChunk`).
+
+Upstream-intended deletions accepted (NOT fork features):
+- `examples/plugin/jshandler/*` — upstream `b6c22f2d` removed the JS handler.
+- `sdk/cliproxy/service_xai_executor_binding_test.go` — upstream `ca1f6271`
+  replaced it with `service_executor_registration_test.go` (which still covers
+  `xai`); our XAIExecutor registration in `service.go` and the 20
+  `xai_executor_test.go` unit tests are intact.
+
+Dockerfile: no conflict this round — alpine + CGO_ENABLED=0 cross-compile
+retained as-is (upstream did not touch it).
+
+Verification: `gofmt -w .` clean; `go build ./cmd/server` clean; `go test ./...`
+green (68 packages, 0 fail), including the two hand-merged packages
+(`translator/gemini/openai/chat-completions`, `handlers/management`).
+
+Pending: fast-forward `main`, push `origin/main`, build `:upstream-sync-7dad9253`
++ `:prod`, local 8312 smoke + user Cursor sign-off BEFORE prod pull.
