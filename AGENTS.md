@@ -22,6 +22,14 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Auth material defaults under `auths/`
 - Storage backends: file-based default; optional Postgres/git/object store (`PGSTORE_*`, `GITSTORE_*`, `OBJECTSTORE_*`)
 
+## Cursor Request Shape
+
+- Cursor does **not** send Anthropic Messages format to the proxy on ingress, even when the user picked a native Claude/Fable model in Cursor. Cursor sends an **OpenAI chat-completions style** request body to cliproxy, and cliproxy's Claude path translates it later.
+- If you need the exact raw Cursor `system` prompt or native tool array, inspect the proxy's **request/response logs**, not ProxyMan captures from Claude Code:
+  - local container: `docker/logs/cliproxy/`
+  - prod VM: `~/cliproxy/logs/`
+- For prompt-shape questions, `=== REQUEST BODY ===` is the raw Cursor payload and `=== API REQUEST ===` is what cliproxy finally sent upstream.
+
 ## Production Observability — Use SigNoz First (MANDATORY)
 
 The prod proxy ships full traces/metrics/logs to SigNoz at `kaecilius.ecorp.cc`. For ANY question about prod behaviour — errors, latency, throughput, which auth was selected, what upstream returned, why a request failed — query SigNoz first. The MCP server is `project-2-CLIProxyAPI-signoz` (tools: `signoz_search_logs`, `signoz_search_traces`, `signoz_aggregate_logs`, `signoz_aggregate_traces`, `signoz_get_trace_details`, `signoz_query_metrics`, `signoz_get_field_values`, `signoz_list_metrics`).
@@ -101,6 +109,17 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
 - `internal/runtime/executor/helps/cursor_fable_snapshot/` — embedded Go asset (`//go:embed`) containing the captured Cursor → Anthropic Opus 4.7 thinking-max system blocks (identity swapped to "Claude Fable 5") + the 19 native Cursor tools (`Shell`, `Read`, `Grep`, `StrReplace`, `Task`, `TodoWrite`, …). DO NOT replace this with a live capture; the embedded version is the contract.
 - `internal/runtime/executor/claude_executor.go` — hook point: the line immediately after `thinking.ApplyThinking` and before `applyCloaking`. Calls `helps.ApplyCursorFableAliasSnapshot(body, req.Model)`. Hook MUST run before `applyCloaking` so the rest of the Cursor pipeline sees the swapped body.
 - `docker/config/cliproxy-config.yaml` — five `overrides:` (each `protocol: claude`) and five `oauth-model-alias: claude:` entries map `f5-low` / `f5-medium` / `f5-high` / `f5-xhigh` / `f5-max` to `claude-fable-5` with the matching effort level. Same config is mirrored on the prod VM at `/home/wade/cliproxy/config/config.yaml` (back up before editing — file is hand-edited in place).
+- If a user asks whether `f5-*` is sending the "right" prompt/tools, verify in the request logs above. The expected behavior is: inbound model `f5-*` → snapshot injects Cursor-native Anthropic-model `system` + 19 native tools → normal Claude rewrite pipeline continues.
+
+### Codex workspace / billing reality
+- ChatGPT web workspaces and OpenAI API/Codex orgs are **different systems**. The UUID shown in `chatgpt.com` workspace pickers is **not** the same identifier as the `org-...` value on `platform.openai.com`.
+- If Codex OAuth returns `chatgpt_plan_type: "free"` and `https://platform.openai.com/settings/organization/billing/overview` shows **Free trial** / **Add payment details**, there is **no proxy-side fix**. The OpenAI API org itself lacks paid Codex/API billing.
+- Do **not** hardcode a ChatGPT workspace UUID into cliproxy config to try to force a business workspace. We tested that path and it did not change the minted API token.
+- To diagnose Codex "why am I still free-tier?" issues, check:
+  1. `https://platform.openai.com/settings/organization/general` for the real API org id (`org-...`)
+  2. `https://platform.openai.com/settings/organization/billing/overview` for actual API/Codex billing state
+  3. the stored auth JSON / decoded `id_token` claims for `chatgpt_account_id`, `chatgpt_plan_type`, and `organizations[]`
+- If the API org is free, the correct fix is on OpenAI's side (billing / org enrollment), not in cliproxy.
 
 ### Observability (deeper than upstream)
 - `internal/observability/` — fork-customised: `transport_logs.go` records error-only request bodies when enabled, `metrics.go` exposes the proxy-level metrics enumerated in `docs/signoz-observability.md`, `config.go` adds `TransportLogsErrorBody` + `TransportLogsBodyLimit` settings.
@@ -118,19 +137,24 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
 ### Docs / governance
 - `AGENTS.md` (this file) — fork-only. Upstream doesn't have it.
 - `MIGRATION-LEDGER.md` — fork-only, tracks each upstream merge.
+- `docs/upstream-sync.md` — fork-only. Full mental model + conflict-resolution playbook for the recurring upstream sync.
 - `docs/signoz-observability.md` — fork-only. (Note: the SigNoz infra map above is the source of truth; the doc file is the dashboards/metrics reference.)
 - `docs/security-backlog.md` — fork-only.
 
 ### Upstream sync workflow
+Full playbook (conflict table, CGO trap, deploy gate): **`.agents/skills/upstream-sync/SKILL.md`** and **`docs/upstream-sync.md`**. Quick reference:
+
 1. `git fetch upstream main`
 2. `git checkout -b sync/upstream-<YYYY-MM-DD>`
-3. `git merge --no-ff --no-commit upstream/main` — resolve conflicts manually, preferring our fork's behaviour for every file in this section.
-4. After merge, run `git status` and verify every file in the lists above is still present and unchanged (or expanded — never reduced).
+3. `git merge --no-ff --no-commit upstream/main` — resolve conflicts manually, **preferring our fork's behaviour for every file in this section**. Standing rule: never revert a fork change to resolve a conflict; when both sides are additive, keep BOTH.
+4. After merge, run `git status` and verify every file in the lists above is still present and unchanged (or expanded — never reduced). Most "deletions" in the diffstat are fork-only files upstream never had; `--no-ff --no-commit` preserves them.
 5. `gofmt -w .` then `go build -o /tmp/build ./cmd/server && rm /tmp/build` then `go test ./...`.
 6. Commit with `chore: sync upstream/main (<N> commits incl. <themes>)`.
 7. Update `MIGRATION-LEDGER.md` with the sync date, commit count, and what each fork-only file required during merge (no change / re-applied / restructured).
 8. Fast-forward `main` only after tests pass. Push to `origin/main`.
-9. Build a new image tagged `:upstream-sync-<sha8>` and `:prod`. Do NOT pull on the prod VM until smoke tests pass locally.
+9. Build a new image tagged `:upstream-sync-<sha8>` and `:prod`. Rebuild local container on **8312** and get user sign-off in Cursor FIRST; do NOT pull on the prod VM until local smoke tests pass.
+
+**CGO=0 Dockerfile trap:** upstream flips the Dockerfile to `bookworm + CGO_ENABLED=1` claiming the plugin host needs cgo. It does NOT for us — the cgo loader is build-tag gated (`internal/pluginhost/loader_unix.go` vs `loader_unsupported.go`). Keep our `alpine + CGO_ENABLED=0` cross-compile; verify with `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/server`. Accepting upstream's change silently regresses build speed ~15s → ~3min and gains nothing we use.
 
 ## Architecture
 - `cmd/server/` — Server entrypoint
