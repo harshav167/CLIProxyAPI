@@ -22,6 +22,20 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Auth material defaults under `auths/`
 - Storage backends: file-based default; optional Postgres/git/object store (`PGSTORE_*`, `GITSTORE_*`, `OBJECTSTORE_*`)
 
+## Production Observability — Use SigNoz First (MANDATORY)
+
+The prod proxy ships full traces/metrics/logs to SigNoz at `kaecilius.ecorp.cc`. For ANY question about prod behaviour — errors, latency, throughput, which auth was selected, what upstream returned, why a request failed — query SigNoz first. The MCP server is `project-2-CLIProxyAPI-signoz` (tools: `signoz_search_logs`, `signoz_search_traces`, `signoz_aggregate_logs`, `signoz_aggregate_traces`, `signoz_get_trace_details`, `signoz_query_metrics`).
+
+DO NOT default to `gcloud compute ssh` for log inspection. SSH is the fallback only when SigNoz is genuinely unreachable AND the user asked for SSH explicitly. If SigNoz returns a 502 / non-200, the FIRST action is to diagnose and fix the SigNoz pipeline (kaecilius LXC, cloudflared tunnel, otel-collector, etc.) — not to silently sidestep into SSH. Tell the user SigNoz is down, fix it, then resume the original investigation.
+
+Known SigNoz failure modes and the fix-first checklist:
+1. Cloudflared tunnel — `cloudflared` on the prod VM forwards `kaecilius.ecorp.cc` to the kaecilius LXC. If the tunnel is down, check `cloudflared tunnel list` + the cloudflared service on prod.
+2. kaecilius LXC (Proxmox CT 101) — historic causes: LVM thin pool full (fix: `lvextend pve/data`), DHCP lease loss (fix: static IP), bridge/uplink switch (fix: `iptables FORWARD ACCEPT` rules on the host).
+3. otel-collector — if the local docker-compose stack stops exporting, the proxy keeps running but SigNoz goes blank. Restart the `otel-collector` service in `docker/docker-compose.local.yml`.
+4. The local `signoz-mcp-server` container at `127.0.0.1:57000` — it's a thin proxy onto kaecilius. A 502 from MCP usually means kaecilius itself is down, not the MCP container.
+
+If the user has to re-explain that SigNoz is the source of truth, that is a process failure. Update this section if the rule changes.
+
 ## Architecture
 - `cmd/server/` — Server entrypoint
 - `internal/api/` — Gin HTTP API (routes, middleware, modules)
