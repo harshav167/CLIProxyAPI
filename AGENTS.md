@@ -130,9 +130,21 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
 - `internal/config/config.go` — `ClaudeCursorGlobalCacheScope` config flag (feature-gates `scope:"global"` on the last system block, defaults on in prod via `cliproxy-config.yaml`).
 - `internal/runtime/executor/helps/claude_cache_control.go` — `EnsureClaudeCacheControl`, `EnsureClaudeUserPromptCacheAnchor`, `CountClaudeCacheControls`. Anchor strategy mirrors Claude Code 2.1.156 Opus 4.8.
 
+### GLM / Z.AI request normalisation (NOT upstream)
+- `internal/runtime/executor/helps/glm_normalizer.go::NormalizeGLMRequestBody` runs on the openai-compat path (both `Execute` and `ExecuteStream` in `openai_compat_executor.go`, right after `ApplyPayloadConfigWithRequest`), gated on `provider == "glm"`. Idempotent. Five behaviours:
+  1. Couples `reasoning_effort` with `thinking.type=enabled` (GLM ignores effort without it) — EXCEPT `none`/`minimal`, which mean skip-thinking and must NOT enable thinking (`glmEffortEnablesThinking`).
+  2. Maps effort aliases (`low`/`medium`→`high`, `xhigh`→`max`) per z.ai spec.
+  3. Strips OpenAI-only top-level fields (`service_tier`, `parallel_tool_calls`, `prompt_cache_key`, `prompt_cache_retention`, `store`, `metadata`, `logprobs`, `top_logprobs`). These vary per turn and break z.ai's **implicit prefix-based prompt cache**.
+  4. Enables `tool_stream: true` for GLM-4.6+ when tools present (per-chunk tool_call deltas; default false buffers them to stream end).
+  5. Sorts `tools[]` by `function.name` for a byte-stable cacheable prefix (Cursor doesn't guarantee tool order across turns). Bails on non-function tools (web_search/retrieval) to avoid partial sort.
+- z.ai prompt cache is IMPLICIT (no `cache_control` markers, no `prompt_cache_key`). Hit reporting via `usage.prompt_tokens_details.cached_tokens` — already parsed by `helps.ParseOpenAIUsage`, flows to SigNoz unchanged. Verified in prod 2026-06-21: warm turn hit 64/96 prompt tokens.
+- `internal/runtime/executor/helps/glm_normalizer_test.go` — 13 tests incl. the `none`/`minimal` skip-thinking guard and idempotency.
+- Prod config (`/home/wade/cliproxy/config/config.yaml`, lines ~730) has the `glm` openai-compatibility provider: base-url `https://api.z.ai/api/coding/paas/v4` (GLM Coding Plan — do NOT downgrade to `/paas/v4`), models `GLM-5.2` / `glm-5.1` / `glm-5-turbo`.
+
 ### Build / packaging
 - `Dockerfile` — `ENV TZ=Australia/Sydney`. Reverted upstream's `debian:bookworm + CGO_ENABLED=1` to `alpine + CGO_ENABLED=0` with `BUILDPLATFORM` / `TARGETARCH` for fast native cross-compilation. Trade-off: no runtime `.so` plugin loading; acceptable for our deployment.
-- Image tags on `ghcr.io/harshav167/cliproxyapi`: `:prod` is the rolling production tag (manually retagged after each deploy), `:f5-and-grok-fixes-<sha>` and `:upstream-sync-<sha>` are content-addressed pins. DO NOT push `:latest`. Current `:prod` digest as of 2026-06-13: `sha256:bdf02e241c362003ac54f0e91c70ea7139d8d75f008ad33b7623c8b93f9ca76d` from local commit `2ee2bf64`.
+- Image tags on `ghcr.io/harshav167/cliproxyapi`: `:prod` is the rolling production tag (manually retagged after each deploy), `:f5-and-grok-fixes-<sha>`, `:upstream-sync-<sha>` and `:glm-cache-<sha>` are content-addressed pins. DO NOT push `:latest`. Current `:prod` digest as of 2026-06-21: `sha256:caabeb57c6bd93ebb2b72f0169743c6459641caeb083d60702520654e736bb43` (tag `:glm-cache-70205e6b`, GLM normalizer + xAI content[] merge fix), deployed to the `cli-proxy-api-test` clanker container. Prior: `sha256:bdf02e241c362003ac54f0e91c70ea7139d8d75f008ad33b7623c8b93f9ca76d` from `2ee2bf64`.
+- Prod deploy target: the `cli-proxy-api-test` service in `/home/wade/cliproxy/compose.yaml` runs `ghcr.io/harshav167/cliproxyapi:prod` (`pull_policy: always`) on port 8312, labeled `cliproxy.instance=clanker`. The OTHER container `cli-proxy-api-plus` runs a DIFFERENT binary (`cliproxyplus:latest`, `./CLIProxyAPIPlus`) on 8317 — not built from this repo. Deploy: `docker compose pull cli-proxy-api-test && docker compose up -d cli-proxy-api-test`.
 
 ### Docs / governance
 - `AGENTS.md` (this file) — fork-only. Upstream doesn't have it.
