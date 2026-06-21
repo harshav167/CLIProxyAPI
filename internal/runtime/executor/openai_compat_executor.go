@@ -128,6 +128,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
+	// GLM-specific request rewrite — see helps.NormalizeGLMRequestBody for the
+	// thinking/reasoning_effort coupling and unsupported field stripping.
+	translated = helps.NormalizeGLMRequestBody(translated, e.Identifier(), baseModel)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -327,6 +330,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	// GLM-specific request rewrite — see helps.NormalizeGLMRequestBody for the
+	// thinking/reasoning_effort coupling and unsupported field stripping.
+	translated = helps.NormalizeGLMRequestBody(translated, e.Identifier(), baseModel)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"

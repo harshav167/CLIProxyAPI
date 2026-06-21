@@ -1067,7 +1067,7 @@ func mergeAdjacentXAIInputReasoningSummaries(body []byte) []byte {
 	items := make([]json.RawMessage, 0, len(input.Array()))
 	for _, item := range input.Array() {
 		if len(items) > 0 && canMergeXAIReasoningSummary(items[len(items)-1], item) {
-			merged, ok := appendXAIReasoningSummary(items[len(items)-1], item.Get("summary").Array())
+			merged, ok := appendXAIReasoningSummary(items[len(items)-1], item)
 			if ok {
 				items[len(items)-1] = json.RawMessage(merged)
 				changed = true
@@ -1096,33 +1096,85 @@ func canMergeXAIReasoningSummary(previous json.RawMessage, current gjson.Result)
 	if previousItem.Get("type").String() != "reasoning" || current.Get("type").String() != "reasoning" {
 		return false
 	}
-	if !previousItem.Get("summary").IsArray() || !current.Get("summary").IsArray() {
+	// Per OpenAI Responses spec, reasoning items can carry text in either
+	// content[] (the canonical reasoning_text field) or summary[] (the older
+	// summary_text field). We allow merging when both sides have arrays for
+	// the same fields, and when the current item only has type plus
+	// summary/content metadata.
+	prevHasSummary := previousItem.Get("summary").IsArray()
+	currHasSummary := current.Get("summary").IsArray()
+	prevHasContent := previousItem.Get("content").IsArray()
+	currHasContent := current.Get("content").IsArray()
+	if !prevHasSummary && !prevHasContent {
 		return false
 	}
-	if len(current.Get("summary").Array()) == 0 {
+	if !currHasSummary && !currHasContent {
+		return false
+	}
+	// The current item must actually carry something to merge in.
+	currSummaryLen := 0
+	if currHasSummary {
+		currSummaryLen = len(current.Get("summary").Array())
+	}
+	currContentLen := 0
+	if currHasContent {
+		currContentLen = len(current.Get("content").Array())
+	}
+	if currSummaryLen == 0 && currContentLen == 0 {
 		return false
 	}
 	for name := range current.Map() {
-		if name != "type" && name != "summary" {
+		if name != "type" && name != "summary" && name != "content" {
 			return false
 		}
 	}
 	return true
 }
 
-func appendXAIReasoningSummary(previous json.RawMessage, currentSummary []gjson.Result) ([]byte, bool) {
+func appendXAIReasoningSummary(previous json.RawMessage, current gjson.Result) ([]byte, bool) {
 	updated := []byte(previous)
-	summary := gjson.GetBytes(updated, "summary")
-	if !summary.IsArray() {
-		return previous, false
-	}
-	nextIndex := len(summary.Array())
-	for i, item := range currentSummary {
-		updatedItem, errSet := sjson.SetRawBytes(updated, fmt.Sprintf("summary.%d", nextIndex+i), []byte(item.Raw))
-		if errSet != nil {
-			return previous, false
+	mergedAny := false
+	// Merge summary[] entries (legacy reasoning_text-via-summary shape).
+	// If previous lacks a summary[] array we skip merging summary entries
+	// rather than bailing out, so a content[] merge below can still proceed.
+	if currSummary := current.Get("summary"); currSummary.IsArray() {
+		if prevSummary := gjson.GetBytes(updated, "summary"); prevSummary.IsArray() {
+			nextIndex := len(prevSummary.Array())
+			for i, item := range currSummary.Array() {
+				updatedItem, errSet := sjson.SetRawBytes(updated, fmt.Sprintf("summary.%d", nextIndex+i), []byte(item.Raw))
+				if errSet != nil {
+					return previous, false
+				}
+				updated = updatedItem
+				mergedAny = true
+			}
 		}
-		updated = updatedItem
+	}
+	// Merge content[] entries (spec-correct reasoning_text shape).
+	if currContent := current.Get("content"); currContent.IsArray() {
+		prevContent := gjson.GetBytes(updated, "content")
+		// If previous item doesn't have a content[] array, create one before
+		// appending so the merged item is well-formed.
+		if !prevContent.IsArray() {
+			seeded, errSeed := sjson.SetRawBytes(updated, "content", []byte("[]"))
+			if errSeed != nil {
+				return previous, false
+			}
+			updated = seeded
+			prevContent = gjson.GetBytes(updated, "content")
+		}
+		nextIndex := len(prevContent.Array())
+		for i, item := range currContent.Array() {
+			updatedItem, errSet := sjson.SetRawBytes(updated, fmt.Sprintf("content.%d", nextIndex+i), []byte(item.Raw))
+			if errSet != nil {
+				return previous, false
+			}
+			updated = updatedItem
+			mergedAny = true
+		}
+	}
+	if !mergedAny {
+		return previous, false
 	}
 	return updated, true
 }

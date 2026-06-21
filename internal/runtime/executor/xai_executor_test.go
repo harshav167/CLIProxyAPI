@@ -885,3 +885,53 @@ func TestNormalizeXAIToolChoiceForTools_NoOpWhenBothAbsent(t *testing.T) {
 		t.Fatalf("tool_choice should not appear: %s", string(out))
 	}
 }
+
+// TestMergeAdjacentXAIInputReasoning_MergesContentWhenPrevLacksSummary guards
+// against a regression where, if the current reasoning item carried both a
+// summary[] and a content[] but the previous item had no summary[], the merge
+// bailed out early and dropped the content[] merge entirely. Both content[]
+// arrays must be combined.
+func TestMergeAdjacentXAIInputReasoning_MergesContentWhenPrevLacksSummary(t *testing.T) {
+	body := []byte(`{"input":[` +
+		`{"type":"reasoning","content":[{"type":"reasoning_text","text":"first"}]},` +
+		`{"type":"reasoning","summary":[{"type":"summary_text","text":"sum"}],"content":[{"type":"reasoning_text","text":"second"}]}` +
+		`]}`)
+
+	out := mergeAdjacentXAIInputReasoningSummaries(body)
+
+	input := gjson.GetBytes(out, "input")
+	if n := len(input.Array()); n != 1 {
+		t.Fatalf("expected items merged into 1, got %d: %s", n, string(out))
+	}
+	content := gjson.GetBytes(out, "input.0.content")
+	if n := len(content.Array()); n != 2 {
+		t.Fatalf("expected content[] merged to 2 entries, got %d: %s", n, string(out))
+	}
+	if got := gjson.GetBytes(out, "input.0.content.0.text").String(); got != "first" {
+		t.Fatalf("content[0].text = %q, want first: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "input.0.content.1.text").String(); got != "second" {
+		t.Fatalf("content[1].text = %q, want second: %s", got, string(out))
+	}
+}
+
+// TestMergeAdjacentXAIInputReasoning_MergesBothSummaryAndContent verifies the
+// happy path where both items carry summary[] and content[]; both arrays merge.
+func TestMergeAdjacentXAIInputReasoning_MergesBothSummaryAndContent(t *testing.T) {
+	body := []byte(`{"input":[` +
+		`{"type":"reasoning","summary":[{"type":"summary_text","text":"s1"}],"content":[{"type":"reasoning_text","text":"c1"}]},` +
+		`{"type":"reasoning","summary":[{"type":"summary_text","text":"s2"}],"content":[{"type":"reasoning_text","text":"c2"}]}` +
+		`]}`)
+
+	out := mergeAdjacentXAIInputReasoningSummaries(body)
+
+	if n := len(gjson.GetBytes(out, "input").Array()); n != 1 {
+		t.Fatalf("expected items merged into 1, got %d: %s", n, string(out))
+	}
+	if n := len(gjson.GetBytes(out, "input.0.summary").Array()); n != 2 {
+		t.Fatalf("expected summary[] merged to 2, got %d: %s", n, string(out))
+	}
+	if n := len(gjson.GetBytes(out, "input.0.content").Array()); n != 2 {
+		t.Fatalf("expected content[] merged to 2, got %d: %s", n, string(out))
+	}
+}
