@@ -15,7 +15,6 @@ type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type ObservabilityConfig = internalconfig.ObservabilityConfig
 type OTLPConfig = internalconfig.OTLPConfig
-type AmpCode = internalconfig.AmpCode
 type OAuthModelAlias = internalconfig.OAuthModelAlias
 type PayloadConfig = internalconfig.PayloadConfig
 type PayloadRule = internalconfig.PayloadRule
