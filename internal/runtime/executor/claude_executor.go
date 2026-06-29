@@ -220,6 +220,14 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 		return prepared, err
 	}
 
+	// Upstream feature (rebuild-mid-system-message): move messages with role
+	// "system" into the top-level system field when enabled. Placed before
+	// cloaking/cache-control so downstream system-block processing sees the
+	// consolidated system content.
+	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
+		body = rebuildMidSystemMessagesToTopLevel(body)
+	}
+
 	// Cursor Fable 5 alias path: when Cursor sends a non-claude-prefixed alias
 	// (f5-*), it skips its ZDR routing gate but also sends a generic custom-model
 	// system prompt + tool set instead of the rich Cursor→Anthropic shape it
@@ -230,7 +238,10 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 	// claude-fable-5 model upstream of here, so we key off the inbound req.Model.
 	body = helps.ApplyCursorFableAliasSnapshot(body, req.Model)
 
-	body = applyCloaking(ctx, e.cfg, auth, body, prepared.baseModel, prepared.apiKey)
+	body, err = applyCloaking(ctx, e.cfg, auth, body, prepared.baseModel, prepared.apiKey)
+	if err != nil {
+		return prepared, err
+	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -308,7 +319,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-<<<<<<< HEAD
 	upstreamStream := prepared.from != prepared.to
 
 	// SetTranslatedReasoningEffort is upstream 11f0f906: log the reasoning
@@ -323,69 +333,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	applyClaudeHeaders(httpReq, auth, prepared.apiKey, false, prepared.extraBetas, e.cfg)
-=======
-	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
-		body = rebuildMidSystemMessagesToTopLevel(body)
-	}
-
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
-	// based on client type and configuration.
-	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
-	if err != nil {
-		return resp, err
-	}
-
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body = ensureModelMaxTokens(body, baseModel)
-
-	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
-	body = disableThinkingIfToolChoiceForced(body)
-	body = normalizeClaudeTemperatureForThinking(body)
-
-	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
-		body = ensureCacheControl(body)
-	}
-
-	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	// Cloaking and ensureCacheControl may push the total over 4 when the client
-	// already sends multiple cache_control blocks.
-	body = enforceCacheControlLimit(body, 4)
-
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
-	body = normalizeCacheControlTTL(body)
-
-	// Extract betas from body and convert to header
-	var extraBetas []string
-	extraBetas, body = extractAndRemoveBetas(body)
-	bodyForTranslation := body
-	bodyForUpstream := body
-	oauthToken := isClaudeOAuthToken(apiKey)
-	var oauthToolNamesReverseMap map[string]string
-	if oauthToken {
-		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
-	}
-	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
-	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
-	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
-		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
-	}
-	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
-
-	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
-	if err != nil {
-		return resp, err
-	}
-	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas, e.cfg); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(httpReq, auth, prepared.apiKey, false, prepared.extraBetas, e.cfg); errHeaders != nil {
 		return resp, errHeaders
 	}
->>>>>>> upstream/main
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -505,34 +455,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
-	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
-		body = rebuildMidSystemMessagesToTopLevel(body)
-	}
-
-<<<<<<< HEAD
 	// Upstream 11f0f906: log reasoning effort as sent upstream.
 	reporter.SetTranslatedReasoningEffort(prepared.bodyForUpstream, prepared.to.String())
-=======
-	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
-	// based on client type and configuration.
-	body, err = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
-	if err != nil {
-		return nil, err
-	}
->>>>>>> upstream/main
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", prepared.baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(prepared.bodyForUpstream))
 	if err != nil {
 		return nil, err
 	}
-<<<<<<< HEAD
-	applyClaudeHeaders(httpReq, auth, prepared.apiKey, true, prepared.extraBetas, e.cfg)
-=======
-	if errHeaders := applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas, e.cfg); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(httpReq, auth, prepared.apiKey, true, prepared.extraBetas, e.cfg); errHeaders != nil {
 		return nil, errHeaders
 	}
->>>>>>> upstream/main
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1687,345 +1620,6 @@ func reverseRemapOAuthToolNamesFromStreamLine(line []byte, reverseMap map[string
 	return updated
 }
 
-<<<<<<< HEAD
-=======
-func applyClaudeToolPrefix(body []byte, prefix string) []byte {
-	if prefix == "" {
-		return body
-	}
-
-	// Collect built-in tool names from the authoritative fallback seed list and
-	// augment it with any typed built-ins present in the current request body.
-	builtinTools := helps.AugmentClaudeBuiltinToolRegistry(body, nil)
-
-	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
-		tools.ForEach(func(index, tool gjson.Result) bool {
-			// Skip built-in tools (web_search, code_execution, etc.) which have
-			// a "type" field and require their name to remain unchanged.
-			if tool.Get("type").Exists() && tool.Get("type").String() != "" {
-				if n := tool.Get("name").String(); n != "" {
-					builtinTools[n] = true
-				}
-				return true
-			}
-			name := tool.Get("name").String()
-			if name == "" || strings.HasPrefix(name, prefix) {
-				return true
-			}
-			path := fmt.Sprintf("tools.%d.name", index.Int())
-			body, _ = sjson.SetBytes(body, path, prefix+name)
-			return true
-		})
-	}
-
-	if gjson.GetBytes(body, "tool_choice.type").String() == "tool" {
-		name := gjson.GetBytes(body, "tool_choice.name").String()
-		if name != "" && !strings.HasPrefix(name, prefix) && !builtinTools[name] {
-			body, _ = sjson.SetBytes(body, "tool_choice.name", prefix+name)
-		}
-	}
-
-	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
-		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.Exists() || !content.IsArray() {
-				return true
-			}
-			content.ForEach(func(contentIndex, part gjson.Result) bool {
-				partType := part.Get("type").String()
-				switch partType {
-				case "tool_use":
-					name := part.Get("name").String()
-					if name == "" || strings.HasPrefix(name, prefix) || builtinTools[name] {
-						return true
-					}
-					path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
-					body, _ = sjson.SetBytes(body, path, prefix+name)
-				case "tool_reference":
-					toolName := part.Get("tool_name").String()
-					if toolName == "" || strings.HasPrefix(toolName, prefix) || builtinTools[toolName] {
-						return true
-					}
-					path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
-					body, _ = sjson.SetBytes(body, path, prefix+toolName)
-				case "tool_result":
-					// Handle nested tool_reference blocks inside tool_result.content[]
-					nestedContent := part.Get("content")
-					if nestedContent.Exists() && nestedContent.IsArray() {
-						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-							if nestedPart.Get("type").String() == "tool_reference" {
-								nestedToolName := nestedPart.Get("tool_name").String()
-								if nestedToolName != "" && !strings.HasPrefix(nestedToolName, prefix) && !builtinTools[nestedToolName] {
-									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
-									body, _ = sjson.SetBytes(body, nestedPath, prefix+nestedToolName)
-								}
-							}
-							return true
-						})
-					}
-				}
-				return true
-			})
-			return true
-		})
-	}
-
-	return body
-}
-
-func stripClaudeToolPrefixFromResponse(body []byte, prefix string) []byte {
-	if prefix == "" {
-		return body
-	}
-	content := gjson.GetBytes(body, "content")
-	if !content.Exists() || !content.IsArray() {
-		return body
-	}
-	content.ForEach(func(index, part gjson.Result) bool {
-		partType := part.Get("type").String()
-		switch partType {
-		case "tool_use":
-			name := part.Get("name").String()
-			if !strings.HasPrefix(name, prefix) {
-				return true
-			}
-			path := fmt.Sprintf("content.%d.name", index.Int())
-			body, _ = sjson.SetBytes(body, path, strings.TrimPrefix(name, prefix))
-		case "tool_reference":
-			toolName := part.Get("tool_name").String()
-			if !strings.HasPrefix(toolName, prefix) {
-				return true
-			}
-			path := fmt.Sprintf("content.%d.tool_name", index.Int())
-			body, _ = sjson.SetBytes(body, path, strings.TrimPrefix(toolName, prefix))
-		case "tool_result":
-			// Handle nested tool_reference blocks inside tool_result.content[]
-			nestedContent := part.Get("content")
-			if nestedContent.Exists() && nestedContent.IsArray() {
-				nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-					if nestedPart.Get("type").String() == "tool_reference" {
-						nestedToolName := nestedPart.Get("tool_name").String()
-						if strings.HasPrefix(nestedToolName, prefix) {
-							nestedPath := fmt.Sprintf("content.%d.content.%d.tool_name", index.Int(), nestedIndex.Int())
-							body, _ = sjson.SetBytes(body, nestedPath, strings.TrimPrefix(nestedToolName, prefix))
-						}
-					}
-					return true
-				})
-			}
-		}
-		return true
-	})
-	return body
-}
-
-func stripClaudeToolPrefixFromStreamLine(line []byte, prefix string) []byte {
-	if prefix == "" {
-		return line
-	}
-	payload := helps.JSONPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return line
-	}
-	contentBlock := gjson.GetBytes(payload, "content_block")
-	if !contentBlock.Exists() {
-		return line
-	}
-
-	blockType := contentBlock.Get("type").String()
-	var updated []byte
-	var err error
-
-	switch blockType {
-	case "tool_use":
-		name := contentBlock.Get("name").String()
-		if !strings.HasPrefix(name, prefix) {
-			return line
-		}
-		updated, err = sjson.SetBytes(payload, "content_block.name", strings.TrimPrefix(name, prefix))
-		if err != nil {
-			return line
-		}
-	case "tool_reference":
-		toolName := contentBlock.Get("tool_name").String()
-		if !strings.HasPrefix(toolName, prefix) {
-			return line
-		}
-		updated, err = sjson.SetBytes(payload, "content_block.tool_name", strings.TrimPrefix(toolName, prefix))
-		if err != nil {
-			return line
-		}
-	default:
-		return line
-	}
-
-	trimmed := bytes.TrimSpace(line)
-	if bytes.HasPrefix(trimmed, []byte("data:")) {
-		return append([]byte("data: "), updated...)
-	}
-	return updated
-}
-
-// getClientUserAgent extracts the client User-Agent from the gin context.
-func getClientUserAgent(ctx context.Context) string {
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		return ginCtx.GetHeader("User-Agent")
-	}
-	return ""
-}
-
-// parseEntrypointFromUA extracts the entrypoint from a Claude Code User-Agent.
-// Format: "claude-cli/x.y.z (external, cli)" → "cli"
-// Format: "claude-cli/x.y.z (external, vscode)" → "vscode"
-// Returns "cli" if parsing fails or UA is not Claude Code.
-func parseEntrypointFromUA(userAgent string) string {
-	// Find content inside parentheses
-	start := strings.Index(userAgent, "(")
-	end := strings.LastIndex(userAgent, ")")
-	if start < 0 || end <= start {
-		return "cli"
-	}
-	inner := userAgent[start+1 : end]
-	// Split by comma, take the second part (entrypoint is at index 1, after USER_TYPE)
-	// Format: "(USER_TYPE, ENTRYPOINT[, extra...])"
-	parts := strings.Split(inner, ",")
-	if len(parts) >= 2 {
-		ep := strings.TrimSpace(parts[1])
-		if ep != "" {
-			return ep
-		}
-	}
-	return "cli"
-}
-
-// getWorkloadFromContext extracts workload identifier from the gin request headers.
-func getWorkloadFromContext(ctx context.Context) string {
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		return strings.TrimSpace(ginCtx.GetHeader("X-CPA-Claude-Workload"))
-	}
-	return ""
-}
-
-// getCloakConfigFromAuth extracts cloak configuration from the auth's attributes,
-// falling back to its stored metadata (the raw OAuth/token JSON). Returns
-// (cloakMode, strictMode, sensitiveWords, cacheUserID); an empty cloakMode means
-// the credential did not explicitly configure a mode.
-func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMode bool, sensitiveWords []string, cacheUserID bool) {
-	if auth == nil {
-		return "", false, nil, false
-	}
-
-	// lookupCloakAttr prefers the executor-facing Attributes, then falls back to the
-	// raw metadata blob (e.g. the OAuth/token JSON) so file-based credentials can
-	// carry cloak settings without a matching claude-api-key config entry.
-	lookupCloakAttr := func(key string) string {
-		if auth.Attributes != nil {
-			if value := strings.TrimSpace(auth.Attributes[key]); value != "" {
-				return value
-			}
-		}
-		if auth.Metadata != nil {
-			if value, ok := auth.Metadata[key].(string); ok {
-				return strings.TrimSpace(value)
-			}
-		}
-		return ""
-	}
-
-	// An empty cloakMode means this credential did not explicitly configure a mode,
-	// allowing the caller to fall back to the global/default behavior.
-	cloakMode = lookupCloakAttr("cloak_mode")
-
-	strictMode = strings.EqualFold(lookupCloakAttr("cloak_strict_mode"), "true")
-
-	if wordsStr := lookupCloakAttr("cloak_sensitive_words"); wordsStr != "" {
-		sensitiveWords = strings.Split(wordsStr, ",")
-		for i := range sensitiveWords {
-			sensitiveWords[i] = strings.TrimSpace(sensitiveWords[i])
-		}
-	}
-
-	cacheUserID = strings.EqualFold(lookupCloakAttr("cloak_cache_user_id"), "true")
-
-	return cloakMode, strictMode, sensitiveWords, cacheUserID
-}
-
-// injectFakeUserID generates and injects a fake user ID into the request metadata.
-// When useCache is false, a new user ID is generated for every call.
-func injectFakeUserID(ctx context.Context, payload []byte, apiKey string, useCache bool) ([]byte, error) {
-	generateID := func() (string, error) {
-		if useCache {
-			return helps.CachedUserIDRequired(ctx, apiKey)
-		}
-		return helps.GenerateFakeUserID(), nil
-	}
-
-	metadata := gjson.GetBytes(payload, "metadata")
-	if !metadata.Exists() {
-		userID, errUserID := generateID()
-		if errUserID != nil {
-			return nil, errUserID
-		}
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", userID)
-		return payload, nil
-	}
-
-	existingUserID := gjson.GetBytes(payload, "metadata.user_id").String()
-	if existingUserID == "" || !helps.IsValidUserID(existingUserID) {
-		userID, errUserID := generateID()
-		if errUserID != nil {
-			return nil, errUserID
-		}
-		payload, _ = sjson.SetBytes(payload, "metadata.user_id", userID)
-	}
-	return payload, nil
-}
-
-// fingerprintSalt is the salt used by Claude Code to compute the 3-char build fingerprint.
-const fingerprintSalt = "59cf53e54c78"
-
-// computeFingerprint computes the 3-char build fingerprint that Claude Code embeds in cc_version.
-// Algorithm: SHA256(salt + messageText[4] + messageText[7] + messageText[20] + version)[:3]
-func computeFingerprint(messageText, version string) string {
-	indices := [3]int{4, 7, 20}
-	runes := []rune(messageText)
-	var sb strings.Builder
-	for _, idx := range indices {
-		if idx < len(runes) {
-			sb.WriteRune(runes[idx])
-		} else {
-			sb.WriteRune('0')
-		}
-	}
-	input := fingerprintSalt + sb.String() + version
-	h := sha256.Sum256([]byte(input))
-	return hex.EncodeToString(h[:])[:3]
-}
-
-// generateBillingHeader creates the x-anthropic-billing-header text block that
-// real Claude Code prepends to every system prompt array.
-// Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=<ep>; cch=<hash>; [cc_workload=<wl>;]
-func generateBillingHeader(payload []byte, experimentalCCHSigning bool, version, messageText, entrypoint, workload string) string {
-	if entrypoint == "" {
-		entrypoint = "cli"
-	}
-	buildHash := computeFingerprint(messageText, version)
-	workloadPart := ""
-	if workload != "" {
-		workloadPart = fmt.Sprintf(" cc_workload=%s;", workload)
-	}
-
-	if experimentalCCHSigning {
-		return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=00000;%s", version, buildHash, entrypoint, workloadPart)
-	}
-
-	// Generate a deterministic cch hash from the payload content (system + messages + tools).
-	h := sha256.Sum256(payload)
-	cch := hex.EncodeToString(h[:])[:5]
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=%s;%s", version, buildHash, entrypoint, cch, workloadPart)
-}
-
->>>>>>> upstream/main
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "", false)
 }
@@ -2152,82 +1746,8 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 // buildTextBlock constructs a JSON text block object with proper escaping.
 // Uses sjson.SetBytes to handle multi-line text, quotes, and control characters.
 // cacheControl is optional; pass nil to omit cache_control.
-<<<<<<< HEAD
-func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) []byte {
-	clientUserAgent := helps.GetClaudeClientUserAgent(ctx)
-=======
-func buildTextBlock(text string, cacheControl map[string]string) string {
-	block := []byte(`{"type":"text"}`)
-	block, _ = sjson.SetBytes(block, "text", text)
-	if cacheControl != nil && len(cacheControl) > 0 {
-		// Build cache_control JSON manually to avoid sjson map marshaling issues.
-		// sjson.SetBytes with map[string]string may not produce expected structure.
-		cc := `{"type":"ephemeral"`
-		if t, ok := cacheControl["ttl"]; ok {
-			cc += fmt.Sprintf(`,"ttl":"%s"`, t)
-		}
-		cc += "}"
-		block, _ = sjson.SetRawBytes(block, "cache_control", []byte(cc))
-	}
-	return string(block)
-}
-
-// prependToFirstUserMessage prepends text content to the first user message.
-// This avoids putting non-Claude-Code system instructions in system[] which
-// triggers Anthropic's extra usage billing for OAuth-proxied requests.
-func prependToFirstUserMessage(payload []byte, text string) []byte {
-	messages := gjson.GetBytes(payload, "messages")
-	if !messages.Exists() || !messages.IsArray() {
-		return payload
-	}
-
-	// Find the first user message index
-	firstUserIdx := -1
-	messages.ForEach(func(idx, msg gjson.Result) bool {
-		if msg.Get("role").String() == "user" {
-			firstUserIdx = int(idx.Int())
-			return false
-		}
-		return true
-	})
-
-	if firstUserIdx < 0 {
-		return payload
-	}
-
-	prefixBlock := fmt.Sprintf(`<system-reminder>
-As you answer the user's questions, you can use the following context from the system:
-%s
-
-IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
-</system-reminder>
-`, text)
-
-	contentPath := fmt.Sprintf("messages.%d.content", firstUserIdx)
-	content := gjson.GetBytes(payload, contentPath)
-
-	if content.IsArray() {
-		newBlock := fmt.Sprintf(`{"type":"text","text":%q}`, prefixBlock)
-		var newArray string
-		if content.Raw == "[]" || content.Raw == "" {
-			newArray = "[" + newBlock + "]"
-		} else {
-			newArray = "[" + newBlock + "," + content.Raw[1:]
-		}
-		payload, _ = sjson.SetRawBytes(payload, contentPath, []byte(newArray))
-	} else if content.Type == gjson.String {
-		newText := prefixBlock + content.String()
-		payload, _ = sjson.SetBytes(payload, contentPath, newText)
-	}
-
-	return payload
-}
-
-// applyCloaking applies cloaking transformations to the payload based on config and client.
-// Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
 func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) ([]byte, error) {
-	clientUserAgent := getClientUserAgent(ctx)
->>>>>>> upstream/main
+	clientUserAgent := helps.GetClaudeClientUserAgent(ctx)
 	// Enable cch signing for OAuth tokens by default (not just experimental flag).
 	oauthToken := isClaudeOAuthToken(apiKey)
 	useCCHSigning := oauthToken || experimentalCCHSigningEnabled(cfg, auth)
@@ -2282,16 +1802,8 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload, useGlobalScopeOnLast)
 	}
 
-	// Inject fake user ID
-<<<<<<< HEAD
+	// Inject fake user ID (our helps-based version is infallible, so no error).
 	payload = helps.InjectClaudeFakeUserID(payload, apiKey, cacheUserID)
-=======
-	var errFakeUserID error
-	payload, errFakeUserID = injectFakeUserID(ctx, payload, apiKey, cacheUserID)
-	if errFakeUserID != nil {
-		return nil, errFakeUserID
-	}
->>>>>>> upstream/main
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {

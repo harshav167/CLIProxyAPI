@@ -177,3 +177,81 @@ func TestNormalizeGLMRequestBody_SkipsToolReorderForNonFunctionTools(t *testing.
 		t.Fatalf("expected first tool to remain web_search (no partial sort); got %s", first)
 	}
 }
+
+func TestNormalizeGLMRequestBody_ActivatesForGLMFamilyModelOnOtherProvider(t *testing.T) {
+	// A throwaway/relay vendor serving GLM under a different provider name must
+	// still get the GLM fixes, gated on the model family with zero config.
+	cases := []struct {
+		provider string
+		model    string
+		want     bool
+	}{
+		{"gmi", "zai-org/GLM-5.2-FP8", true},
+		{"some-relay", "glm-5.2", true},
+		{"openrouter", "z-ai/glm-4.6", true},
+		{"openai", "gpt-4o", false},
+		{"anthropic", "claude-opus-4-8", false},
+	}
+	for _, c := range cases {
+		// service_tier is stripped only when the normalizer activates.
+		body := []byte(`{"model":"` + c.model + `","messages":[],"service_tier":"priority"}`)
+		out := NormalizeGLMRequestBody(body, c.provider, c.model)
+		stripped := !gjson.GetBytes(out, "service_tier").Exists()
+		if stripped != c.want {
+			t.Errorf("provider=%s model=%s: activated=%v want=%v (body=%s)", c.provider, c.model, stripped, c.want, out)
+		}
+	}
+}
+
+func TestNormalizeGLMRequestBody_DropsEmptyAssistantContentWithToolCalls(t *testing.T) {
+	// The actual prod 400001 repro: assistant with content:[] and tool_calls.
+	body := []byte(`{"model":"zai-org/GLM-5.2-FP8","messages":[` +
+		`{"role":"user","content":"hi"},` +
+		`{"role":"assistant","content":[],"tool_calls":[{"id":"c1","type":"function","function":{"name":"Shell","arguments":"{}"}}]},` +
+		`{"role":"tool","tool_call_id":"c1","content":"ok"}` +
+		`]}`)
+	out := NormalizeGLMRequestBody(body, "gmi", "zai-org/GLM-5.2-FP8")
+
+	if gjson.GetBytes(out, "messages.1.content").Exists() {
+		t.Fatalf("expected empty assistant content to be dropped; body=%s", out)
+	}
+	// tool_calls must be preserved.
+	if n := len(gjson.GetBytes(out, "messages.1.tool_calls").Array()); n != 1 {
+		t.Fatalf("expected tool_calls preserved (1); got %d: %s", n, out)
+	}
+}
+
+func TestNormalizeGLMRequestBody_PreservesNonEmptyAssistantContent(t *testing.T) {
+	body := []byte(`{"model":"glm-5.2","messages":[` +
+		`{"role":"assistant","content":[{"type":"text","text":"working on it"}],"tool_calls":[{"id":"c1","type":"function","function":{"name":"Shell","arguments":"{}"}}]}` +
+		`]}`)
+	out := NormalizeGLMRequestBody(body, "glm", "glm-5.2")
+	if !gjson.GetBytes(out, "messages.0.content").Exists() {
+		t.Fatalf("expected non-empty assistant content to be preserved; body=%s", out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "working on it" {
+		t.Fatalf("content text mangled: %q (%s)", got, out)
+	}
+}
+
+func TestNormalizeGLMRequestBody_DropsEmptyStringAndNullAssistantContent(t *testing.T) {
+	for _, empty := range []string{`""`, `null`, `[]`} {
+		body := []byte(`{"model":"glm-5.2","messages":[` +
+			`{"role":"assistant","content":` + empty + `,"tool_calls":[{"id":"c1","type":"function","function":{"name":"x","arguments":"{}"}}]}` +
+			`]}`)
+		out := NormalizeGLMRequestBody(body, "glm", "glm-5.2")
+		if gjson.GetBytes(out, "messages.0.content").Exists() {
+			t.Errorf("content=%s: expected dropped; got %s", empty, out)
+		}
+	}
+}
+
+func TestNormalizeGLMRequestBody_KeepsEmptyContentWhenNoToolCalls(t *testing.T) {
+	// An assistant message with empty content but NO tool_calls is left alone
+	// (don't mask a different malformed-request bug).
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"assistant","content":[]}]}`)
+	out := NormalizeGLMRequestBody(body, "glm", "glm-5.2")
+	if !gjson.GetBytes(out, "messages.0.content").Exists() {
+		t.Fatalf("expected empty content kept when no tool_calls; body=%s", out)
+	}
+}

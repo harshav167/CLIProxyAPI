@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -33,12 +34,22 @@ import (
 //     function name so byte-identical tool sets always produce a byte-identical
 //     prefix.
 //
-// The normaliser is idempotent and a no-op when provider != "glm".
+// The normaliser is a no-op for non-GLM traffic and is idempotent.
+//
+// It activates when EITHER the configured provider is "glm" OR the model id is
+// GLM-family (e.g. "glm-5.2", "zai-org/GLM-5.2-FP8"). The latter matters because
+// the same GLM models are served by multiple OpenAI-compatible vendors (z.ai,
+// promo/relay endpoints, etc.); gating only on the provider name would leave
+// those vendors broken. The empty-assistant-content sanitizer in particular is
+// a GLM API requirement regardless of who serves the model.
 func NormalizeGLMRequestBody(payload []byte, provider, model string) []byte {
-	if !isGLMProvider(provider) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	// The reasoning/tool/field rewrites are GLM-profile behaviours; the
+	// empty-content sanitizer is a hard GLM API requirement. Both are safe to
+	// run whenever the request is GLM-bound (provider OR model family).
+	if !isGLMProvider(provider) && !isGLMFamilyModel(model) {
 		return payload
 	}
 
@@ -48,14 +59,35 @@ func NormalizeGLMRequestBody(payload []byte, provider, model string) []byte {
 	out = stripGLMUnsupportedTopLevelFields(out)
 	out = enableGLMToolStream(out, model)
 	out = stabilizeGLMToolOrder(out)
+	out = dropEmptyAssistantContentWithToolCalls(out)
+	// Cursor → GLM system-prompt rewrite: GLM receives the same Cursor "AI coding
+	// assistant" prompt family as Claude, so apply the shared execution-integrity
+	// contract + generic plan/unexpected-changes patches (identity left as-is).
+	out = ApplyCursorGLMSystemPromptUpgradeToPayload(out)
 	return out
 }
 
 // isGLMProvider matches the openai-compatibility provider name configured in
-// cliproxy-config.yaml. We intentionally only match the literal "glm" value
-// here — the generic openai-compat path stays untouched for other providers.
+// cliproxy-config.yaml (the canonical z.ai entry).
 func isGLMProvider(provider string) bool {
 	return strings.EqualFold(strings.TrimSpace(provider), "glm")
+}
+
+// isGLMFamilyModel reports whether a model id belongs to the GLM family,
+// independent of which vendor serves it. Matches bare ids ("glm-5.2"),
+// vendor-prefixed ids ("zai-org/GLM-5.2-FP8"), and is case-insensitive. This is
+// how a throwaway/relay provider serving GLM gets the same request fixes with
+// zero config.
+func isGLMFamilyModel(model string) bool {
+	name := strings.ToLower(strings.TrimSpace(model))
+	if name == "" {
+		return false
+	}
+	// Strip any vendor/org prefix (e.g. "zai-org/glm-5.2-fp8" -> "glm-5.2-fp8").
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return strings.HasPrefix(name, "glm-") || strings.HasPrefix(name, "glm4") || strings.HasPrefix(name, "glm5")
 }
 
 // ensureGLMThinkingForReasoningEffort sets `thinking.type = "enabled"` when
@@ -290,4 +322,69 @@ func stabilizeGLMToolOrder(payload []byte) []byte {
 		return payload
 	}
 	return updated
+}
+
+// dropEmptyAssistantContentWithToolCalls removes the `content` field from any
+// assistant message that carries tool_calls but whose content is empty.
+//
+// Background: OpenAI/Anthropic clients (Cursor included) emit assistant turns
+// that made a tool call with no accompanying prose as:
+//
+//	{"role":"assistant","content":[],"tool_calls":[...]}
+//
+// GLM/z.ai rejects this with `400001 invalid_request_error` ("API 调用参数有误")
+// because it treats an empty content array as an invalid parameter. GLM accepts
+// the same message when `content` is a non-empty string/array OR is omitted
+// entirely. We omit it (the safe, lossless shape) only when content is empty
+// (`[]`, `""`, or null) AND tool_calls is a non-empty array — so we never drop
+// real assistant text.
+//
+// Confirmed against a prod 400 (2026-06-27): 10 of 301 messages had content:[]
+// with tool_calls; the other 85 assistant+tool_calls turns had real content and
+// were accepted.
+func dropEmptyAssistantContentWithToolCalls(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+	out := payload
+	idx := -1
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		idx++
+		if msg.Get("role").String() != "assistant" {
+			return true
+		}
+		toolCalls := msg.Get("tool_calls")
+		if !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
+			return true
+		}
+		content := msg.Get("content")
+		if !isEmptyMessageContent(content) {
+			return true
+		}
+		if updated, err := sjson.DeleteBytes(out, fmt.Sprintf("messages.%d.content", idx)); err == nil {
+			out = updated
+		}
+		return true
+	})
+	return out
+}
+
+// isEmptyMessageContent reports whether a message content value carries no
+// usable text: missing, JSON null, empty string, or empty array.
+func isEmptyMessageContent(content gjson.Result) bool {
+	if !content.Exists() {
+		return true
+	}
+	switch content.Type {
+	case gjson.Null:
+		return true
+	case gjson.String:
+		return strings.TrimSpace(content.String()) == ""
+	default:
+		if content.IsArray() {
+			return len(content.Array()) == 0
+		}
+		return false
+	}
 }

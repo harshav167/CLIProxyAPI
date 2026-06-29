@@ -87,6 +87,40 @@ Both push through `https://kaecilius.ecorp.cc/v1/{traces,logs,metrics}`.
 
 If the user ever has to re-explain that SigNoz is the source of truth, that is a process failure. Update this section the moment any infrastructure detail changes.
 
+## Cursor rendering contract: `delta.reasoning_content` = visible thinking (verified 2026-06-27)
+
+Cursor renders an OpenAI chat-completions stream's **`choices[].delta.reasoning_content`** as the native thinking block. This is THE field. Confirmed on the wire from two independent GLM backends (z.ai coding endpoint: 258 deltas; GMI general endpoint: 518 deltas) — both stream `{"choices":[{"delta":{"reasoning_content":"..."}}]}` and Cursor shows thinking for both. The visible answer then arrives as the normal `delta.content`. No request-side `thinking`/`reasoning_effort` field is required for Cursor to render it — the model/provider emits `reasoning_content` and Cursor picks it up.
+
+- Our chat-completions translators ALREADY emit this correctly:
+  - `internal/translator/claude/openai/chat-completions/claude_openai_response.go` — `thinking_delta` → `choices.0.delta.reasoning_content` (streaming) and `choices.0.message.reasoning_content` (non-stream).
+  - `internal/translator/codex/openai/chat-completions/codex_openai_response.go` — `response.reasoning_summary_text.delta` → `choices.0.delta.reasoning_content`.
+- Opus/GPT thinking visibility caveat: the Opus prod aliases use `thinking.type: adaptive` + `output_config.effort` (the model DECIDES whether to think). An easy turn (e.g. a single tool call) can legitimately return `output_tokens_details.thinking_tokens: 0` and therefore no `reasoning_content` — that is NOT a bug, it's adaptive thinking declining to think. To force thinking every turn, switch the override to `thinking.type: enabled` + `thinking.budget_tokens` (manual) — at higher token cost.
+
+### Image/vision through Cursor (verified 2026-06-27)
+- Cursor pre-processes images itself (needs a real OpenAI API key configured) and DOES send `image_url` + `data:image` base64 in the downstream chat-completions body. Proven on prod: downstream had the JPEG, upstream to z.ai had the identical bytes, our proxy passes it through untouched (`NormalizeGLMRequestBody` never touches image content).
+- Whether a given model "sees" the image depends on the BACKEND deployment, not our proxy: z.ai's coding-plan GLM-5.2 accepts the image (200, ~48K prompt tokens) but the model replies "I can't see it" (text-only deployment); GMI's `zai-org/GLM-5.2-FP8` build is multimodal and describes it. z.ai's real vision model is `glm-5v-turbo` on the GENERAL endpoint (`/api/paas/v4`), not the coding endpoint.
+
+## GLM / Z.AI provider config (prod `openai-compatibility`)
+
+Prod `glm` provider uses the GLM Coding Plan endpoint `https://api.z.ai/api/coding/paas/v4` (subscription; only GLM-5.2 / GLM-5-Turbo / GLM-4.7 callable, no vision). The `gmi` provider (`https://api.gmi-serving.com/v1`, general pay-as-you-go) is a throwaway promo endpoint.
+
+GLM effort aliases use `protocol: openai` payload overrides (matched on the client-facing alias name). Pattern (added 2026-06-27, verified on the wire):
+
+```yaml
+# under openai-compatibility: glm: models:
+  - name: GLM-5.2
+    alias: "glm-5.2-max"     # one model entry per alias
+  - name: GLM-5.2
+    alias: "glm-5.2-high"
+# under override:
+  - models: [{ name: glm-5.2-max, protocol: openai, ... }]
+    params: { stream: true, thinking.type: enabled, reasoning_effort: max,  clear_thinking: false, tool_stream: true }
+  - models: [{ name: glm-5.2-high, protocol: openai, ... }]
+    params: { stream: true, thinking.type: enabled, reasoning_effort: high, clear_thinking: false, tool_stream: true }
+```
+
+Per z.ai spec: `reasoning_effort` only takes effect when `thinking.type: enabled`; `low`/`medium`→`high`, `xhigh`→`max`, `none`/`minimal` skip thinking. `clear_thinking: false` preserves prior-turn `reasoning_content` across turns. `tool_stream: true` streams tool_call deltas (GLM-4.6+). Always back up the hand-edited prod config (`config.yaml.bak-*`) before editing; restart `cli-proxy-api-test` to load.
+
 ## Fork features to preserve across upstream merges
 
 This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me/CLIProxyAPI`) does not have. Every upstream sync MUST keep these intact. List updated 2026-06-13; refresh whenever a fork-only feature is added.
