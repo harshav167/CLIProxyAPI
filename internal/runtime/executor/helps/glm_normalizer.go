@@ -149,10 +149,18 @@ func glmEffortEnablesThinking(level string) bool {
 //
 //   - "none" / "minimal" => the model skips thinking entirely
 //   - "low" / "medium"   => mapped to "high"
-//   - "xhigh"            => mapped to "max"
 //
-// GLM applies these maps server-side anyway, but doing it client-side makes
-// outbound captures less confusing and keeps the wire value stable across
+// We deliberately do NOT remap "xhigh" => "max". Both are valid in z.ai's
+// documented enum, so the remap gains nothing on the direct z.ai API — but it
+// actively breaks GLM served through OpenAI-style relays (cline.bot → Vercel AI
+// Gateway, apikey.fun, etc.) whose effort enum tops out at "xhigh" and rejects
+// "max" with a 400 (`Invalid option: expected one of none|minimal|low|medium|
+// high|xhigh`, param reasoning.effort). Passing "xhigh" through verbatim works
+// on z.ai AND every relay; "max" only works on z.ai direct. Confirmed against a
+// prod cline.bot 400 (2026-07-01).
+//
+// GLM applies the remaining maps server-side anyway, but doing them client-side
+// makes outbound captures less confusing and keeps the wire value stable across
 // upstream behaviour changes.
 func mapGLMReasoningEffortAliases(payload []byte) []byte {
 	effort := gjson.GetBytes(payload, "reasoning_effort")
@@ -167,10 +175,10 @@ func mapGLMReasoningEffortAliases(payload []byte) []byte {
 	switch raw {
 	case "low", "medium":
 		mapped = "high"
-	case "xhigh":
-		mapped = "max"
-	case "high", "max", "minimal", "none":
-		// already a valid GLM enum value; keep as-is
+	case "xhigh", "high", "max", "minimal", "none":
+		// already a valid GLM enum value; keep as-is. "xhigh" in particular
+		// must pass through unchanged so relay gateways (cline/Vercel) that cap
+		// at "xhigh" accept it.
 		return payload
 	default:
 		// Unknown levels are passed through unchanged so GLM can reject or

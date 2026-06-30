@@ -68,9 +68,12 @@ func TestNormalizeGLMRequestBody_DoesNotOverwriteCallerThinking(t *testing.T) {
 
 func TestNormalizeGLMRequestBody_MapsReasoningEffortAliases(t *testing.T) {
 	cases := map[string]string{
-		"low":     "high",
-		"medium":  "high",
-		"xhigh":   "max",
+		"low":    "high",
+		"medium": "high",
+		// "xhigh" must pass through unchanged (NOT remapped to "max"): "max" is
+		// rejected by OpenAI-style relay gateways (cline.bot/Vercel) whose enum
+		// caps at "xhigh", while "xhigh" is valid on both z.ai-direct and relays.
+		"xhigh":   "xhigh",
 		"high":    "high",
 		"max":     "max",
 		"minimal": "minimal",
