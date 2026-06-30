@@ -7,6 +7,8 @@
 package chat_completions
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -198,7 +200,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				// Responses-native tools (e.g. ApplyPatch) keep their transport shape.
 				if customCallIDs[toolCallID] {
 					custOut := []byte(`{"type":"custom_tool_call_output","call_id":"","output":[]}`)
-					custOut, _ = sjson.SetBytes(custOut, "call_id", toolCallID)
+					custOut, _ = sjson.SetBytes(custOut, "call_id", shortenCodexCallIDIfNeeded(toolCallID))
 					blk := []byte(`{"type":"input_text","text":""}`)
 					blk, _ = sjson.SetBytes(blk, "text", content.String())
 					custOut, _ = sjson.SetRawBytes(custOut, "output.-1", blk)
@@ -208,7 +210,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 					// string content, array content, image_url, and file parts.
 					funcOutput := []byte(`{}`)
 					funcOutput, _ = sjson.SetBytes(funcOutput, "type", "function_call_output")
-					funcOutput, _ = sjson.SetBytes(funcOutput, "call_id", toolCallID)
+					funcOutput, _ = sjson.SetBytes(funcOutput, "call_id", shortenCodexCallIDIfNeeded(toolCallID))
 					funcOutput = setToolCallOutputContent(funcOutput, content)
 					out, _ = sjson.SetRawBytes(out, "input.-1", funcOutput)
 				}
@@ -314,7 +316,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 								callID := tc.Get("id").String()
 								if customToolNames[name] {
 									custCall := []byte(`{"type":"custom_tool_call","call_id":"","name":"","input":""}`)
-									custCall, _ = sjson.SetBytes(custCall, "call_id", callID)
+									custCall, _ = sjson.SetBytes(custCall, "call_id", shortenCodexCallIDIfNeeded(callID))
 									custCall, _ = sjson.SetBytes(custCall, "name", name)
 									custCall, _ = sjson.SetBytes(custCall, "input", args)
 									out, _ = sjson.SetRawBytes(out, "input.-1", custCall)
@@ -324,7 +326,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 								// Create function_call as top-level object
 								funcCall := []byte(`{}`)
 								funcCall, _ = sjson.SetBytes(funcCall, "type", "function_call")
-								funcCall, _ = sjson.SetBytes(funcCall, "call_id", callID)
+								funcCall, _ = sjson.SetBytes(funcCall, "call_id", shortenCodexCallIDIfNeeded(callID))
 								funcCall, _ = sjson.SetBytes(funcCall, "name", name)
 								funcCall, _ = sjson.SetBytes(funcCall, "arguments", args)
 								out, _ = sjson.SetRawBytes(out, "input.-1", funcCall)
@@ -530,4 +532,27 @@ func appendToolOutputFallbackPart(output []byte, item gjson.Result) []byte {
 	part, _ = sjson.SetBytes(part, "text", text)
 	output, _ = sjson.SetRawBytes(output, "-1", part)
 	return output
+}
+
+// shortenCodexCallIDIfNeeded deterministically shortens a tool call_id to the
+// 64-character maximum the Codex Responses API enforces on input[].call_id.
+// Clients such as Cursor's newer architecture emit composite ids of the form
+// "call_<id>\nfc_<item_id>" (94 chars) that round-trip through the chat shape;
+// forwarding them verbatim makes the upstream reject the request with
+// "string too long. Expected a string with maximum length 64". The same input
+// always maps to the same output, so a function_call and its paired
+// function_call_output (which carry an identical call_id) stay correlated.
+func shortenCodexCallIDIfNeeded(id string) string {
+	const limit = 64
+	if len(id) <= limit {
+		return id
+	}
+
+	sum := sha256.Sum256([]byte(id))
+	suffix := "_" + hex.EncodeToString(sum[:8])
+	prefixLen := limit - len(suffix)
+	if prefixLen <= 0 {
+		return suffix[len(suffix)-limit:]
+	}
+	return id[:prefixLen] + suffix
 }

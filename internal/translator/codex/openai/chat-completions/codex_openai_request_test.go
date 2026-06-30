@@ -1,6 +1,7 @@
 package chat_completions
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -950,4 +951,84 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 	if !found {
 		t.Errorf("tool 'search' not found in output tools: %s", gjson.Get(result, "tools").Raw)
 	}
+}
+
+// Repro of the prod 400 "input[N].call_id: string too long" failure: Cursor's
+// newer architecture round-trips composite tool ids of the form
+// "call_<id>\nfc_<item_id>" (94 chars) through the chat shape. The Codex
+// Responses API caps input[].call_id at 64 chars, so forwarding them verbatim
+// makes the upstream reject the whole request. The translator must shorten the
+// id deterministically and keep the function_call paired with its output.
+func TestToolCallShortensOverlongCallID(t *testing.T) {
+	longCallID := "call_K05K1CLQtBXOa3QVv07l4Bh2\nfc_01878ba3d557b51cef92a7214eff0653873a1668f38c599fa97505ef8d70c"
+	if len(longCallID) != 94 {
+		t.Fatalf("test fixture should be 94 chars (matches prod repro), got %d", len(longCallID))
+	}
+
+	input := []byte(`{
+		"model": "gpt-5.4",
+		"messages": [
+			{"role": "user", "content": "Search please"},
+			{
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": ` + mustJSONString(longCallID) + `,
+						"type": "function",
+						"function": {"name": "search", "arguments": "{\"q\":\"go\"}"}
+					}
+				]
+			},
+			{
+				"role": "tool",
+				"tool_call_id": ` + mustJSONString(longCallID) + `,
+				"content": "ok"
+			}
+		],
+		"tools": [
+			{"type": "function", "function": {"name": "search", "description": "Search", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.4", input, true)
+	result := string(out)
+
+	var callID, outputCallID string
+	for _, item := range gjson.Get(result, "input").Array() {
+		switch item.Get("type").String() {
+		case "function_call":
+			callID = item.Get("call_id").String()
+		case "function_call_output":
+			outputCallID = item.Get("call_id").String()
+		}
+	}
+
+	if callID == "" || outputCallID == "" {
+		t.Fatalf("expected both function_call and function_call_output, got call=%q output=%q in %s", callID, outputCallID, gjson.Get(result, "input").Raw)
+	}
+	if len(callID) > 64 {
+		t.Errorf("function_call call_id exceeds 64 chars (%d): %q", len(callID), callID)
+	}
+	if len(outputCallID) > 64 {
+		t.Errorf("function_call_output call_id exceeds 64 chars (%d): %q", len(outputCallID), outputCallID)
+	}
+	if callID != outputCallID {
+		t.Errorf("call_id pairing broken: function_call=%q function_call_output=%q", callID, outputCallID)
+	}
+	if callID != shortenCodexCallIDIfNeeded(longCallID) {
+		t.Errorf("call_id not shortened deterministically: got %q want %q", callID, shortenCodexCallIDIfNeeded(longCallID))
+	}
+}
+
+// A short call_id must pass through unchanged.
+func TestToolCallShortCallIDUnchanged(t *testing.T) {
+	if got := shortenCodexCallIDIfNeeded("call_abc123"); got != "call_abc123" {
+		t.Errorf("short call_id should be unchanged, got %q", got)
+	}
+}
+
+func mustJSONString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
