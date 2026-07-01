@@ -239,8 +239,8 @@ func TestLookupModelInfoIncludesClaudeSonnet5(t *testing.T) {
 	if model.MaxCompletionTokens != 128000 {
 		t.Fatalf("Claude Sonnet 5 max completion tokens = %d, want 128000", model.MaxCompletionTokens)
 	}
-	if model.Thinking == nil || !model.Thinking.ZeroAllowed || !model.Thinking.DynamicAllowed || model.Thinking.Min != 0 || model.Thinking.Max != 0 {
-		t.Fatalf("expected Claude Sonnet 5 dynamic level-only thinking with zero allowed, got %+v", model.Thinking)
+	if model.Thinking == nil || !model.Thinking.ZeroAllowed || model.Thinking.Min != 1024 || model.Thinking.Max != 128000 {
+		t.Fatalf("expected Claude Sonnet 5 bounded thinking (min=1024,max=128000,zero_allowed) matching the proven fable-5 shape, got %+v", model.Thinking)
 	}
 	expectedLevels := []string{"low", "medium", "high", "xhigh", "max"}
 	if len(model.Thinking.Levels) != len(expectedLevels) {
