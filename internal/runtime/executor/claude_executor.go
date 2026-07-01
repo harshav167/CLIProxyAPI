@@ -248,7 +248,7 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, prepared.baseModel, prepared.to.String(), prepared.from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = ensureModelMaxTokens(body, prepared.baseModel)
 	body = disableThinkingIfToolChoiceForced(body)
-	body = normalizeClaudeTemperatureForThinking(body)
+	body = normalizeClaudeSamplingForThinking(body)
 
 	if helps.CountClaudeCacheControls(body) == 0 {
 		body = helps.EnsureClaudeCacheControl(body)
@@ -919,21 +919,18 @@ func disableThinkingIfToolChoiceForced(body []byte) []byte {
 	return body
 }
 
-// normalizeClaudeTemperatureForThinking keeps Anthropic message requests valid when
-// thinking is enabled. Anthropic rejects temperatures other than 1 when
-// thinking.type is enabled/adaptive/auto.
-func normalizeClaudeTemperatureForThinking(body []byte) []byte {
-	if !gjson.GetBytes(body, "temperature").Exists() {
-		return body
-	}
-
+// normalizeClaudeSamplingForThinking keeps Anthropic message requests valid when
+// thinking is active. Anthropic rejects non-default sampling while thinking is
+// enabled/adaptive/auto.
+func normalizeClaudeSamplingForThinking(body []byte) []byte {
 	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
 	switch thinkingType {
 	case "enabled", "adaptive", "auto":
-		if temp := gjson.GetBytes(body, "temperature"); temp.Exists() && temp.Type == gjson.Number && temp.Float() == 1 {
-			return body
+		if temp := gjson.GetBytes(body, "temperature"); temp.Exists() && (temp.Type != gjson.Number || temp.Float() != 1) {
+			body, _ = sjson.SetBytes(body, "temperature", 1)
 		}
-		body, _ = sjson.SetBytes(body, "temperature", 1)
+		body, _ = sjson.DeleteBytes(body, "top_p")
+		body, _ = sjson.DeleteBytes(body, "top_k")
 	}
 	return body
 }

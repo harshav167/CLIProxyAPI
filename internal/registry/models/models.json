@@ -120,6 +120,28 @@
       }
     },
     {
+      "id": "claude-sonnet-5",
+      "object": "model",
+      "created": 1782777600,
+      "owned_by": "anthropic",
+      "type": "claude",
+      "display_name": "Claude Sonnet 5",
+      "description": "Anthropic's agentic Sonnet model for coding, tool use, and enterprise workflows",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "zero_allowed": true,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
       "id": "claude-fable-5",
       "object": "model",
       "created": 1781049600,
@@ -1362,29 +1384,6 @@
   ],
   "codex-free": [
     {
-      "id": "gpt-5.4",
-      "object": "model",
-      "created": 1772668800,
-      "owned_by": "openai",
-      "type": "openai",
-      "display_name": "GPT 5.4",
-      "version": "gpt-5.4",
-      "description": "Stable version of GPT 5.4",
-      "context_length": 1050000,
-      "max_completion_tokens": 128000,
-      "supported_parameters": [
-        "tools"
-      ],
-      "thinking": {
-        "levels": [
-          "low",
-          "medium",
-          "high",
-          "xhigh"
-        ]
-      }
-    },
-    {
       "id": "gpt-5.4-mini",
       "object": "model",
       "created": 1773705600,
@@ -2245,15 +2244,8 @@
       "display_name": "Composer 2.5 Fast",
       "name": "grok-composer-2.5-fast",
       "description": "xAI Composer 2.5 Fast model for the Responses API.",
-      "context_length": 256000,
-      "max_completion_tokens": 256000,
-      "thinking": {
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
-      }
+      "context_length": 200000,
+      "max_completion_tokens": 32768
     }
   ]
 }
