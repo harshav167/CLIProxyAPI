@@ -202,9 +202,18 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		}
 	}
 
-	// Process messages and transform them to Claude Code format
+	// Process messages and transform them to Claude Code format.
+	//
+	// Accumulate top-level messages in a slice and write `messages` ONCE after
+	// the loop. The previous code appended each with sjson.SetRawBytes(out,
+	// "messages.-1", ...), re-serialising the growing (up to multi-MB) `out` on
+	// every append -> O(conversationLength^2). Cursor sends this OpenAI shape
+	// even for native Claude models, so this runs on every Opus turn; building a
+	// []string and joining once keeps it linear. (system[] is left inline — it
+	// holds only a handful of blocks, so it is not a scaling hotspot.)
 	if messages := root.Get("messages"); messages.Exists() && messages.IsArray() {
 		messageIndex := 0
+		messageItems := make([]string, 0)
 		messages.ForEach(func(_, message gjson.Result) bool {
 			role := message.Get("role").String()
 			contentResult := message.Get("content")
@@ -282,7 +291,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					})
 				}
 
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+				messageItems = append(messageItems, string(msg))
 				messageIndex++
 
 			case "tool":
@@ -299,7 +308,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				} else {
 					msg, _ = sjson.SetBytes(msg, "content.0.content", toolResultContent)
 				}
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+				messageItems = append(messageItems, string(msg))
 				messageIndex++
 			}
 			return true
@@ -310,9 +319,13 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		if messageIndex == 0 {
 			system := gjson.GetBytes(out, "system")
 			if system.Exists() && system.IsArray() && len(system.Array()) > 0 {
-				fallbackMsg := []byte(`{"role":"user","content":[{"type":"text","text":""}]}`)
-				out, _ = sjson.SetRawBytes(out, "messages.-1", fallbackMsg)
+				messageItems = append(messageItems, `{"role":"user","content":[{"type":"text","text":""}]}`)
 			}
+		}
+
+		// Write the fully-built messages array once (see accumulation note above).
+		if len(messageItems) > 0 {
+			out, _ = sjson.SetRawBytes(out, "messages", []byte("["+strings.Join(messageItems, ",")+"]"))
 		}
 	}
 

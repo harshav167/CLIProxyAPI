@@ -1480,57 +1480,105 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 		}
 	}
 
-	// 3. Rename tool references in messages
+	// 3. Rename tool references in messages.
+	//
+	// Rebuild the messages array in a SINGLE pass rather than calling
+	// sjson.SetBytes(body, "messages.i.content.j...", ...) per matching block.
+	// Each such call re-serialises the entire (up to multi-MB) request body, so
+	// the old per-block loop was O(conversationLength^2) — the dominant cost in
+	// the Cursor→Claude pre-upstream window (proven: ~4x time per 2x body). We
+	// emit each message's Raw unchanged when it has nothing to rename, and only
+	// re-serialise the small per-message content when it does, then write the
+	// messages array back exactly once.
 	messages := gjson.GetBytes(body, "messages")
 	if messages.Exists() && messages.IsArray() {
-		messages.ForEach(func(msgIndex, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if !content.Exists() || !content.IsArray() {
-				return true
+		var mb strings.Builder
+		mb.WriteByte('[')
+		msgCount := 0
+		changedAny := false
+		messages.ForEach(func(_, msg gjson.Result) bool {
+			if msgCount > 0 {
+				mb.WriteByte(',')
 			}
-			content.ForEach(func(contentIndex, part gjson.Result) bool {
-				partType := part.Get("type").String()
-				switch partType {
-				case "tool_use":
-					name := part.Get("name").String()
-					if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
-						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
-						body, _ = sjson.SetBytes(body, path, newName)
-						recordRename(name, newName)
-					}
-				case "tool_reference":
-					toolName := part.Get("tool_name").String()
-					if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
-						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
-						body, _ = sjson.SetBytes(body, path, newName)
-						recordRename(toolName, newName)
-					}
-				case "tool_result":
-					// Handle nested tool_reference blocks inside tool_result.content[]
-					toolID := part.Get("tool_use_id").String()
-					_ = toolID // tool_use_id stays as-is
-					nestedContent := part.Get("content")
-					if nestedContent.Exists() && nestedContent.IsArray() {
-						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
-							if nestedPart.Get("type").String() == "tool_reference" {
-								nestedToolName := nestedPart.Get("tool_name").String()
-								if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
-									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
-									body, _ = sjson.SetBytes(body, nestedPath, newName)
-									recordRename(nestedToolName, newName)
-								}
-							}
-							return true
-						})
-					}
-				}
-				return true
-			})
+			msgCount++
+			msgJSON, changed := renameMessageToolReferences(msg, recordRename)
+			if changed {
+				changedAny = true
+			}
+			mb.WriteString(msgJSON)
 			return true
 		})
+		mb.WriteByte(']')
+		if changedAny {
+			body, _ = sjson.SetRawBytes(body, "messages", []byte(mb.String()))
+		}
 	}
 
 	return body, reverseMap
+}
+
+// renameMessageToolReferences applies OAuth tool-name renames to a single
+// message's tool_use / tool_reference / nested tool_result references and
+// returns the (possibly rewritten) message JSON plus whether anything changed.
+//
+// It re-serialises only this message's own content array (a handful of small
+// blocks) instead of the whole request body, which is what keeps
+// remapOAuthToolNames linear in conversation length. When nothing matches, the
+// original msg.Raw is returned untouched so no-rename turns cost nothing.
+func renameMessageToolReferences(msg gjson.Result, recordRename func(original, renamed string)) (string, bool) {
+	content := msg.Get("content")
+	if !content.Exists() || !content.IsArray() {
+		return msg.Raw, false
+	}
+
+	contentJSON := content.Raw
+	changed := false
+	content.ForEach(func(contentIndex, part gjson.Result) bool {
+		switch part.Get("type").String() {
+		case "tool_use":
+			name := part.Get("name").String()
+			if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+				contentJSON, _ = sjson.Set(contentJSON, fmt.Sprintf("%d.name", contentIndex.Int()), newName)
+				recordRename(name, newName)
+				changed = true
+			}
+		case "tool_reference":
+			toolName := part.Get("tool_name").String()
+			if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
+				contentJSON, _ = sjson.Set(contentJSON, fmt.Sprintf("%d.tool_name", contentIndex.Int()), newName)
+				recordRename(toolName, newName)
+				changed = true
+			}
+		case "tool_result":
+			// tool_use_id stays as-is; only nested tool_reference names change.
+			nestedContent := part.Get("content")
+			if nestedContent.Exists() && nestedContent.IsArray() {
+				nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
+					if nestedPart.Get("type").String() == "tool_reference" {
+						nestedToolName := nestedPart.Get("tool_name").String()
+						if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
+							contentJSON, _ = sjson.Set(contentJSON, fmt.Sprintf("%d.content.%d.tool_name", contentIndex.Int(), nestedIndex.Int()), newName)
+							recordRename(nestedToolName, newName)
+							changed = true
+						}
+					}
+					return true
+				})
+			}
+		}
+		return true
+	})
+
+	if !changed {
+		return msg.Raw, false
+	}
+	updated, err := sjson.SetRaw(msg.Raw, "content", contentJSON)
+	if err != nil {
+		// Fall back to the original message on the rare serialise failure; the
+		// rename is lost but the payload stays valid.
+		return msg.Raw, false
+	}
+	return updated, true
 }
 
 // reverseRemapOAuthToolNames reverses the tool name mapping for non-stream responses

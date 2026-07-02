@@ -178,7 +178,15 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	// Build input from messages, handling all message types including tool calls.
 	// Skip the system message that was promoted to top-level `instructions` above
 	// to avoid duplicating it as a developer-role entry in input[].
-	out, _ = sjson.SetRawBytes(out, "input", []byte(`[]`))
+	//
+	// Accumulate each translated item's raw JSON in a slice and write the whole
+	// `input` array ONCE after the loop. The previous code appended every item
+	// with sjson.SetRawBytes(out, "input.-1", ...), which re-serialises the
+	// entire (up to multi-MB) `out` on each append -> O(conversationLength^2),
+	// the dominant cost of the GPT/Codex request build. Building a []string and
+	// joining once keeps this linear. (Same fix pattern as the Claude executor's
+	// rebuildMidSystemMessagesToTopLevel.)
+	inputItems := make([]string, 0)
 	if messages.IsArray() {
 		arr := messages.Array()
 		for i := 0; i < len(arr); i++ {
@@ -204,7 +212,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 					blk := []byte(`{"type":"input_text","text":""}`)
 					blk, _ = sjson.SetBytes(blk, "text", content.String())
 					custOut, _ = sjson.SetRawBytes(custOut, "output.-1", blk)
-					out, _ = sjson.SetRawBytes(out, "input.-1", custOut)
+					inputItems = append(inputItems, string(custOut))
 				} else {
 					// Standard function_call_output via upstream helper which handles
 					// string content, array content, image_url, and file parts.
@@ -212,7 +220,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 					funcOutput, _ = sjson.SetBytes(funcOutput, "type", "function_call_output")
 					funcOutput, _ = sjson.SetBytes(funcOutput, "call_id", shortenCodexCallIDIfNeeded(toolCallID))
 					funcOutput = setToolCallOutputContent(funcOutput, content)
-					out, _ = sjson.SetRawBytes(out, "input.-1", funcOutput)
+					inputItems = append(inputItems, string(funcOutput))
 				}
 
 			default:
@@ -300,7 +308,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				// are present — Responses API needs function_call items
 				// directly, otherwise call_id matching fails (#2132).
 				if role != "assistant" || len(gjson.GetBytes(msg, "content").Array()) > 0 {
-					out, _ = sjson.SetRawBytes(out, "input.-1", msg)
+					inputItems = append(inputItems, string(msg))
 				}
 
 				// Handle tool calls for assistant messages as separate top-level objects
@@ -319,7 +327,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 									custCall, _ = sjson.SetBytes(custCall, "call_id", shortenCodexCallIDIfNeeded(callID))
 									custCall, _ = sjson.SetBytes(custCall, "name", name)
 									custCall, _ = sjson.SetBytes(custCall, "input", args)
-									out, _ = sjson.SetRawBytes(out, "input.-1", custCall)
+									inputItems = append(inputItems, string(custCall))
 									continue
 								}
 
@@ -329,7 +337,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 								funcCall, _ = sjson.SetBytes(funcCall, "call_id", shortenCodexCallIDIfNeeded(callID))
 								funcCall, _ = sjson.SetBytes(funcCall, "name", name)
 								funcCall, _ = sjson.SetBytes(funcCall, "arguments", args)
-								out, _ = sjson.SetRawBytes(out, "input.-1", funcCall)
+								inputItems = append(inputItems, string(funcCall))
 							}
 						}
 					}
@@ -337,6 +345,8 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 			}
 		}
 	}
+	// Write the fully-built input array once (see accumulation note above).
+	out, _ = sjson.SetRawBytes(out, "input", []byte("["+strings.Join(inputItems, ",")+"]"))
 
 	// Map response_format and text settings to Responses API text.format
 	rf := gjson.GetBytes(rawJSON, "response_format")
