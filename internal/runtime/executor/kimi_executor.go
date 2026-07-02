@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -115,6 +117,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if err != nil {
 		return resp, err
 	}
+	body = ensureKimiPromptCacheKey(body)
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
 
 	url := kimiauth.KimiAPIBaseURL + "/v1/chat/completions"
@@ -228,6 +231,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
+	body = ensureKimiPromptCacheKey(body)
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
 
 	url := kimiauth.KimiAPIBaseURL + "/v1/chat/completions"
@@ -329,6 +333,92 @@ func (e *KimiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth,
 	return e.ClaudeExecutor.CountTokens(ctx, auth, req, opts)
 }
 
+// ensureKimiPromptCacheKey injects a deterministic prompt_cache_key derived from
+// the conversation's stable prefix (system prompt + first user message) when the
+// caller has not supplied one.
+//
+// Kimi K2.* uses automatic server-side prefix caching, so cache hits already
+// occur without this field. But per Kimi's docs, prompt_cache_key is a
+// scheduling hint: requests sharing the same key are sticky-routed to the same
+// cache cluster, which keeps the prefix-cache hit rate high under load /
+// cluster rebalancing. Cursor does not send a session id, so we synthesise a
+// stable key from content that does not change across turns of one conversation
+// (the system prompt and the first user message). Later turns append messages
+// but keep that prefix identical, so the key stays constant for the whole
+// conversation and drifts only when a genuinely new conversation starts.
+//
+// If the caller already set prompt_cache_key we never overwrite it.
+func ensureKimiPromptCacheKey(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()) != "" {
+		return body
+	}
+	key := kimiConversationCacheKey(gjson.GetBytes(body, "messages"))
+	if key == "" {
+		return body
+	}
+	updated, err := sjson.SetBytes(body, "prompt_cache_key", key)
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+// kimiConversationCacheKey builds a stable session identifier from the first
+// system block and the first user message. Returns "" when neither is present
+// (nothing stable to key on).
+func kimiConversationCacheKey(messages gjson.Result) string {
+	if !messages.Exists() || !messages.IsArray() {
+		return ""
+	}
+	var sys, firstUser string
+	haveSys, haveUser := false, false
+	for _, msg := range messages.Array() {
+		role := strings.TrimSpace(msg.Get("role").String())
+		switch role {
+		case "system", "developer":
+			if !haveSys {
+				sys = kimiMessageText(msg)
+				haveSys = true
+			}
+		case "user":
+			if !haveUser {
+				firstUser = kimiMessageText(msg)
+				haveUser = true
+			}
+		}
+		if haveSys && haveUser {
+			break
+		}
+	}
+	if sys == "" && firstUser == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(sys + "\x00" + firstUser))
+	return "cpa-" + hex.EncodeToString(sum[:16])
+}
+
+// kimiMessageText flattens a message's content (string or array-of-parts) to a
+// single string for hashing.
+func kimiMessageText(msg gjson.Result) string {
+	content := msg.Get("content")
+	if content.Type == gjson.String {
+		return content.String()
+	}
+	if content.IsArray() {
+		parts := make([]string, 0, len(content.Array()))
+		for _, item := range content.Array() {
+			if t := item.Get("text"); t.Exists() {
+				parts = append(parts, t.String())
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
 func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return body, nil
@@ -354,8 +444,6 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 	patched := 0
 	patchedReasoning := 0
 	ambiguous := 0
-	latestReasoning := ""
-	hasLatestReasoning := false
 
 	removePending := func(id string) {
 		for idx := range pending {
@@ -373,13 +461,6 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 		switch role {
 		case "assistant":
 			reasoning := msg.Get("reasoning_content")
-			if reasoning.Exists() {
-				reasoningText := reasoning.String()
-				if strings.TrimSpace(reasoningText) != "" {
-					latestReasoning = reasoningText
-					hasLatestReasoning = true
-				}
-			}
 
 			toolCalls := msg.Get("tool_calls")
 			if !toolCalls.Exists() || !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
@@ -387,7 +468,7 @@ func normalizeKimiToolMessageLinks(body []byte) ([]byte, error) {
 			}
 
 			if !reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "" {
-				reasoningText := fallbackAssistantReasoning(msg, hasLatestReasoning, latestReasoning)
+				reasoningText := fallbackAssistantReasoning(msg)
 				path := fmt.Sprintf("messages.%d.reasoning_content", msgIdx)
 				next, err := sjson.SetBytes(out, path, reasoningText)
 				if err != nil {
@@ -544,11 +625,26 @@ func isKimiAssistantContentPartEmpty(part gjson.Result) bool {
 	return strings.TrimSpace(part.Raw) == "{}"
 }
 
-func fallbackAssistantReasoning(msg gjson.Result, hasLatest bool, latest string) string {
-	if hasLatest && strings.TrimSpace(latest) != "" {
-		return latest
-	}
+// kimiReasoningPlaceholder is the neutral filler used when a historical
+// assistant tool-call turn arrives with no reasoning_content and no usable
+// content of its own. Kimi K2.* thinking models require a non-empty
+// reasoning_content on assistant turns that carry tool_calls, so the field
+// cannot simply be omitted. The value is intentionally short, neutral, and
+// constant so it (a) reads as innocuous filler rather than the alarming
+// "[reasoning unavailable]" that used to surface in the UI, and (b) stays
+// byte-stable so it never breaks Kimi's prefix cache.
+const kimiReasoningPlaceholder = "(continuing)"
 
+// fallbackAssistantReasoning derives a reasoning_content value for an assistant
+// tool-call turn that arrived without one.
+//
+// It ONLY ever uses this turn's own content — never another turn's reasoning.
+// The previous implementation copied the most recent reasoning from an earlier
+// turn onto this one, which paired mismatched reasoning with the wrong tool
+// action and produced confused, rambling reasoning in downstream turns. Using
+// only the message's own content (or a neutral constant when it has none) keeps
+// each turn's reasoning coherent with its own action.
+func fallbackAssistantReasoning(msg gjson.Result) string {
 	content := msg.Get("content")
 	if content.Type == gjson.String {
 		if text := strings.TrimSpace(content.String()); text != "" {
@@ -569,7 +665,7 @@ func fallbackAssistantReasoning(msg gjson.Result, hasLatest bool, latest string)
 		}
 	}
 
-	return "[reasoning unavailable]"
+	return kimiReasoningPlaceholder
 }
 
 // Refresh refreshes the Kimi token using the refresh token.

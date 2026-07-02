@@ -6,6 +6,38 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestEnsureKimiPromptCacheKey_InjectsStableKey(t *testing.T) {
+	// Two turns of the SAME conversation: same system + first user, different
+	// trailing messages. They must produce the SAME prompt_cache_key so Kimi
+	// sticky-routes them to the same prefix-cache shard.
+	turn1 := []byte(`{"messages":[{"role":"system","content":"sys prompt"},{"role":"user","content":"do X"}]}`)
+	turn2 := []byte(`{"messages":[{"role":"system","content":"sys prompt"},{"role":"user","content":"do X"},{"role":"assistant","content":"ok"},{"role":"user","content":"now Y"}]}`)
+
+	k1 := gjson.GetBytes(ensureKimiPromptCacheKey(turn1), "prompt_cache_key").String()
+	k2 := gjson.GetBytes(ensureKimiPromptCacheKey(turn2), "prompt_cache_key").String()
+	if k1 == "" {
+		t.Fatal("expected prompt_cache_key to be injected")
+	}
+	if k1 != k2 {
+		t.Fatalf("prompt_cache_key not stable across turns: %q vs %q", k1, k2)
+	}
+
+	// A different conversation (different first user message) must get a different key.
+	other := []byte(`{"messages":[{"role":"system","content":"sys prompt"},{"role":"user","content":"different task"}]}`)
+	k3 := gjson.GetBytes(ensureKimiPromptCacheKey(other), "prompt_cache_key").String()
+	if k3 == k1 {
+		t.Fatalf("expected different conversation to get a different key, both were %q", k1)
+	}
+}
+
+func TestEnsureKimiPromptCacheKey_DoesNotOverwriteCaller(t *testing.T) {
+	body := []byte(`{"prompt_cache_key":"caller-set","messages":[{"role":"user","content":"hi"}]}`)
+	got := gjson.GetBytes(ensureKimiPromptCacheKey(body), "prompt_cache_key").String()
+	if got != "caller-set" {
+		t.Fatalf("caller prompt_cache_key overwritten: got %q, want %q", got, "caller-set")
+	}
+}
+
 func TestNormalizeKimiToolMessageLinks_UsesCallIDFallback(t *testing.T) {
 	body := []byte(`{
 		"messages":[
@@ -84,7 +116,11 @@ func TestNormalizeKimiToolMessageLinks_PreservesExistingToolCallID(t *testing.T)
 	}
 }
 
-func TestNormalizeKimiToolMessageLinks_InheritsPreviousReasoningForAssistantToolCalls(t *testing.T) {
+func TestNormalizeKimiToolMessageLinks_DoesNotInheritOtherTurnReasoning(t *testing.T) {
+	// A tool-call turn with no reasoning of its own must NOT inherit an earlier
+	// turn's reasoning. Copying "previous reasoning" onto message[1] pairs it with
+	// the wrong tool action and produced the confused, rambling reasoning users
+	// saw. message[1] has no own content, so it gets the neutral placeholder.
 	body := []byte(`{
 		"messages":[
 			{"role":"assistant","content":"plan","reasoning_content":"previous reasoning"},
@@ -97,9 +133,11 @@ func TestNormalizeKimiToolMessageLinks_InheritsPreviousReasoningForAssistantTool
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	got := gjson.GetBytes(out, "messages.1.reasoning_content").String()
-	if got != "previous reasoning" {
-		t.Fatalf("messages.1.reasoning_content = %q, want %q", got, "previous reasoning")
+	if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != kimiReasoningPlaceholder {
+		t.Fatalf("messages.1.reasoning_content = %q, want %q (must not inherit other turn's reasoning)", got, kimiReasoningPlaceholder)
+	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "previous reasoning" {
+		t.Fatalf("messages.0.reasoning_content = %q, want %q (original must be intact)", got, "previous reasoning")
 	}
 }
 
@@ -119,8 +157,8 @@ func TestNormalizeKimiToolMessageLinks_InsertsFallbackReasoningWhenMissing(t *te
 	if !reasoning.Exists() {
 		t.Fatalf("messages.0.reasoning_content should exist")
 	}
-	if reasoning.String() != "[reasoning unavailable]" {
-		t.Fatalf("messages.0.reasoning_content = %q, want %q", reasoning.String(), "[reasoning unavailable]")
+	if reasoning.String() != kimiReasoningPlaceholder {
+		t.Fatalf("messages.0.reasoning_content = %q, want %q", reasoning.String(), kimiReasoningPlaceholder)
 	}
 }
 
@@ -199,8 +237,16 @@ func TestNormalizeKimiToolMessageLinks_RepairsIDsAndReasoningTogether(t *testing
 	if got := gjson.GetBytes(out, "messages.3.tool_call_id").String(); got != "call_2" {
 		t.Fatalf("messages.3.tool_call_id = %q, want %q", got, "call_2")
 	}
-	if got := gjson.GetBytes(out, "messages.2.reasoning_content").String(); got != "r1" {
-		t.Fatalf("messages.2.reasoning_content = %q, want %q", got, "r1")
+	// messages.2 is a tool-call turn with no reasoning and no own content. We must
+	// NOT copy message[0]'s "r1" onto it (that mismatched reasoning with the wrong
+	// action and produced confused downstream reasoning). It gets the neutral
+	// placeholder instead.
+	if got := gjson.GetBytes(out, "messages.2.reasoning_content").String(); got != kimiReasoningPlaceholder {
+		t.Fatalf("messages.2.reasoning_content = %q, want %q", got, kimiReasoningPlaceholder)
+	}
+	// message[0]'s own reasoning must be left intact.
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "r1" {
+		t.Fatalf("messages.0.reasoning_content = %q, want %q", got, "r1")
 	}
 }
 
