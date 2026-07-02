@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -117,6 +118,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if err != nil {
 		return resp, err
 	}
+	body = normalizeKimiToolSchemaRefs(body)
 	body = ensureKimiPromptCacheKey(body)
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
 
@@ -231,6 +233,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
+	body = normalizeKimiToolSchemaRefs(body)
 	body = ensureKimiPromptCacheKey(body)
 	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
 
@@ -331,6 +334,159 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 func (e *KimiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
 	return e.ClaudeExecutor.CountTokens(ctx, auth, req, opts)
+}
+
+// normalizeKimiToolSchemaRefs rewrites JSON-Schema $ref usages in tool
+// parameter schemas that Kimi/Moonshot rejects.
+//
+// Moonshot's schema validator ONLY accepts $ref values that start with
+// "#/$defs/". Cursor emits sibling/self references such as
+//
+//	"final_summary": {"$ref": "#/properties/current_step", "description": "..."}
+//
+// (reusing another property's type and overriding just the description). Kimi
+// 422s the entire request with:
+//
+//	tools.function.parameters is not a valid moonshot flavored json schema,
+//	details: <At path 'properties.final_summary.$ref': references must start
+//	with #/$defs/>
+//
+// which makes every tool call in that request fail (observed in prod when
+// subagents were enabled: the UpdateCurrentStep tool carries these refs and no
+// $defs block at all).
+//
+// The fix is to INLINE-resolve any $ref that does not point under #/$defs/:
+// replace the ref-bearing object with a copy of the referenced subschema, then
+// re-apply the object's own sibling keys (e.g. description) so local overrides
+// win. This yields a semantically identical, ref-free schema Moonshot accepts.
+// Refs already under #/$defs/ are left untouched. No-op for non-tool traffic.
+func normalizeKimiToolSchemaRefs(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return body
+	}
+	out := body
+	idx := -1
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		idx++
+		params := tool.Get("function.parameters")
+		if !params.Exists() || !params.IsObject() {
+			return true
+		}
+		if !strings.Contains(params.Raw, `"$ref"`) {
+			return true
+		}
+		var root map[string]any
+		if err := json.Unmarshal([]byte(params.Raw), &root); err != nil {
+			return true
+		}
+		if !inlineKimiSchemaRefs(root, root, 0) {
+			return true
+		}
+		rewritten, err := json.Marshal(root)
+		if err != nil {
+			return true
+		}
+		if updated, errSet := sjson.SetRawBytes(out, fmt.Sprintf("tools.%d.function.parameters", idx), rewritten); errSet == nil {
+			out = updated
+		}
+		return true
+	})
+	return out
+}
+
+// inlineKimiSchemaRefs walks a parsed JSON-schema node, replacing every $ref
+// that does not start with "#/$defs/" with the subschema it points at (resolved
+// against root), preserving the ref object's sibling keys as overrides. Returns
+// whether it changed anything. Bounded recursion depth guards against ref
+// cycles and pathological nesting.
+func inlineKimiSchemaRefs(node any, root map[string]any, depth int) bool {
+	if depth > 64 {
+		return false
+	}
+	changed := false
+	switch typed := node.(type) {
+	case map[string]any:
+		if ref, ok := typed["$ref"].(string); ok && ref != "" && !strings.HasPrefix(ref, "#/$defs/") {
+			if resolved, ok := resolveKimiJSONPointer(root, ref); ok {
+				// Start from a copy of the resolved target, then overlay the
+				// ref object's own keys (except $ref) so local overrides win.
+				for k := range typed {
+					if k == "$ref" {
+						continue
+					}
+					resolved[k] = typed[k]
+				}
+				// Replace node contents in place: clear then copy merged result.
+				for k := range typed {
+					delete(typed, k)
+				}
+				for k, v := range resolved {
+					typed[k] = v
+				}
+				changed = true
+			}
+		}
+		for _, v := range typed {
+			if inlineKimiSchemaRefs(v, root, depth+1) {
+				changed = true
+			}
+		}
+	case []any:
+		for _, v := range typed {
+			if inlineKimiSchemaRefs(v, root, depth+1) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// resolveKimiJSONPointer resolves a local JSON pointer like
+// "#/properties/current_step" against root and returns a deep copy of the
+// target object. Only fragment ("#/...") pointers are supported. Returns
+// (copy, true) on success.
+func resolveKimiJSONPointer(root map[string]any, ref string) (map[string]any, bool) {
+	if !strings.HasPrefix(ref, "#/") {
+		return nil, false
+	}
+	var cur any = root
+	for _, rawTok := range strings.Split(strings.TrimPrefix(ref, "#/"), "/") {
+		tok := strings.ReplaceAll(strings.ReplaceAll(rawTok, "~1", "/"), "~0", "~")
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		next, exists := m[tok]
+		if !exists {
+			return nil, false
+		}
+		cur = next
+	}
+	target, ok := cur.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	copied, ok := deepCopyJSONMap(target)
+	if !ok {
+		return nil, false
+	}
+	return copied, true
+}
+
+func deepCopyJSONMap(m map[string]any) (map[string]any, bool) {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, false
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // ensureKimiPromptCacheKey injects a deterministic prompt_cache_key derived from
@@ -625,25 +781,22 @@ func isKimiAssistantContentPartEmpty(part gjson.Result) bool {
 	return strings.TrimSpace(part.Raw) == "{}"
 }
 
-// kimiReasoningPlaceholder is the neutral filler used when a historical
-// assistant tool-call turn arrives with no reasoning_content and no usable
-// content of its own. Kimi K2.* thinking models require a non-empty
-// reasoning_content on assistant turns that carry tool_calls, so the field
-// cannot simply be omitted. The value is intentionally short, neutral, and
-// constant so it (a) reads as innocuous filler rather than the alarming
-// "[reasoning unavailable]" that used to surface in the UI, and (b) stays
-// byte-stable so it never breaks Kimi's prefix cache.
-const kimiReasoningPlaceholder = "(continuing)"
-
 // fallbackAssistantReasoning derives a reasoning_content value for an assistant
-// tool-call turn that arrived without one.
+// tool-call turn that arrived without one. Kimi K2.* thinking models require a
+// non-empty reasoning_content on assistant turns that carry tool_calls, so the
+// field cannot be omitted.
 //
-// It ONLY ever uses this turn's own content — never another turn's reasoning.
-// The previous implementation copied the most recent reasoning from an earlier
-// turn onto this one, which paired mismatched reasoning with the wrong tool
-// action and produced confused, rambling reasoning in downstream turns. Using
-// only the message's own content (or a neutral constant when it has none) keeps
-// each turn's reasoning coherent with its own action.
+// The value MUST be genuine, self-contained reasoning text about THIS turn's own
+// action — never a generic placeholder token. Kimi K2.7's thinking model is
+// stateful across turns: if a prior assistant turn's reasoning is a bare marker
+// like "(continuing)" or "[reasoning unavailable]", the model latches onto it
+// and every subsequent turn's reasoning degenerates into echoing that marker
+// (confirmed in prod: all displayed thinking became "(continuing)"). Describing
+// the tool call the assistant actually made gives the model coherent, per-turn
+// reasoning to continue from and avoids that feedback loop.
+//
+// Precedence: (1) the message's own text content, (2) a sentence synthesised
+// from the tool call(s) it made, (3) a last-resort complete sentence.
 func fallbackAssistantReasoning(msg gjson.Result) string {
 	content := msg.Get("content")
 	if content.Type == gjson.String {
@@ -665,7 +818,35 @@ func fallbackAssistantReasoning(msg gjson.Result) string {
 		}
 	}
 
-	return kimiReasoningPlaceholder
+	// Synthesise reasoning from the tool call(s) this turn made. This is real,
+	// action-specific text the thinking model can coherently continue from.
+	if names := kimiToolCallNames(msg); len(names) > 0 {
+		if len(names) == 1 {
+			return "I'll use the " + names[0] + " tool to make progress on the task."
+		}
+		return "I'll use these tools to make progress on the task: " + strings.Join(names, ", ") + "."
+	}
+
+	// Last resort: a complete, self-contained sentence (never an open-ended
+	// marker that the model would parrot).
+	return "Proceeding with the next step based on the results so far."
+}
+
+// kimiToolCallNames returns the function names of an assistant message's
+// tool_calls, in order, skipping empties.
+func kimiToolCallNames(msg gjson.Result) []string {
+	toolCalls := msg.Get("tool_calls")
+	if !toolCalls.IsArray() {
+		return nil
+	}
+	names := make([]string, 0, len(toolCalls.Array()))
+	for _, tc := range toolCalls.Array() {
+		name := strings.TrimSpace(tc.Get("function.name").String())
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // Refresh refreshes the Kimi token using the refresh token.

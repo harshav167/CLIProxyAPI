@@ -1,10 +1,64 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+// TestNormalizeKimiToolSchemaRefs_InlinesSiblingRef reproduces the exact prod
+// failure: Cursor's UpdateCurrentStep tool has final_summary / completed_subtitle
+// referencing a sibling property via {"$ref":"#/properties/current_step"}, with
+// no $defs block. Moonshot rejects any $ref not under #/$defs/. After
+// normalisation there must be no $ref, and the ref-ing properties must inherit
+// current_step's type while keeping their own description.
+func TestNormalizeKimiToolSchemaRefs_InlinesSiblingRef(t *testing.T) {
+	body := []byte(`{"model":"kimi-k2.7-code","messages":[],"tools":[{"type":"function","function":{"name":"UpdateCurrentStep","parameters":{"type":"object","properties":{"current_step":{"type":"string","minLength":1,"description":"Major step"},"final_summary":{"$ref":"#/properties/current_step","description":"Exec summary"},"completed_subtitle":{"$ref":"#/properties/current_step","description":"Past-tense subtitle"}}}}}]}`)
+
+	out := normalizeKimiToolSchemaRefs(body)
+
+	if strings.Contains(string(out), `"$ref"`) {
+		t.Fatalf("expected all $ref removed, got: %s", out)
+	}
+	p := "tools.0.function.parameters.properties."
+	if got := gjson.GetBytes(out, p+"final_summary.type").String(); got != "string" {
+		t.Fatalf("final_summary.type = %q, want string", got)
+	}
+	if got := gjson.GetBytes(out, p+"final_summary.minLength").Int(); got != 1 {
+		t.Fatalf("final_summary.minLength = %d, want 1 (inherited)", got)
+	}
+	if got := gjson.GetBytes(out, p+"final_summary.description").String(); got != "Exec summary" {
+		t.Fatalf("final_summary.description = %q, want local override 'Exec summary'", got)
+	}
+	if got := gjson.GetBytes(out, p+"completed_subtitle.type").String(); got != "string" {
+		t.Fatalf("completed_subtitle.type = %q, want string", got)
+	}
+	if got := gjson.GetBytes(out, p+"completed_subtitle.description").String(); got != "Past-tense subtitle" {
+		t.Fatalf("completed_subtitle.description = %q, want local override", got)
+	}
+	// current_step (the ref target) must be untouched.
+	if got := gjson.GetBytes(out, p+"current_step.description").String(); got != "Major step" {
+		t.Fatalf("current_step.description = %q, want 'Major step'", got)
+	}
+}
+
+// $defs refs are already Moonshot-valid and must be left as-is.
+func TestNormalizeKimiToolSchemaRefs_LeavesDefsRefsAlone(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","function":{"name":"T","parameters":{"type":"object","properties":{"x":{"$ref":"#/$defs/Foo"}},"$defs":{"Foo":{"type":"string"}}}}}]}`)
+	out := normalizeKimiToolSchemaRefs(body)
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.x.$ref").String(); got != "#/$defs/Foo" {
+		t.Fatalf("valid #/$defs/ ref should be preserved, got %q (body=%s)", got, out)
+	}
+}
+
+// No tools / no refs => untouched.
+func TestNormalizeKimiToolSchemaRefs_Noop(t *testing.T) {
+	body := []byte(`{"model":"kimi-k2.7-code","messages":[{"role":"user","content":"hi"}]}`)
+	if got := normalizeKimiToolSchemaRefs(body); string(got) != string(body) {
+		t.Fatalf("expected no-op, body changed:\n in=%s\nout=%s", body, got)
+	}
+}
 
 func TestEnsureKimiPromptCacheKey_InjectsStableKey(t *testing.T) {
 	// Two turns of the SAME conversation: same system + first user, different
@@ -133,8 +187,14 @@ func TestNormalizeKimiToolMessageLinks_DoesNotInheritOtherTurnReasoning(t *testi
 		t.Fatalf("normalizeKimiToolMessageLinks() error = %v", err)
 	}
 
-	if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != kimiReasoningPlaceholder {
-		t.Fatalf("messages.1.reasoning_content = %q, want %q (must not inherit other turn's reasoning)", got, kimiReasoningPlaceholder)
+	// message[1] must NOT inherit message[0]'s "previous reasoning"; it gets
+	// reasoning synthesised from its OWN tool call instead.
+	wantSynth := "I'll use the list_directory tool to make progress on the task."
+	if got := gjson.GetBytes(out, "messages.1.reasoning_content").String(); got != wantSynth {
+		t.Fatalf("messages.1.reasoning_content = %q, want %q (synthesised from own tool call, not inherited)", got, wantSynth)
+	}
+	if strings.Contains(gjson.GetBytes(out, "messages.1.reasoning_content").String(), "continuing") {
+		t.Fatalf("reasoning must never be a bare (continuing) marker")
 	}
 	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "previous reasoning" {
 		t.Fatalf("messages.0.reasoning_content = %q, want %q (original must be intact)", got, "previous reasoning")
@@ -157,8 +217,9 @@ func TestNormalizeKimiToolMessageLinks_InsertsFallbackReasoningWhenMissing(t *te
 	if !reasoning.Exists() {
 		t.Fatalf("messages.0.reasoning_content should exist")
 	}
-	if reasoning.String() != kimiReasoningPlaceholder {
-		t.Fatalf("messages.0.reasoning_content = %q, want %q", reasoning.String(), kimiReasoningPlaceholder)
+	want := "I'll use the list_directory tool to make progress on the task."
+	if reasoning.String() != want {
+		t.Fatalf("messages.0.reasoning_content = %q, want %q", reasoning.String(), want)
 	}
 }
 
@@ -239,10 +300,11 @@ func TestNormalizeKimiToolMessageLinks_RepairsIDsAndReasoningTogether(t *testing
 	}
 	// messages.2 is a tool-call turn with no reasoning and no own content. We must
 	// NOT copy message[0]'s "r1" onto it (that mismatched reasoning with the wrong
-	// action and produced confused downstream reasoning). It gets the neutral
-	// placeholder instead.
-	if got := gjson.GetBytes(out, "messages.2.reasoning_content").String(); got != kimiReasoningPlaceholder {
-		t.Fatalf("messages.2.reasoning_content = %q, want %q", got, kimiReasoningPlaceholder)
+	// action and produced confused downstream reasoning). It gets reasoning
+	// synthesised from its OWN tool call (read_file) instead.
+	wantSynth := "I'll use the read_file tool to make progress on the task."
+	if got := gjson.GetBytes(out, "messages.2.reasoning_content").String(); got != wantSynth {
+		t.Fatalf("messages.2.reasoning_content = %q, want %q", got, wantSynth)
 	}
 	// message[0]'s own reasoning must be left intact.
 	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "r1" {
