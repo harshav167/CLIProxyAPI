@@ -195,6 +195,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
 	// Ensure we at least record the request even if upstream doesn't return usage
 	reporter.EnsurePublished(ctx)
+	// Kimi K2 via OpenAI-compat relays (Ollama/Fireworks) wraps reasoning in
+	// <think>/</think> sentinels; strip them before translation. No-op for
+	// non-Kimi models.
+	body = helps.NormalizeKimiReasoningNonStream(baseModel, body)
 	// Translate response back to source format when needed
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, body, &param)
@@ -429,7 +433,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 
 			// OpenAI-compatible streams must use SSE data lines.
-			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param)
+			// Kimi K2 served through OpenAI-compat relays (Ollama/Fireworks)
+			// wraps reasoning in unbalanced <think>/</think> sentinels; strip
+			// them before translation so they neither render raw nor corrupt
+			// the next turn's tool-call reconstruction. No-op for non-Kimi.
+			streamLine := helps.NormalizeKimiReasoningStreamLine(baseModel, bytes.Clone(trimmedLine))
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, streamLine, &param)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
