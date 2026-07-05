@@ -87,6 +87,40 @@ Both push through `https://kaecilius.ecorp.cc/v1/{traces,logs,metrics}`.
 
 If the user ever has to re-explain that SigNoz is the source of truth, that is a process failure. Update this section the moment any infrastructure detail changes.
 
+## Cursor rendering contract: `delta.reasoning_content` = visible thinking (verified 2026-06-27)
+
+Cursor renders an OpenAI chat-completions stream's **`choices[].delta.reasoning_content`** as the native thinking block. This is THE field. Confirmed on the wire from two independent GLM backends (z.ai coding endpoint: 258 deltas; GMI general endpoint: 518 deltas) — both stream `{"choices":[{"delta":{"reasoning_content":"..."}}]}` and Cursor shows thinking for both. The visible answer then arrives as the normal `delta.content`. No request-side `thinking`/`reasoning_effort` field is required for Cursor to render it — the model/provider emits `reasoning_content` and Cursor picks it up.
+
+- Our chat-completions translators ALREADY emit this correctly:
+  - `internal/translator/claude/openai/chat-completions/claude_openai_response.go` — `thinking_delta` → `choices.0.delta.reasoning_content` (streaming) and `choices.0.message.reasoning_content` (non-stream).
+  - `internal/translator/codex/openai/chat-completions/codex_openai_response.go` — `response.reasoning_summary_text.delta` → `choices.0.delta.reasoning_content`.
+- Opus/GPT thinking visibility caveat: the Opus prod aliases use `thinking.type: adaptive` + `output_config.effort` (the model DECIDES whether to think). An easy turn (e.g. a single tool call) can legitimately return `output_tokens_details.thinking_tokens: 0` and therefore no `reasoning_content` — that is NOT a bug, it's adaptive thinking declining to think. To force thinking every turn, switch the override to `thinking.type: enabled` + `thinking.budget_tokens` (manual) — at higher token cost.
+
+### Image/vision through Cursor (verified 2026-06-27)
+- Cursor pre-processes images itself (needs a real OpenAI API key configured) and DOES send `image_url` + `data:image` base64 in the downstream chat-completions body. Proven on prod: downstream had the JPEG, upstream to z.ai had the identical bytes, our proxy passes it through untouched (`NormalizeGLMRequestBody` never touches image content).
+- Whether a given model "sees" the image depends on the BACKEND deployment, not our proxy: z.ai's coding-plan GLM-5.2 accepts the image (200, ~48K prompt tokens) but the model replies "I can't see it" (text-only deployment); GMI's `zai-org/GLM-5.2-FP8` build is multimodal and describes it. z.ai's real vision model is `glm-5v-turbo` on the GENERAL endpoint (`/api/paas/v4`), not the coding endpoint.
+
+## GLM / Z.AI provider config (prod `openai-compatibility`)
+
+Prod `glm` provider uses the GLM Coding Plan endpoint `https://api.z.ai/api/coding/paas/v4` (subscription; only GLM-5.2 / GLM-5-Turbo / GLM-4.7 callable, no vision). The `gmi` provider (`https://api.gmi-serving.com/v1`, general pay-as-you-go) is a throwaway promo endpoint.
+
+GLM effort aliases use `protocol: openai` payload overrides (matched on the client-facing alias name). Pattern (added 2026-06-27, verified on the wire):
+
+```yaml
+# under openai-compatibility: glm: models:
+  - name: GLM-5.2
+    alias: "glm-5.2-max"     # one model entry per alias
+  - name: GLM-5.2
+    alias: "glm-5.2-high"
+# under override:
+  - models: [{ name: glm-5.2-max, protocol: openai, ... }]
+    params: { stream: true, thinking.type: enabled, reasoning_effort: max,  clear_thinking: false, tool_stream: true }
+  - models: [{ name: glm-5.2-high, protocol: openai, ... }]
+    params: { stream: true, thinking.type: enabled, reasoning_effort: high, clear_thinking: false, tool_stream: true }
+```
+
+Per z.ai spec: `reasoning_effort` only takes effect when `thinking.type: enabled`; `low`/`medium`→`high`, `xhigh`→`max`, `none`/`minimal` skip thinking. `clear_thinking: false` preserves prior-turn `reasoning_content` across turns. `tool_stream: true` streams tool_call deltas (GLM-4.6+). Always back up the hand-edited prod config (`config.yaml.bak-*`) before editing; restart `cli-proxy-api-test` to load.
+
 ## Fork features to preserve across upstream merges
 
 This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me/CLIProxyAPI`) does not have. Every upstream sync MUST keep these intact. List updated 2026-06-13; refresh whenever a fork-only feature is added.
@@ -130,9 +164,21 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
 - `internal/config/config.go` — `ClaudeCursorGlobalCacheScope` config flag (feature-gates `scope:"global"` on the last system block, defaults on in prod via `cliproxy-config.yaml`).
 - `internal/runtime/executor/helps/claude_cache_control.go` — `EnsureClaudeCacheControl`, `EnsureClaudeUserPromptCacheAnchor`, `CountClaudeCacheControls`. Anchor strategy mirrors Claude Code 2.1.156 Opus 4.8.
 
+### GLM / Z.AI request normalisation (NOT upstream)
+- `internal/runtime/executor/helps/glm_normalizer.go::NormalizeGLMRequestBody` runs on the openai-compat path (both `Execute` and `ExecuteStream` in `openai_compat_executor.go`, right after `ApplyPayloadConfigWithRequest`), gated on `provider == "glm"`. Idempotent. Five behaviours:
+  1. Couples `reasoning_effort` with `thinking.type=enabled` (GLM ignores effort without it) — EXCEPT `none`/`minimal`, which mean skip-thinking and must NOT enable thinking (`glmEffortEnablesThinking`).
+  2. Maps effort aliases (`low`/`medium`→`high`, `xhigh`→`max`) per z.ai spec.
+  3. Strips OpenAI-only top-level fields (`service_tier`, `parallel_tool_calls`, `prompt_cache_key`, `prompt_cache_retention`, `store`, `metadata`, `logprobs`, `top_logprobs`). These vary per turn and break z.ai's **implicit prefix-based prompt cache**.
+  4. Enables `tool_stream: true` for GLM-4.6+ when tools present (per-chunk tool_call deltas; default false buffers them to stream end).
+  5. Sorts `tools[]` by `function.name` for a byte-stable cacheable prefix (Cursor doesn't guarantee tool order across turns). Bails on non-function tools (web_search/retrieval) to avoid partial sort.
+- z.ai prompt cache is IMPLICIT (no `cache_control` markers, no `prompt_cache_key`). Hit reporting via `usage.prompt_tokens_details.cached_tokens` — already parsed by `helps.ParseOpenAIUsage`, flows to SigNoz unchanged. Verified in prod 2026-06-21: warm turn hit 64/96 prompt tokens.
+- `internal/runtime/executor/helps/glm_normalizer_test.go` — 13 tests incl. the `none`/`minimal` skip-thinking guard and idempotency.
+- Prod config (`/home/wade/cliproxy/config/config.yaml`, lines ~730) has the `glm` openai-compatibility provider: base-url `https://api.z.ai/api/coding/paas/v4` (GLM Coding Plan — do NOT downgrade to `/paas/v4`), models `GLM-5.2` / `glm-5.1` / `glm-5-turbo`.
+
 ### Build / packaging
 - `Dockerfile` — `ENV TZ=Australia/Sydney`. Reverted upstream's `debian:bookworm + CGO_ENABLED=1` to `alpine + CGO_ENABLED=0` with `BUILDPLATFORM` / `TARGETARCH` for fast native cross-compilation. Trade-off: no runtime `.so` plugin loading; acceptable for our deployment.
-- Image tags on `ghcr.io/harshav167/cliproxyapi`: `:prod` is the rolling production tag (manually retagged after each deploy), `:f5-and-grok-fixes-<sha>` and `:upstream-sync-<sha>` are content-addressed pins. DO NOT push `:latest`. Current `:prod` digest as of 2026-06-13: `sha256:bdf02e241c362003ac54f0e91c70ea7139d8d75f008ad33b7623c8b93f9ca76d` from local commit `2ee2bf64`.
+- Image tags on `ghcr.io/harshav167/cliproxyapi`: `:prod` is the rolling production tag (manually retagged after each deploy), `:f5-and-grok-fixes-<sha>`, `:upstream-sync-<sha>` and `:glm-cache-<sha>` are content-addressed pins. DO NOT push `:latest`. Current `:prod` digest as of 2026-07-03: `sha256:905499680e0b0103ad324b7c3ff2de09ae1db71273f234019f236df4594dc769` (tag `:upstream-sync-d6a3780d`, commit `d6a3780d` — http.Transport connection-pool caching + Kimi $ref inliner/reasoning fixes from `81c433ed`), deployed to the `cli-proxy-api-test` clanker container with `--local-model`. Prior: `sha256:caabeb57c6bd93ebb2b72f0169743c6459641caeb083d60702520654e736bb43` (tag `:glm-cache-70205e6b`, GLM normalizer + xAI content[] merge fix). Prior: `sha256:bdf02e241c362003ac54f0e91c70ea7139d8d75f008ad33b7623c8b93f9ca76d` from `2ee2bf64`.
+- Prod deploy target: the `cli-proxy-api-test` service in `/home/wade/cliproxy/compose.yaml` runs `ghcr.io/harshav167/cliproxyapi:prod` (`pull_policy: always`) on port 8312, labeled `cliproxy.instance=clanker`. The OTHER container `cli-proxy-api-plus` runs a DIFFERENT binary (`cliproxyplus:latest`, `./CLIProxyAPIPlus`) on 8317 — not built from this repo. Deploy: `docker compose pull cli-proxy-api-test && docker compose up -d cli-proxy-api-test`.
 
 ### Docs / governance
 - `AGENTS.md` (this file) — fork-only. Upstream doesn't have it.

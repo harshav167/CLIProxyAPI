@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -201,9 +202,18 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		}
 	}
 
-	// Process messages and transform them to Claude Code format
+	// Process messages and transform them to Claude Code format.
+	//
+	// Accumulate top-level messages in a slice and write `messages` ONCE after
+	// the loop. The previous code appended each with sjson.SetRawBytes(out,
+	// "messages.-1", ...), re-serialising the growing (up to multi-MB) `out` on
+	// every append -> O(conversationLength^2). Cursor sends this OpenAI shape
+	// even for native Claude models, so this runs on every Opus turn; building a
+	// []string and joining once keeps it linear. (system[] is left inline — it
+	// holds only a handful of blocks, so it is not a scaling hotspot.)
 	if messages := root.Get("messages"); messages.Exists() && messages.IsArray() {
 		messageIndex := 0
+		messageItems := make([]string, 0)
 		messages.ForEach(func(_, message gjson.Result) bool {
 			role := message.Get("role").String()
 			contentResult := message.Get("content")
@@ -251,6 +261,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 							if toolCallID == "" {
 								toolCallID = genToolCallID()
 							}
+							toolCallID = util.SanitizeClaudeToolID(toolCallID)
 
 							function := toolCall.Get("function")
 							toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
@@ -280,12 +291,13 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					})
 				}
 
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+				messageItems = append(messageItems, string(msg))
 				messageIndex++
 
 			case "tool":
 				// Handle tool result messages conversion
 				toolCallID := message.Get("tool_call_id").String()
+				toolCallID = util.SanitizeClaudeToolID(toolCallID)
 				toolContentResult := message.Get("content")
 
 				msg := []byte(`{"role":"user","content":[{"type":"tool_result","tool_use_id":"","content":""}]}`)
@@ -296,7 +308,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				} else {
 					msg, _ = sjson.SetBytes(msg, "content.0.content", toolResultContent)
 				}
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+				messageItems = append(messageItems, string(msg))
 				messageIndex++
 			}
 			return true
@@ -307,9 +319,13 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		if messageIndex == 0 {
 			system := gjson.GetBytes(out, "system")
 			if system.Exists() && system.IsArray() && len(system.Array()) > 0 {
-				fallbackMsg := []byte(`{"role":"user","content":[{"type":"text","text":""}]}`)
-				out, _ = sjson.SetRawBytes(out, "messages.-1", fallbackMsg)
+				messageItems = append(messageItems, `{"role":"user","content":[{"type":"text","text":""}]}`)
 			}
+		}
+
+		// Write the fully-built messages array once (see accumulation note above).
+		if len(messageItems) > 0 {
+			out, _ = sjson.SetRawBytes(out, "messages", []byte("["+strings.Join(messageItems, ",")+"]"))
 		}
 	}
 
