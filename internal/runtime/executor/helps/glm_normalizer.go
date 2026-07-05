@@ -108,6 +108,17 @@ func ensureGLMThinkingForReasoningEffort(payload []byte) []byte {
 	if !effort.Exists() {
 		return payload
 	}
+	// `thinking.type` is z.ai's GLM Coding Plan dialect. The SAME GLM models are
+	// also served by other OpenAI-compatible vendors whose thinking API differs —
+	// notably Alibaba Model Studio (token-plan / DashScope compatible-mode), which
+	// uses a flat top-level `enable_thinking` boolean and does NOT understand
+	// `thinking.type`. If the caller already set `enable_thinking`, they've picked
+	// the vendor's own thinking switch, so injecting z.ai's `thinking` block is
+	// both redundant and wrong (Alibaba ignores/rejects the unknown shape). Bail.
+	// z.ai requests never carry `enable_thinking`, so this guard is a no-op there.
+	if root.Get("enable_thinking").Exists() {
+		return payload
+	}
 	level := strings.TrimSpace(strings.ToLower(effort.String()))
 	if level == "" || !glmEffortEnablesThinking(level) {
 		return payload

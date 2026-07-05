@@ -66,6 +66,35 @@ func TestNormalizeGLMRequestBody_DoesNotOverwriteCallerThinking(t *testing.T) {
 	}
 }
 
+func TestNormalizeGLMRequestBody_DoesNotInjectThinkingWhenEnableThinkingPresent(t *testing.T) {
+	// Alibaba Model Studio (token-plan / DashScope compatible-mode) serves the
+	// GLM family but uses a flat `enable_thinking` boolean, not z.ai's
+	// `thinking.type`. When the caller already set `enable_thinking`, the
+	// normalizer must NOT inject the z.ai `thinking` block (Alibaba ignores/
+	// rejects it), while still keeping reasoning_effort intact.
+	body := []byte(`{"model":"glm-5.2","messages":[],"reasoning_effort":"high","enable_thinking":true}`)
+	out := NormalizeGLMRequestBody(body, "openai-compatible-ali", "glm-5.2")
+	if gjson.GetBytes(out, "thinking").Exists() {
+		t.Fatalf("expected NO z.ai thinking block when enable_thinking is set; got %s", gjson.GetBytes(out, "thinking").Raw)
+	}
+	if got := gjson.GetBytes(out, "enable_thinking").Bool(); got != true {
+		t.Fatalf("expected enable_thinking to be preserved; got %v", got)
+	}
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("expected reasoning_effort=high preserved; got %q", got)
+	}
+}
+
+func TestNormalizeGLMRequestBody_StillInjectsThinkingForZaiWithoutEnableThinking(t *testing.T) {
+	// The z.ai path (no enable_thinking) must be UNCHANGED: reasoning_effort
+	// still couples to thinking.type=enabled.
+	body := []byte(`{"model":"glm-5.2","messages":[],"reasoning_effort":"high"}`)
+	out := NormalizeGLMRequestBody(body, "glm", "glm-5.2")
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("expected z.ai path to still inject thinking.type=enabled; got %q", got)
+	}
+}
+
 func TestNormalizeGLMRequestBody_MapsReasoningEffortAliases(t *testing.T) {
 	cases := map[string]string{
 		"low":    "high",

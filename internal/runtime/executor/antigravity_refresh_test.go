@@ -22,7 +22,14 @@ func resetAntigravityRefreshGroupForTest() {
 	antigravityRefreshGroup = singleflight.Group{}
 }
 
-func useAntigravityRefreshTestTransport(t *testing.T, targetHost string) {
+// useAntigravityRefreshTestTransport builds a transport that redirects every
+// dial to the test server. Returned as an http.RoundTripper so the test can
+// inject it through the "cliproxy.roundtripper" context value, which
+// NewProxyAwareHTTPClient checks (priority 3) before the pool-cached default
+// transport (priority 4) that the d6a3780d optimization added — the priority-4
+// fallback always returns a non-nil transport and would otherwise bypass this
+// injection.
+func useAntigravityRefreshTestTransport(t *testing.T, targetHost string) http.RoundTripper {
 	t.Helper()
 
 	transport := &http.Transport{
@@ -33,13 +40,8 @@ func useAntigravityRefreshTestTransport(t *testing.T, targetHost string) {
 		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 		ForceAttemptHTTP2: false,
 	}
-	antigravityTransport = transport
-	antigravityTransportOnce = sync.Once{}
-	antigravityTransportOnce.Do(func() {})
-	t.Cleanup(func() {
-		antigravityTransport = nil
-		antigravityTransportOnce = sync.Once{}
-	})
+	t.Cleanup(transport.CloseIdleConnections)
+	return transport
 }
 
 func TestAntigravityRefresh_DeduplicatesConcurrentRefresh(t *testing.T) {
@@ -80,7 +82,7 @@ func TestAntigravityRefresh_DeduplicatesConcurrentRefresh(t *testing.T) {
 	if errParse != nil {
 		t.Fatalf("parse test server URL: %v", errParse)
 	}
-	useAntigravityRefreshTestTransport(t, serverURL.Host)
+	testTransport := useAntigravityRefreshTestTransport(t, serverURL.Host)
 
 	executor := &AntigravityExecutor{}
 	authA := &cliproxyauth.Auth{
@@ -106,7 +108,8 @@ func TestAntigravityRefresh_DeduplicatesConcurrentRefresh(t *testing.T) {
 		if launched != nil {
 			close(launched)
 		}
-		updated, errRefresh := executor.Refresh(context.Background(), auth)
+		ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", testTransport)
+		updated, errRefresh := executor.Refresh(ctx, auth)
 		results <- updated
 		errs <- errRefresh
 	}

@@ -438,6 +438,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// them before translation so they neither render raw nor corrupt
 			// the next turn's tool-call reconstruction. No-op for non-Kimi.
 			streamLine := helps.NormalizeKimiReasoningStreamLine(baseModel, bytes.Clone(trimmedLine))
+			// Cursor's stream parser renders empty visible content when an
+			// openai-compat upstream emits empty-string delta.content /
+			// delta.reasoning_content on every chunk (the Alibaba MaaS
+			// compatible-mode shape) and omits role:"assistant" after the
+			// first chunk. Normalise toward the shape Cursor accepts.
+			streamLine = helps.NormalizeOpenAICompatStreamLine(streamLine)
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, streamLine, &param)
 			for i := range chunks {
 				select {
