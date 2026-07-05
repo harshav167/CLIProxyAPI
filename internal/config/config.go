@@ -199,6 +199,39 @@ type Config struct {
 	// sharing without re-triggering the validator. Flag-gated so we can roll
 	// back fast without rebuilding if 400s reappear.
 	ClaudeCursorGlobalCacheScope bool `yaml:"claude-cursor-global-cache-scope" json:"claude-cursor-global-cache-scope"`
+
+	// CodexContinueThinking enables the fork-only continue-thinking fold
+	// for Codex / Responses API traffic. When enabled and a streaming
+	// reasoning round's terminal event carries the OpenAI reasoning
+	// truncation fingerprint (usage.output_tokens_details.reasoning_tokens
+	// == truncation-step*n - 2), the executor silently opens a continuation
+	// round with the prior reasoning replayed plus a `phase:"commentary"`
+	// nudge, folding N upstream rounds into one downstream response.
+	// Default off; ported from CodexCont (https://github.com/neteroster/CodexCont).
+	CodexContinueThinking *CodexContinueConfig `yaml:"codex-continue-thinking" json:"codex-continue-thinking"`
+}
+
+// CodexContinueConfig is the fork-only config for the continue-thinking fold
+// applied to Codex / Responses API traffic. Ported from CodexCont.
+//
+// Field semantics match CodexCont's config.example.toml:
+//   - enabled: master switch. Default false.
+//   - truncation-step: period of the fingerprint. Default 518.
+//   - max-continue: hard round cap after round 1 (0 = stop after round 1).
+//   - min-n: continue only when truncation tier n >= min-n.
+//   - max-n: stop forcing once n > max-n (0 = uncapped).
+//   - method: "commentary" (default, clean) | "tool_pair" (legacy synthetic).
+//   - marker-text: the commentary message text that nudges the model.
+//   - max-total-output-tokens: cumulative cost cap across rounds (0 = off).
+type CodexContinueConfig struct {
+	Enabled              bool   `yaml:"enabled" json:"enabled"`
+	TruncationStep       int    `yaml:"truncation-step" json:"truncation-step"`
+	MaxContinue          int    `yaml:"max-continue" json:"max-continue"`
+	MinN                 int    `yaml:"min-n" json:"min-n"`
+	MaxN                 int    `yaml:"max-n" json:"max-n"`
+	Method               string `yaml:"method" json:"method"`
+	MarkerText           string `yaml:"marker-text" json:"marker-text"`
+	MaxTotalOutputTokens int    `yaml:"max-total-output-tokens" json:"max-total-output-tokens"`
 }
 
 // RedisQueueConfig configures the optional external Redis/Valkey backend used

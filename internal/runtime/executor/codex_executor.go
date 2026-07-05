@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -1141,68 +1140,40 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
 		}()
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 52_428_800) // 50MB
-		var param any
-		outputItemsByIndex := make(map[int64][]byte)
-		var outputItemsFallback [][]byte
-		for scanner.Scan() {
-			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
-			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			translatedLine := bytes.Clone(line)
 
-			if bytes.HasPrefix(line, dataTag) {
-				data := bytes.TrimSpace(line[5:])
-				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
-					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
-						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
-						reporter.PublishFailure(ctx, errClearReplay)
-						select {
-						case out <- cliproxyexecutor.StreamChunk{Err: errClearReplay}:
-						case <-ctx.Done():
-						}
-						return
-					}
-					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
-					reporter.PublishFailure(ctx, streamErr)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-					case <-ctx.Done():
-					}
-					return
-				}
-				switch gjson.GetBytes(data, "type").String() {
-				case "response.output_item.done":
-					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
-				case "response.completed":
-					if detail, ok := helps.ParseCodexUsage(data); ok {
-						reporter.Publish(ctx, detail)
-					}
-					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
-					cacheCodexReasoningReplayFromCompleted(replayScope, data)
-					translatedLine = append([]byte("data: "), data...)
-				}
-			}
-
-			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
-			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param)
-			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
-					return
-				}
-			}
+		// Continue-thinking fold (fork-only). When disabled (the default),
+		// runFoldLoop falls through to the legacy scanner path verbatim —
+		// no behavior change. When enabled, it runs the multi-round fold
+		// state machine (ported from CodexCont) that detects OpenAI's
+		// 518n-2 reasoning-truncation fingerprint and silently opens
+		// continuation rounds, folding N upstream responses into one
+		// downstream stream.
+		foldCfg := helps.NormalizeCodexContinueConfig(e.cfg.CodexContinueThinking)
+		if foldCfg.Enabled && !helps.ReasoningEnabled(body) {
+			// Fold only applies to reasoning requests. Fall through to
+			// legacy path when reasoning is explicitly disabled.
+			foldCfg = &config.CodexContinueConfig{}
 		}
-		if errScan := scanner.Err(); errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
-			}
+		fx := &codexContinueFoldContext{
+			cfg:             foldCfg,
+			executor:        e,
+			reqCtx:          ctx,
+			auth:            auth,
+			req:             req,
+			opts:            opts,
+			baseModel:       baseModel,
+			from:            from,
+			to:              to,
+			originalPayload: originalPayload,
+			baseBody:        body,
+			url:             url,
+			apiKey:          apiKey,
+			identityState:   identityState,
+			httpClient:      httpClient,
+			streamChunkCh:   out,
+			responseFormat:  responseFormat,
 		}
+		fx.runFoldLoop(ctx, httpResp, identityState, out, reporter, replayScope)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
