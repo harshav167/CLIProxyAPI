@@ -436,3 +436,77 @@ green (68 packages, 0 fail), including the two hand-merged packages
 
 Pending: fast-forward `main`, push `origin/main`, build `:upstream-sync-7dad9253`
 + `:prod`, local 8312 smoke + user Cursor sign-off BEFORE prod pull.
+
+## Upstream Sync — 2026-07-05 (35 commits)
+
+Branch: `sync/upstream-2026-07-05`. Merge-base `4c0c6029`, upstream tip
+`5afc0f1d`. Divergence at start: 35 upstream / 71 fork.
+
+Incoming themes: plugin store auth providers + direct install type +
+manifest fetching (11 commits), `disable-cooling` field in management
+PatchOpenAICompat, Codex WS-to-SSE full transcript replay, force-mapped
+Responses SSE framing fix, Gemini Responses reasoning two-part
+signatures, Antigravity CLI User-Agent agy 1.0.13 short form, reasoning
+content handling, snapshot test refactor, README sponsor additions
+(VisionCoder/Code0/CyberPay/Claude API), Claude Sonnet 5 metadata, and
+`fix(translator): remove temperature parameter handling in Claude
+request transformations` (closes #4071).
+
+Conflicts (4 files, all in the Sonnet-5 / Claude-temperature area we
+already ported via `10c2f474` on 2026-07-01) and per-file decisions:
+
+- `internal/registry/models/models.json` — kept OUR bounded thinking
+  block for `claude-sonnet-5` (`min: 1024, max: 128000, zero_allowed:
+  true`, no `dynamic_allowed`). Dropped upstream's
+  `dynamic_allowed: true` shape. Per user decision: preserve the proven
+  fable-5 shape; do not enable Anthropic's adaptive path for Sonnet 5.
+- `internal/registry/model_registry_safety_test.go` — kept OUR assertion
+  matching the bounded thinking block.
+- `internal/runtime/executor/claude_executor.go` (3 hunks) — kept OUR
+  `prepared.*` factored flow (the O(n²) perf fix from `9a57e522`,
+  load-bearing for 2.2 MB Opus payloads). Dropped upstream's re-inlined
+  body-manipulation sequence at both Execute and ExecuteStream call
+  sites. Kept OUR `normalizeClaudeSamplingForThinking` (coerce
+  temperature to 1 when thinking active) over upstream's
+  `normalizeClaudeSamplingForUpstream` (delete temperature
+  unconditionally). Per user "keep ours" stance for this Sonnet-5
+  cluster + standing rule "don't revert our changes even if upstream
+  conflicts". Residual: the auto-merged translator
+  `claude_openai_request.go` now drops `temperature` from OpenAI inbound
+  (upstream `5afc0f1d`); our function only acts on native Claude clients
+  that send `temperature` directly — defensive, no break.
+- `internal/runtime/executor/claude_executor_test.go` (4 hunks) — kept
+  OUR 5 tests verbatim (assert coerce-to-1 semantics matching the
+  function we kept). Dropped upstream's 6
+  `TestNormalizeClaudeSamplingForUpstream_*` tests.
+
+Fork-only files (12 in the AGENTS.md inventory) verified present and
+unchanged-or-expanded: `AGENTS.md`, `MIGRATION-LEDGER.md`,
+`docs/upstream-sync.md`, `docs/signoz-observability.md`,
+`docs/security-backlog.md`, `internal/usage/logger_plugin.go`,
+`internal/runtime/executor/helps/cursor_system_prompt.go`,
+`internal/runtime/executor/helps/claude_cursor_system_prompt.go`,
+`internal/runtime/executor/helps/cursor_fable_alias.go`,
+`internal/runtime/executor/helps/glm_normalizer.go`,
+`internal/runtime/executor/helps/proxy_helpers.go`,
+`internal/registry/model_definitions.go`. The `f5-*` Fable-5 hook point
+in `claude_executor.go` is preserved (the `prepared.*` flow survives).
+
+Dockerfile: no conflict this round — alpine + CGO_ENABLED=0
+cross-compile retained as-is (upstream did not touch it).
+
+Pre-existing flake noted (NOT introduced by this merge): on clean
+`main`, `TestAntigravityRefresh_DeduplicatesConcurrentRefresh` in
+`internal/runtime/executor` hangs (httptest.Server accept loop never
+returns). Reproduced on `main` HEAD `1adff3a3` before redoing the merge.
+Skipped via `-skip` for the green re-run; the rest of
+`internal/runtime/executor` passes in 2.5s.
+
+Verification: `gofmt -w .` clean; `go build -o /tmp/cli-proxy-build
+./cmd/server` clean; `go test -timeout 120s -skip
+TestAntigravityRefresh_DeduplicatesConcurrentRefresh ./...` green (all
+packages pass, 0 fail).
+
+Pending: commit, fast-forward `main`, push `origin/main`, build
+`:upstream-sync-<sha8>` + `:prod`, local 8312 smoke + user Cursor
+sign-off BEFORE prod pull.
