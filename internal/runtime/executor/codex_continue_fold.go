@@ -111,8 +111,6 @@ func (fx *codexContinueFoldContext) scanOneRound(
 	var outputItemsFallback [][]byte
 
 	itemKind := map[int64]string{} // upstream output_index → "reasoning" | "buffered"
-	oiMap := map[int64]int64{}     // upstream output_index → downstream output_index
-	_ = oiMap                      // reasoning keeps its own output_index when fold is active
 
 	for scanner.Scan() {
 		rawLine := scanner.Bytes()
@@ -204,7 +202,6 @@ func (fx *codexContinueFoldContext) scanOneRound(
 					continue
 				}
 				itemKind[upOI] = "live"
-				oiMap[upOI] = upOI
 				forwardEvent(translatedLine, identityState)
 				continue
 			}
