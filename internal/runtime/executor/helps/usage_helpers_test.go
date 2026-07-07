@@ -197,6 +197,23 @@ func TestParseCodexUsageMapsCachedTokensToCacheRead(t *testing.T) {
 	}
 }
 
+func TestParseCodexUsageMapsTopLevelCachedTokensToCacheRead(t *testing.T) {
+	data := []byte(`{"response":{"usage":{"input_tokens":10,"cached_tokens":4,"output_tokens":2,"total_tokens":12}}}`)
+	detail, ok := ParseCodexUsage(data)
+	if !ok {
+		t.Fatal("ParseCodexUsage() ok = false, want true")
+	}
+	if detail.InputTokens != 6 {
+		t.Fatalf("input tokens = %d, want 6 (10 input - 4 cached)", detail.InputTokens)
+	}
+	if detail.CachedTokens != 4 {
+		t.Fatalf("cached tokens = %d, want 4", detail.CachedTokens)
+	}
+	if detail.CacheReadTokens != 4 {
+		t.Fatalf("cache read tokens = %d, want 4", detail.CacheReadTokens)
+	}
+}
+
 func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
 	data := []byte(`{"usage":{"input_tokens":3085,"output_tokens":253,"cache_read_input_tokens":7,"cache_creation_input_tokens":19514}}`)
 	detail := ParseClaudeUsage(data)

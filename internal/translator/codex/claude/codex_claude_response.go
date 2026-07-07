@@ -574,6 +574,9 @@ func extractResponsesUsage(usage gjson.Result) (int64, int64, int64) {
 	inputTokens := usage.Get("input_tokens").Int()
 	outputTokens := usage.Get("output_tokens").Int()
 	cachedTokens := usage.Get("input_tokens_details.cached_tokens").Int()
+	if cachedTokens == 0 && usage.Get("cached_tokens").Exists() {
+		cachedTokens = usage.Get("cached_tokens").Int()
+	}
 
 	if cachedTokens > 0 {
 		if inputTokens >= cachedTokens {

@@ -833,6 +833,39 @@ func TestConvertCodexResponseToClaude_StreamStopSequenceMapping(t *testing.T) {
 	}
 }
 
+func TestConvertCodexResponseToClaude_StreamUsageTopLevelCachedTokens(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+	var param any
+
+	outputs := ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, []byte(`data: {"type":"response.completed","response":{"stop_reason":"stop","usage":{"input_tokens":10,"cached_tokens":4,"output_tokens":2,"total_tokens":12}}}`), &param)
+	messageDelta, ok := findClaudeStreamMessageDelta(outputs)
+	if !ok {
+		t.Fatalf("did not find message_delta; outputs=%q", outputs)
+	}
+	if got := messageDelta.Get("usage.input_tokens").Int(); got != 6 {
+		t.Fatalf("input_tokens = %d, want 6", got)
+	}
+	if got := messageDelta.Get("usage.cache_read_input_tokens").Int(); got != 4 {
+		t.Fatalf("cache_read_input_tokens = %d, want 4", got)
+	}
+}
+
+func TestConvertCodexResponseToClaudeNonStream_UsageTopLevelCachedTokens(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"messages":[]}`)
+
+	response := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","stop_reason":"stop","usage":{"input_tokens":10,"cached_tokens":4,"output_tokens":2,"total_tokens":12},"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}`)
+	out := ConvertCodexResponseToClaudeNonStream(ctx, "", originalRequest, nil, response, nil)
+
+	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 6 {
+		t.Fatalf("input_tokens = %d, want 6; response=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 4 {
+		t.Fatalf("cache_read_input_tokens = %d, want 4; response=%s", got, out)
+	}
+}
+
 func TestConvertCodexResponseToClaudeNonStream_WebSearchCallEmitsServerToolBlocks(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"}],"messages":[{"role":"user","content":"search weather"}]}`)
