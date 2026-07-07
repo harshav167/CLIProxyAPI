@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpfetch"
 	log "github.com/sirupsen/logrus"
@@ -16,7 +18,23 @@ import (
 const userAgent = "CLIProxyAPI"
 const maxPluginStoreRedirects = 10
 
-// HTTPDoer abstracts the HTTP client used to execute requests.
+var defaultPluginStoreHTTPClient HTTPDoer = &http.Client{
+	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          10,
+		MaxIdleConnsPerHost:   5,
+	},
+}
+
+// DefaultHTTPClient returns the package-level default HTTP client.
+func DefaultHTTPClient() HTTPDoer {
+	return defaultPluginStoreHTTPClient
+}
+
 type HTTPDoer = httpfetch.Doer
 
 type Client struct {
@@ -56,49 +74,31 @@ func (c Client) FetchRegistry(ctx context.Context) (Registry, error) {
 // FetchLatestRelease returns the latest published release of the plugin's
 // GitHub repository, mirroring the WebUI panel update check.
 func (c Client) FetchLatestRelease(ctx context.Context, plugin Plugin) (Release, error) {
-	owner, repo, errRepository := GitHubRepositoryParts(plugin.Repository)
-	if errRepository != nil {
-		return Release{}, errRepository
-	}
-	releaseURL := fmt.Sprintf(
-		"https://api.github.com/repos/%s/%s/releases/latest",
-		url.PathEscape(owner),
-		url.PathEscape(repo),
-	)
-	data, errDownload := c.get(ctx, releaseURL, "application/vnd.github+json", RequestKindMetadata, 0)
-	if errDownload != nil {
-		return Release{}, errDownload
-	}
-	var release Release
-	if errDecode := json.Unmarshal(data, &release); errDecode != nil {
-		return Release{}, fmt.Errorf("decode release: %w", errDecode)
-	}
-	return release, nil
+	return c.fetchRelease(ctx, plugin, "releases/latest")
 }
 
 // FetchReleaseByTag returns a published release by its exact GitHub tag.
 func (c Client) FetchReleaseByTag(ctx context.Context, plugin Plugin, tag string) (Release, error) {
-	owner, repo, errRepository := GitHubRepositoryParts(plugin.Repository)
-	if errRepository != nil {
-		return Release{}, errRepository
-	}
 	tag = strings.TrimSpace(tag)
 	if tag == "" {
 		return Release{}, fmt.Errorf("release tag is required")
 	}
-	releaseURL := fmt.Sprintf(
-		"https://api.github.com/repos/%s/%s/releases/tags/%s",
-		url.PathEscape(owner),
-		url.PathEscape(repo),
-		url.PathEscape(tag),
-	)
-	data, errDownload := c.get(ctx, releaseURL, "application/vnd.github+json", RequestKindMetadata, 0)
-	if errDownload != nil {
-		return Release{}, errDownload
+	return c.fetchRelease(ctx, plugin, "releases/tags/"+url.PathEscape(tag))
+}
+
+func (c Client) fetchRelease(ctx context.Context, plugin Plugin, suffix string) (Release, error) {
+	owner, repo, err := GitHubRepositoryParts(plugin.Repository)
+	if err != nil {
+		return Release{}, err
+	}
+	releaseURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/%s", url.PathEscape(owner), url.PathEscape(repo), suffix)
+	data, err := c.get(ctx, releaseURL, "application/vnd.github+json", RequestKindMetadata, 0)
+	if err != nil {
+		return Release{}, err
 	}
 	var release Release
-	if errDecode := json.Unmarshal(data, &release); errDecode != nil {
-		return Release{}, fmt.Errorf("decode release: %w", errDecode)
+	if err := json.Unmarshal(data, &release); err != nil {
+		return Release{}, fmt.Errorf("decode release: %w", err)
 	}
 	return release, nil
 }
@@ -114,12 +114,9 @@ func ReleaseVersion(release Release) (string, error) {
 }
 
 func (c Client) DownloadAsset(ctx context.Context, asset ReleaseAsset) ([]byte, error) {
-	downloadURL := strings.TrimSpace(asset.BrowserDownloadURL)
-	apiURL := strings.TrimSpace(asset.APIURL)
-	if downloadURL == "" || c.releaseAssetAPIAuthenticated(apiURL) {
-		if apiURL != "" {
-			downloadURL = apiURL
-		}
+	downloadURL := asset.BrowserDownloadURL
+	if downloadURL == "" || c.releaseAssetAPIAuthenticated(asset.APIURL) {
+		downloadURL = asset.APIURL
 	}
 	if downloadURL == "" {
 		return nil, fmt.Errorf("asset %q missing download url", asset.Name)
@@ -128,10 +125,6 @@ func (c Client) DownloadAsset(ctx context.Context, asset ReleaseAsset) ([]byte, 
 }
 
 func (c Client) releaseAssetAPIAuthenticated(apiURL string) bool {
-	apiURL = strings.TrimSpace(apiURL)
-	if apiURL == "" {
-		return false
-	}
 	return AuthConfigured(c.Auth, apiURL, RequestKindArtifact)
 }
 
@@ -174,19 +167,19 @@ func (c Client) httpClient() HTTPDoer {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return http.DefaultClient
+	return defaultPluginStoreHTTPClient
 }
 
 func (c Client) userAgent() string {
-	if strings.TrimSpace(c.UserAgent) != "" {
-		return strings.TrimSpace(c.UserAgent)
+	if v := strings.TrimSpace(c.UserAgent); v != "" {
+		return v
 	}
 	return userAgent
 }
 
 func pluginStoreGetNoRedirect(ctx context.Context, client HTTPDoer, requestURL string, headers http.Header) (*http.Response, error) {
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultPluginStoreHTTPClient
 	}
 	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if errRequest != nil {
@@ -269,28 +262,22 @@ func SelectReleaseAssets(release Release, id, version, goos, goarch string) (Rel
 	var archiveAsset ReleaseAsset
 	var checksumAsset ReleaseAsset
 	for _, asset := range release.Assets {
-		switch strings.TrimSpace(asset.Name) {
+		switch asset.Name {
 		case archiveName:
 			archiveAsset = asset
 		case "checksums.txt":
 			checksumAsset = asset
 		}
 	}
-	if strings.TrimSpace(archiveAsset.Name) == "" {
+	if archiveAsset.Name == "" {
 		return ReleaseAsset{}, ReleaseAsset{}, fmt.Errorf("release asset %s not found", archiveName)
 	}
-	if strings.TrimSpace(checksumAsset.Name) == "" {
+	if checksumAsset.Name == "" {
 		return ReleaseAsset{}, ReleaseAsset{}, fmt.Errorf("release asset checksums.txt not found")
 	}
 	return archiveAsset, checksumAsset, nil
 }
 
 func ArchiveName(id, version, goos, goarch string) string {
-	return fmt.Sprintf(
-		"%s_%s_%s_%s.zip",
-		strings.TrimSpace(id),
-		strings.TrimSpace(version),
-		strings.TrimSpace(goos),
-		strings.TrimSpace(goarch),
-	)
+	return fmt.Sprintf("%s_%s_%s_%s.zip", id, version, goos, goarch)
 }

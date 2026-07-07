@@ -78,7 +78,7 @@ func AuthConfigured(auth []AuthConfig, requestURL string, kind string) bool {
 	if !ok {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(item.Type)) {
+	switch item.Type {
 	case AuthTypeNone:
 		return false
 	case AuthTypeBearer, AuthTypeGitHubToken:

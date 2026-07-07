@@ -77,34 +77,33 @@ func manifestFromPlugin(source Source, plugin Plugin, base Manifest) Manifest {
 
 func (m Manifest) Plugin() Plugin {
 	return Plugin{
-		ID:          strings.TrimSpace(m.ID),
-		Name:        strings.TrimSpace(m.Name),
-		Description: strings.TrimSpace(m.Description),
-		Author:      strings.TrimSpace(m.Author),
-		Version:     strings.TrimSpace(m.Version),
-		Repository:  strings.TrimSpace(m.Repository),
-		Logo:        strings.TrimSpace(m.Logo),
-		Homepage:    strings.TrimSpace(m.Homepage),
-		License:     strings.TrimSpace(m.License),
+		ID:          m.ID,
+		Name:        m.Name,
+		Description: m.Description,
+		Author:      m.Author,
+		Version:     m.Version,
+		Repository:  m.Repository,
+		Logo:        m.Logo,
+		Homepage:    m.Homepage,
+		License:     m.License,
 		Tags:        append([]string(nil), m.Tags...),
 		Install:     NormalizeInstallPlan(m.Install),
 	}
 }
 
 func (m Manifest) InstallType() string {
-	installType := strings.ToLower(strings.TrimSpace(m.Install.Type))
-	if installType == "" {
+	if m.Install.Type == "" {
 		return InstallTypeGitHubRelease
 	}
-	return installType
+	return strings.ToLower(strings.TrimSpace(m.Install.Type))
 }
 
 func (m Manifest) Validate() error {
-	version := strings.TrimSpace(m.Version)
+	version := normalizeVersion(m.Version)
 	if version == "" {
 		return fmt.Errorf("missing required field version")
 	}
-	if !validPluginVersion(normalizeVersion(version)) {
+	if !validPluginVersion(version) {
 		return fmt.Errorf("invalid plugin version %q", m.Version)
 	}
 	switch m.InstallType() {
@@ -135,8 +134,8 @@ func (m Manifest) Validate() error {
 		if errVersion != nil {
 			return errVersion
 		}
-		if releaseVersion != normalizeVersion(version) {
-			return fmt.Errorf("release-tag %q resolves version %q, want %q", releaseTag, releaseVersion, normalizeVersion(version))
+		if releaseVersion != version {
+			return fmt.Errorf("release-tag %q resolves version %q, want %q", releaseTag, releaseVersion, version)
 		}
 		return nil
 	default:

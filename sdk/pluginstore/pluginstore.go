@@ -74,6 +74,13 @@ func DefaultSource() Source {
 	return internalpluginstore.DefaultSource()
 }
 
+// DefaultHTTPClient returns the plugin store's default HTTP client with bounded
+// timeouts. Use it when you want the same safe defaults but need to customize
+// the transport (e.g., add a proxy).
+func DefaultHTTPClient() HTTPDoer {
+	return internalpluginstore.DefaultHTTPClient()
+}
+
 func NormalizeSources(registryURLs []string) ([]Source, error) {
 	return internalpluginstore.NormalizeSources(registryURLs)
 }

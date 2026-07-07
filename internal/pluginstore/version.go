@@ -23,12 +23,18 @@ func UpdateAvailable(installed, latest string) bool {
 	return comparison < 0
 }
 
-func normalizeVersion(version string) string {
+// NormalizeVersion strips a leading "v"/"V" prefix and trims whitespace from a
+// version string.
+func NormalizeVersion(version string) string {
 	version = strings.TrimSpace(version)
 	if len(version) > 1 && (version[0] == 'v' || version[0] == 'V') {
 		version = version[1:]
 	}
 	return version
+}
+
+func normalizeVersion(version string) string {
+	return NormalizeVersion(version)
 }
 
 // compareVersions compares dotted numeric versions segment by segment, with

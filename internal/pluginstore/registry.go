@@ -1,7 +1,6 @@
 package pluginstore
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -116,22 +115,21 @@ func SourceID(registryURL string) string {
 }
 
 func SourceName(registryURL string) string {
-	parsed, errParse := url.Parse(strings.TrimSpace(registryURL))
-	if errParse != nil || strings.TrimSpace(parsed.Host) == "" {
-		return strings.TrimSpace(registryURL)
+	parsed, err := url.Parse(trim(registryURL))
+	if err != nil || trim(parsed.Host) == "" {
+		return trim(registryURL)
 	}
 	return parsed.Host
 }
 
 func ParseRegistry(data []byte) (Registry, error) {
 	var registry Registry
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	if errDecode := decoder.Decode(&registry); errDecode != nil {
-		return Registry{}, fmt.Errorf("decode registry: %w", errDecode)
+	if err := json.Unmarshal(data, &registry); err != nil {
+		return Registry{}, fmt.Errorf("decode registry: %w", err)
 	}
 	normalizeRegistry(&registry)
-	if errValidate := ValidateRegistry(registry); errValidate != nil {
-		return Registry{}, errValidate
+	if err := ValidateRegistry(registry); err != nil {
+		return Registry{}, err
 	}
 	return registry, nil
 }
@@ -142,15 +140,15 @@ func normalizeRegistry(registry *Registry) {
 	}
 	for index := range registry.Plugins {
 		plugin := &registry.Plugins[index]
-		plugin.ID = strings.TrimSpace(plugin.ID)
-		plugin.Name = strings.TrimSpace(plugin.Name)
-		plugin.Description = strings.TrimSpace(plugin.Description)
-		plugin.Author = strings.TrimSpace(plugin.Author)
-		plugin.Version = strings.TrimSpace(plugin.Version)
-		plugin.Repository = strings.TrimSpace(plugin.Repository)
-		plugin.Logo = strings.TrimSpace(plugin.Logo)
-		plugin.Homepage = strings.TrimSpace(plugin.Homepage)
-		plugin.License = strings.TrimSpace(plugin.License)
+		plugin.ID = trim(plugin.ID)
+		plugin.Name = trim(plugin.Name)
+		plugin.Description = trim(plugin.Description)
+		plugin.Author = trim(plugin.Author)
+		plugin.Version = trim(plugin.Version)
+		plugin.Repository = trim(plugin.Repository)
+		plugin.Logo = trim(plugin.Logo)
+		plugin.Homepage = trim(plugin.Homepage)
+		plugin.License = trim(plugin.License)
 		plugin.Install = NormalizeInstallPlan(plugin.Install)
 		for versionIndex := range plugin.Versions {
 			version := &plugin.Versions[versionIndex]
@@ -158,9 +156,13 @@ func normalizeRegistry(registry *Registry) {
 			version.Install = NormalizeInstallPlan(version.Install)
 		}
 		for tagIndex := range plugin.Tags {
-			plugin.Tags[tagIndex] = strings.TrimSpace(plugin.Tags[tagIndex])
+			plugin.Tags[tagIndex] = trim(plugin.Tags[tagIndex])
 		}
 	}
+}
+
+func trim(s string) string {
+	return strings.TrimSpace(s)
 }
 
 func ValidateRegistry(registry Registry) error {
@@ -172,10 +174,10 @@ func ValidateRegistry(registry Registry) error {
 		if registry.SchemaVersion == SchemaVersion && PluginInstallType(plugin) == InstallTypeDirect {
 			return fmt.Errorf("plugins[%d]: direct install requires schema_version %d", index, SchemaVersionV2)
 		}
-		if errValidate := ValidatePlugin(plugin); errValidate != nil {
-			return fmt.Errorf("plugins[%d]: %w", index, errValidate)
+		if err := ValidatePlugin(plugin); err != nil {
+			return fmt.Errorf("plugins[%d]: %w", index, err)
 		}
-		id := strings.TrimSpace(plugin.ID)
+		id := trim(plugin.ID)
 		if _, exists := seen[id]; exists {
 			return fmt.Errorf("plugins[%d]: duplicate plugin id %q", index, id)
 		}
@@ -196,32 +198,30 @@ func ValidatePlugin(plugin Plugin) error {
 		required["repository"] = plugin.Repository
 	}
 	for field, value := range required {
-		if strings.TrimSpace(value) == "" {
+		if trim(value) == "" {
 			return fmt.Errorf("missing required field %s", field)
 		}
 	}
-	if !validPluginID(strings.TrimSpace(plugin.ID)) {
+	if !validPluginID(trim(plugin.ID)) {
 		return fmt.Errorf("invalid plugin id %q", plugin.ID)
 	}
-	// The version is optional since the latest release is the source of truth;
-	// when present it is only used as a display fallback and must be valid.
-	if version := strings.TrimSpace(plugin.Version); version != "" && !validPluginVersion(version) {
+	if version := trim(plugin.Version); version != "" && !validPluginVersion(version) {
 		return fmt.Errorf("invalid plugin version %q", plugin.Version)
 	}
 	switch installType {
 	case InstallTypeGitHubRelease:
-		if _, _, errRepository := GitHubRepositoryParts(plugin.Repository); errRepository != nil {
-			return errRepository
+		if _, _, err := GitHubRepositoryParts(plugin.Repository); err != nil {
+			return err
 		}
 	case InstallTypeDirect:
-		if strings.TrimSpace(plugin.Version) == "" {
+		if trim(plugin.Version) == "" {
 			return fmt.Errorf("missing required field version")
 		}
-		if errPlan := ValidateInstallPlan(plugin.Install); errPlan != nil {
-			return errPlan
+		if err := ValidateInstallPlan(plugin.Install); err != nil {
+			return err
 		}
-		if errVersions := ValidatePluginVersions(plugin); errVersions != nil {
-			return errVersions
+		if err := ValidatePluginVersions(plugin); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("unsupported install type %q", plugin.Install.Type)
@@ -233,6 +233,7 @@ func ValidatePluginVersions(plugin Plugin) error {
 	if len(plugin.Versions) == 0 {
 		return nil
 	}
+	parentType := PluginInstallType(plugin)
 	seen := make(map[string]struct{}, len(plugin.Versions))
 	for index, version := range plugin.Versions {
 		version.Version = normalizeVersion(version.Version)
@@ -245,14 +246,14 @@ func ValidatePluginVersions(plugin Plugin) error {
 		seen[version.Version] = struct{}{}
 		installType := strings.ToLower(strings.TrimSpace(version.Install.Type))
 		if installType == "" {
-			installType = PluginInstallType(plugin)
+			installType = parentType
 			version.Install.Type = installType
 		}
-		if installType != PluginInstallType(plugin) {
-			return fmt.Errorf("versions[%d]: install type %q does not match plugin install type %q", index, installType, PluginInstallType(plugin))
+		if installType != parentType {
+			return fmt.Errorf("versions[%d]: install type %q does not match plugin install type %q", index, installType, parentType)
 		}
-		if errPlan := ValidateInstallPlan(version.Install); errPlan != nil {
-			return fmt.Errorf("versions[%d]: %w", index, errPlan)
+		if err := ValidateInstallPlan(version.Install); err != nil {
+			return fmt.Errorf("versions[%d]: %w", index, err)
 		}
 	}
 	return nil
@@ -272,8 +273,8 @@ func NormalizeInstallPlan(plan InstallPlan) InstallPlan {
 		artifact := &plan.Artifacts[index]
 		artifact.GOOS = normalizeGOOS(artifact.GOOS)
 		artifact.GOARCH = normalizeGOARCH(artifact.GOARCH)
-		artifact.URL = strings.TrimSpace(artifact.URL)
-		artifact.SHA256 = strings.ToLower(strings.TrimSpace(artifact.SHA256))
+		artifact.URL = trim(artifact.URL)
+		artifact.SHA256 = strings.ToLower(trim(artifact.SHA256))
 	}
 	return plan
 }
@@ -303,8 +304,8 @@ func ValidateInstallPlan(plan InstallPlan) error {
 func ValidateArtifact(artifact Artifact) error {
 	artifact.GOOS = normalizeGOOS(artifact.GOOS)
 	artifact.GOARCH = normalizeGOARCH(artifact.GOARCH)
-	artifact.URL = strings.TrimSpace(artifact.URL)
-	artifact.SHA256 = strings.ToLower(strings.TrimSpace(artifact.SHA256))
+	artifact.URL = trim(artifact.URL)
+	artifact.SHA256 = strings.ToLower(trim(artifact.SHA256))
 	if artifact.GOOS == "" {
 		return fmt.Errorf("missing goos")
 	}
@@ -314,8 +315,8 @@ func ValidateArtifact(artifact Artifact) error {
 	if artifact.URL == "" {
 		return fmt.Errorf("missing url")
 	}
-	parsed, errParse := url.Parse(artifact.URL)
-	if errParse != nil || parsed.Scheme == "" || parsed.Host == "" {
+	parsed, err := url.Parse(artifact.URL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return fmt.Errorf("invalid artifact url")
 	}
 	if parsed.Scheme != "https" && parsed.Scheme != "http" {
@@ -330,8 +331,8 @@ func ValidateArtifact(artifact Artifact) error {
 	if len(artifact.SHA256) != sha256.Size*2 {
 		return fmt.Errorf("invalid sha256 length")
 	}
-	if _, errDecode := hex.DecodeString(artifact.SHA256); errDecode != nil {
-		return fmt.Errorf("invalid sha256: %w", errDecode)
+	if _, err := hex.DecodeString(artifact.SHA256); err != nil {
+		return fmt.Errorf("invalid sha256: %w", err)
 	}
 	if artifact.Size < 0 {
 		return fmt.Errorf("invalid size")
@@ -343,10 +344,9 @@ func PluginPlatforms(plugin Plugin) []Platform {
 	if PluginInstallType(plugin) != InstallTypeDirect {
 		return nil
 	}
-	artifacts := PluginArtifacts(plugin)
-	seen := make(map[Platform]struct{}, len(artifacts))
-	platforms := make([]Platform, 0, len(artifacts))
-	for _, artifact := range artifacts {
+	seen := make(map[Platform]struct{})
+	var platforms []Platform
+	for _, artifact := range PluginArtifacts(plugin) {
 		platform := Platform{GOOS: artifact.GOOS, GOARCH: artifact.GOARCH}
 		if platform.GOOS == "" || platform.GOARCH == "" {
 			continue
@@ -364,9 +364,13 @@ func PluginArtifacts(plugin Plugin) []Artifact {
 	if PluginInstallType(plugin) != InstallTypeDirect {
 		return nil
 	}
-	artifacts := append([]Artifact(nil), NormalizeInstallPlan(plugin.Install).Artifacts...)
+	artifacts := append([]Artifact(nil), plugin.Install.Artifacts...)
 	for _, version := range plugin.Versions {
-		artifacts = append(artifacts, NormalizeInstallPlan(version.Install).Artifacts...)
+		artifacts = append(artifacts, version.Install.Artifacts...)
+	}
+	for index := range artifacts {
+		artifacts[index].GOOS = normalizeGOOS(artifacts[index].GOOS)
+		artifacts[index].GOARCH = normalizeGOARCH(artifacts[index].GOARCH)
 	}
 	return artifacts
 }
@@ -413,10 +417,10 @@ func validPluginID(id string) bool {
 }
 
 func GitHubRepositoryParts(repository string) (string, string, error) {
-	repository = strings.TrimSpace(repository)
-	parsed, errParse := url.Parse(repository)
-	if errParse != nil {
-		return "", "", fmt.Errorf("invalid repository URL: %w", errParse)
+	repository = trim(repository)
+	parsed, err := url.Parse(repository)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid repository URL: %w", err)
 	}
 	if parsed.Scheme != "https" || parsed.Host != "github.com" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", "", fmt.Errorf("repository must be https://github.com/{owner}/{repo}")
@@ -425,13 +429,13 @@ func GitHubRepositoryParts(repository string) (string, string, error) {
 	if len(segments) != 2 || segments[0] == "" || segments[1] == "" {
 		return "", "", fmt.Errorf("repository must be https://github.com/{owner}/{repo}")
 	}
-	owner, errOwner := url.PathUnescape(segments[0])
-	if errOwner != nil {
-		return "", "", fmt.Errorf("invalid repository owner: %w", errOwner)
+	owner, err := url.PathUnescape(segments[0])
+	if err != nil {
+		return "", "", fmt.Errorf("invalid repository owner: %w", err)
 	}
-	repo, errRepo := url.PathUnescape(segments[1])
-	if errRepo != nil {
-		return "", "", fmt.Errorf("invalid repository name: %w", errRepo)
+	repo, err := url.PathUnescape(segments[1])
+	if err != nil {
+		return "", "", fmt.Errorf("invalid repository name: %w", err)
 	}
 	if strings.HasSuffix(repo, ".git") {
 		return "", "", fmt.Errorf("repository must be https://github.com/{owner}/{repo}")
@@ -440,9 +444,9 @@ func GitHubRepositoryParts(repository string) (string, string, error) {
 }
 
 func (r Registry) PluginByID(id string) (Plugin, bool) {
-	id = strings.TrimSpace(id)
+	id = trim(id)
 	for _, plugin := range r.Plugins {
-		if strings.TrimSpace(plugin.ID) == id {
+		if trim(plugin.ID) == id {
 			return plugin, true
 		}
 	}

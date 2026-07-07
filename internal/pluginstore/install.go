@@ -11,7 +11,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -45,36 +44,36 @@ type InstallResult struct {
 }
 
 func (c Client) Install(ctx context.Context, plugin Plugin, options InstallOptions) (InstallResult, error) {
-	if errValidate := ValidatePlugin(plugin); errValidate != nil {
-		return InstallResult{}, errValidate
+	if err := ValidatePlugin(plugin); err != nil {
+		return InstallResult{}, err
 	}
 	options = normalizeInstallOptions(options)
 	if PluginInstallType(plugin) == InstallTypeDirect {
 		plugin.Version = normalizeVersion(plugin.Version)
 		return c.InstallDirect(ctx, plugin, plugin.Install, options)
 	}
-	release, errRelease := c.FetchLatestRelease(ctx, plugin)
-	if errRelease != nil {
-		return InstallResult{}, errRelease
+	release, err := c.FetchLatestRelease(ctx, plugin)
+	if err != nil {
+		return InstallResult{}, err
 	}
-	latestVersion, errVersion := ReleaseVersion(release)
-	if errVersion != nil {
-		return InstallResult{}, errVersion
+	latestVersion, err := ReleaseVersion(release)
+	if err != nil {
+		return InstallResult{}, err
 	}
 	plugin.Version = latestVersion
 	return c.installRelease(ctx, plugin, release, latestVersion, options)
 }
 
 func (c Client) InstallManifest(ctx context.Context, manifest Manifest, options InstallOptions) (InstallResult, error) {
-	if errValidate := manifest.Validate(); errValidate != nil {
-		return InstallResult{}, errValidate
+	if err := manifest.Validate(); err != nil {
+		return InstallResult{}, err
 	}
 	options = normalizeInstallOptions(options)
 	switch manifest.InstallType() {
 	case InstallTypeDirect:
-		plugin, errPlugin := c.directPluginFromManifest(ctx, manifest)
-		if errPlugin != nil {
-			return InstallResult{}, errPlugin
+		plugin, err := c.directPluginFromManifest(ctx, manifest)
+		if err != nil {
+			return InstallResult{}, err
 		}
 		return c.InstallDirect(ctx, plugin, plugin.Install, options)
 	case InstallTypeGitHubRelease:
@@ -86,8 +85,8 @@ func (c Client) InstallManifest(ctx context.Context, manifest Manifest, options 
 
 // InstallVersion installs a plugin artifact from a fixed release tag/version.
 func (c Client) InstallVersion(ctx context.Context, plugin Plugin, releaseTag string, version string, options InstallOptions) (InstallResult, error) {
-	if errValidate := ValidatePlugin(plugin); errValidate != nil {
-		return InstallResult{}, errValidate
+	if err := ValidatePlugin(plugin); err != nil {
+		return InstallResult{}, err
 	}
 	options = normalizeInstallOptions(options)
 	version = normalizeVersion(version)
@@ -98,13 +97,13 @@ func (c Client) InstallVersion(ctx context.Context, plugin Plugin, releaseTag st
 	if releaseTag == "" {
 		releaseTag = version
 	}
-	release, errRelease := c.FetchReleaseByTag(ctx, plugin, releaseTag)
-	if errRelease != nil {
-		return InstallResult{}, errRelease
+	release, err := c.FetchReleaseByTag(ctx, plugin, releaseTag)
+	if err != nil {
+		return InstallResult{}, err
 	}
-	releaseVersion, errVersion := ReleaseVersion(release)
-	if errVersion != nil {
-		return InstallResult{}, errVersion
+	releaseVersion, err := ReleaseVersion(release)
+	if err != nil {
+		return InstallResult{}, err
 	}
 	if releaseVersion != version {
 		return InstallResult{}, fmt.Errorf("release tag %q resolved version %q, want %q", releaseTag, releaseVersion, version)
@@ -114,29 +113,29 @@ func (c Client) InstallVersion(ctx context.Context, plugin Plugin, releaseTag st
 }
 
 func (c Client) installRelease(ctx context.Context, plugin Plugin, release Release, version string, options InstallOptions) (InstallResult, error) {
-	archiveAsset, checksumAsset, errAssets := SelectReleaseAssets(release, plugin.ID, plugin.Version, options.GOOS, options.GOARCH)
-	if errAssets != nil {
-		return InstallResult{}, errAssets
+	archiveAsset, checksumAsset, err := SelectReleaseAssets(release, plugin.ID, plugin.Version, options.GOOS, options.GOARCH)
+	if err != nil {
+		return InstallResult{}, err
 	}
-	archiveData, errArchive := c.DownloadAsset(ctx, archiveAsset)
-	if errArchive != nil {
-		return InstallResult{}, fmt.Errorf("download %s: %w", archiveAsset.Name, errArchive)
+	archiveData, err := c.DownloadAsset(ctx, archiveAsset)
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("download %s: %w", archiveAsset.Name, err)
 	}
-	checksumData, errChecksum := c.DownloadAsset(ctx, checksumAsset)
-	if errChecksum != nil {
-		return InstallResult{}, fmt.Errorf("download checksums.txt: %w", errChecksum)
+	checksumData, err := c.DownloadAsset(ctx, checksumAsset)
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("download checksums.txt: %w", err)
 	}
-	checksums, errParse := ParseChecksums(checksumData)
-	if errParse != nil {
-		return InstallResult{}, errParse
+	checksums, err := ParseChecksums(checksumData)
+	if err != nil {
+		return InstallResult{}, err
 	}
-	if errVerify := VerifyChecksum(archiveAsset.Name, archiveData, checksums); errVerify != nil {
-		return InstallResult{}, errVerify
+	if err := VerifyChecksum(archiveAsset.Name, archiveData, checksums); err != nil {
+		return InstallResult{}, err
 	}
 	plugin.Version = version
-	result, errInstall := InstallArchive(archiveData, plugin, options)
-	if errInstall != nil {
-		return InstallResult{}, errInstall
+	result, err := InstallArchive(archiveData, plugin, options)
+	if err != nil {
+		return InstallResult{}, err
 	}
 	result.InstallType = InstallTypeGitHubRelease
 	result.ReleaseTag = strings.TrimSpace(release.TagName)
@@ -154,24 +153,24 @@ func (c Client) InstallDirect(ctx context.Context, plugin Plugin, plan InstallPl
 	}
 	plan = NormalizeInstallPlan(plan)
 	plan.Type = InstallTypeDirect
-	if errValidate := ValidateInstallPlan(plan); errValidate != nil {
-		return InstallResult{}, errValidate
+	if err := ValidateInstallPlan(plan); err != nil {
+		return InstallResult{}, err
 	}
 	options = normalizeInstallOptions(options)
-	artifact, errSelect := SelectArtifact(plan, options.GOOS, options.GOARCH)
-	if errSelect != nil {
-		return InstallResult{}, errSelect
+	artifact, err := SelectArtifact(plan, options.GOOS, options.GOARCH)
+	if err != nil {
+		return InstallResult{}, err
 	}
-	archiveData, errDownload := c.DownloadArtifact(ctx, artifact)
-	if errDownload != nil {
-		return InstallResult{}, fmt.Errorf("download artifact: %w", errDownload)
+	archiveData, err := c.DownloadArtifact(ctx, artifact)
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("download artifact: %w", err)
 	}
-	if errVerify := VerifyArtifactChecksum(artifact, archiveData); errVerify != nil {
-		return InstallResult{}, errVerify
+	if err := VerifyArtifactChecksum(artifact, archiveData); err != nil {
+		return InstallResult{}, err
 	}
-	result, errInstall := InstallArchive(archiveData, plugin, options)
-	if errInstall != nil {
-		return InstallResult{}, errInstall
+	result, err := InstallArchive(archiveData, plugin, options)
+	if err != nil {
+		return InstallResult{}, err
 	}
 	result.InstallType = InstallTypeDirect
 	return result, nil
@@ -194,12 +193,12 @@ func (c Client) directPluginFromManifest(ctx context.Context, manifest Manifest)
 	}
 	sourceClient := c
 	sourceClient.RegistryURL = sourceURL
-	registry, errRegistry := sourceClient.FetchRegistry(ctx)
-	if errRegistry != nil {
-		return Plugin{}, fmt.Errorf("fetch direct install source: %w", errRegistry)
+	registry, err := sourceClient.FetchRegistry(ctx)
+	if err != nil {
+		return Plugin{}, fmt.Errorf("fetch direct install source: %w", err)
 	}
-	resolved, okPlugin := registry.PluginByID(manifest.ID)
-	if !okPlugin {
+	resolved, ok := registry.PluginByID(manifest.ID)
+	if !ok {
 		return Plugin{}, fmt.Errorf("direct install plugin %q not found in source", strings.TrimSpace(manifest.ID))
 	}
 	if PluginInstallType(resolved) != InstallTypeDirect {
@@ -215,8 +214,8 @@ func directPluginVersion(plugin Plugin, id string, version string) (Plugin, erro
 		plugin.Version = version
 		plugin.Install = NormalizeInstallPlan(plugin.Install)
 		plugin.Install.Type = InstallTypeDirect
-		if errPlan := ValidateInstallPlan(plugin.Install); errPlan != nil {
-			return Plugin{}, fmt.Errorf("direct install plugin %q version %q: %w", id, version, errPlan)
+		if err := ValidateInstallPlan(plugin.Install); err != nil {
+			return Plugin{}, fmt.Errorf("direct install plugin %q version %q: %w", id, version, err)
 		}
 		return plugin, nil
 	}
@@ -232,8 +231,8 @@ func directPluginVersion(plugin Plugin, id string, version string) (Plugin, erro
 		if plugin.Install.Type != InstallTypeDirect {
 			return Plugin{}, fmt.Errorf("direct install plugin %q version %q resolved as %q", id, version, plugin.Install.Type)
 		}
-		if errPlan := ValidateInstallPlan(plugin.Install); errPlan != nil {
-			return Plugin{}, fmt.Errorf("direct install plugin %q version %q: %w", id, version, errPlan)
+		if err := ValidateInstallPlan(plugin.Install); err != nil {
+			return Plugin{}, fmt.Errorf("direct install plugin %q version %q: %w", id, version, err)
 		}
 		return plugin, nil
 	}
@@ -251,57 +250,55 @@ func InstallArchive(archiveData []byte, plugin Plugin, options InstallOptions) (
 		return InstallResult{}, fmt.Errorf("invalid plugin version %q", plugin.Version)
 	}
 	plugin.Version = version
-	reader, errZip := zip.NewReader(bytes.NewReader(archiveData), int64(len(archiveData)))
-	if errZip != nil {
-		return InstallResult{}, fmt.Errorf("open zip: %w", errZip)
+	reader, err := zip.NewReader(bytes.NewReader(archiveData), int64(len(archiveData)))
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("open zip: %w", err)
 	}
 
-	libraryData, mode, errLibrary := readTargetLibrary(reader, id, version, options.GOOS)
-	if errLibrary != nil {
-		return InstallResult{}, errLibrary
+	libraryData, mode, err := readTargetLibrary(reader, id, version, options.GOOS)
+	if err != nil {
+		return InstallResult{}, err
 	}
 
-	targetPath, errTarget := installTargetPath(options, id, version)
-	if errTarget != nil {
-		return InstallResult{}, errTarget
+	targetPath, err := installTargetPath(options, id, version)
+	if err != nil {
+		return InstallResult{}, err
 	}
 	overwritten := false
-	if _, errStat := os.Stat(targetPath); errStat == nil {
+	if _, err := os.Stat(targetPath); err == nil {
 		overwritten = true
-	} else if !errors.Is(errStat, os.ErrNotExist) {
-		return InstallResult{}, fmt.Errorf("stat target plugin: %w", errStat)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return InstallResult{}, fmt.Errorf("stat target plugin: %w", err)
 	}
 	if overwritten {
-		existingData, errReadExisting := os.ReadFile(targetPath)
-		if errReadExisting != nil {
-			return InstallResult{}, fmt.Errorf("read target plugin: %w", errReadExisting)
+		existingData, err := os.ReadFile(targetPath)
+		if err != nil {
+			return InstallResult{}, fmt.Errorf("read target plugin: %w", err)
 		}
 		if bytes.Equal(existingData, libraryData) {
 			return InstallResult{
 				ID:          id,
-				Version:     strings.TrimSpace(plugin.Version),
+				Version:     plugin.Version,
 				Path:        targetPath,
 				Overwritten: true,
 				Skipped:     true,
 			}, nil
 		}
 	}
-	// Re-check immediately before replacing an existing file: the same version
-	// may have been loaded while the archive was being downloaded and verified.
 	if overwritten && options.BeforeWrite != nil {
-		if errBeforeWrite := options.BeforeWrite(); errBeforeWrite != nil {
-			return InstallResult{}, fmt.Errorf("prepare plugin write: %w", errBeforeWrite)
+		if err := options.BeforeWrite(); err != nil {
+			return InstallResult{}, fmt.Errorf("prepare plugin write: %w", err)
 		}
 	}
 	if overwritten && loadedPluginInstallBlocked(options) {
 		return InstallResult{}, ErrLoadedPluginLocked
 	}
-	if errWrite := writeFileAtomic(targetPath, libraryData, mode); errWrite != nil {
-		return InstallResult{}, errWrite
+	if err := writeFileAtomic(targetPath, libraryData, mode); err != nil {
+		return InstallResult{}, err
 	}
 	return InstallResult{
 		ID:          id,
-		Version:     strings.TrimSpace(plugin.Version),
+		Version:     plugin.Version,
 		Path:        targetPath,
 		Overwritten: overwritten,
 	}, nil
@@ -320,9 +317,9 @@ func readTargetLibrary(reader *zip.Reader, id string, version string, goos strin
 	versionedTargetName := versionedPluginFileName(id, version, goos)
 	var target *zip.File
 	for _, file := range reader.File {
-		cleanedName, errClean := cleanZipName(file.Name)
-		if errClean != nil {
-			return nil, 0, errClean
+		cleanedName, err := cleanZipName(file.Name)
+		if err != nil {
+			return nil, 0, err
 		}
 		if file.FileInfo().IsDir() {
 			continue
@@ -348,18 +345,18 @@ func readTargetLibrary(reader *zip.Reader, id string, version string, goos strin
 		return nil, 0, fmt.Errorf("zip does not contain %s", targetName)
 	}
 
-	handle, errOpen := target.Open()
-	if errOpen != nil {
-		return nil, 0, fmt.Errorf("open %s: %w", targetName, errOpen)
+	handle, err := target.Open()
+	if err != nil {
+		return nil, 0, fmt.Errorf("open %s: %w", targetName, err)
 	}
 	defer func() {
-		if errClose := handle.Close(); errClose != nil {
-			log.WithError(errClose).Debug("failed to close plugin archive entry")
+		if err := handle.Close(); err != nil {
+			log.WithError(err).Debug("failed to close plugin archive entry")
 		}
 	}()
-	data, errRead := io.ReadAll(handle)
-	if errRead != nil {
-		return nil, 0, fmt.Errorf("read %s: %w", targetName, errRead)
+	data, err := io.ReadAll(handle)
+	if err != nil {
+		return nil, 0, fmt.Errorf("read %s: %w", targetName, err)
 	}
 	mode := target.FileInfo().Mode().Perm()
 	if mode == 0 {
@@ -399,112 +396,6 @@ func hasDynamicLibraryExtension(name string) bool {
 	return strings.HasSuffix(lowerName, ".dylib") || strings.HasSuffix(lowerName, ".so") || strings.HasSuffix(lowerName, ".dll")
 }
 
-type pluginFileInfo struct {
-	ID      string
-	Path    string
-	Version string
-}
-
-func discoverCurrentPluginFiles(root string) ([]pluginFileInfo, error) {
-	root = strings.TrimSpace(root)
-	if root == "" {
-		root = "plugins"
-	}
-	candidates := pluginCandidateDirs(root, runtime.GOOS, runtime.GOARCH)
-	extension := pluginExtension(runtime.GOOS)
-	selected := make([]pluginFileInfo, 0)
-	seen := make(map[string]struct{})
-	for _, dir := range candidates {
-		entries, errReadDir := os.ReadDir(dir)
-		if errReadDir != nil {
-			if os.IsNotExist(errReadDir) {
-				continue
-			}
-			return nil, errReadDir
-		}
-		files := make([]string, 0, len(entries))
-		for _, entry := range entries {
-			if entry == nil || !entry.Type().IsRegular() {
-				continue
-			}
-			if strings.HasSuffix(strings.ToLower(entry.Name()), extension) {
-				files = append(files, filepath.Join(dir, entry.Name()))
-			}
-		}
-		sort.Strings(files)
-		for _, path := range files {
-			file, okFile := pluginFileInfoFromPath(path, extension)
-			if !okFile {
-				continue
-			}
-			if _, exists := seen[file.ID]; exists {
-				continue
-			}
-			seen[file.ID] = struct{}{}
-			selected = append(selected, file)
-		}
-	}
-	return selected, nil
-}
-
-func pluginCandidateDirs(root string, goos string, goarch string) []string {
-	dirs := make([]string, 0, 2)
-	dirs = append(dirs, filepath.Join(root, goos, goarch))
-	dirs = append(dirs, root)
-	return dirs
-}
-
-func pluginIDFromPath(path string) string {
-	file, ok := pluginFileInfoFromPath(path, "")
-	if ok {
-		return file.ID
-	}
-	base := filepath.Base(path)
-	lowerBase := strings.ToLower(base)
-	for _, extension := range []string{".so", ".dylib", ".dll"} {
-		if strings.HasSuffix(lowerBase, extension) {
-			return base[:len(base)-len(extension)]
-		}
-	}
-	return base
-}
-
-func pluginFileInfoFromPath(filePath string, requiredExtension string) (pluginFileInfo, bool) {
-	base := filepath.Base(filePath)
-	lowerBase := strings.ToLower(base)
-	extension := strings.TrimSpace(requiredExtension)
-	if extension != "" {
-		if !strings.HasSuffix(lowerBase, strings.ToLower(extension)) {
-			return pluginFileInfo{}, false
-		}
-	} else {
-		for _, candidateExtension := range []string{".so", ".dylib", ".dll"} {
-			if strings.HasSuffix(lowerBase, candidateExtension) {
-				extension = candidateExtension
-				break
-			}
-		}
-		if extension == "" {
-			return pluginFileInfo{}, false
-		}
-	}
-	name := base[:len(base)-len(extension)]
-	id := name
-	version := ""
-	if versionIndex := strings.LastIndex(name, "-v"); versionIndex > 0 {
-		candidateID := name[:versionIndex]
-		candidateVersion := name[versionIndex+2:]
-		if validPluginID(candidateID) && validPluginVersion(candidateVersion) {
-			id = candidateID
-			version = candidateVersion
-		}
-	}
-	if !validPluginID(id) {
-		return pluginFileInfo{}, false
-	}
-	return pluginFileInfo{ID: id, Path: filePath, Version: version}, true
-}
-
 func pluginExtension(goos string) string {
 	switch strings.ToLower(strings.TrimSpace(goos)) {
 	case "darwin", "mac", "macos", "osx":
@@ -518,56 +409,55 @@ func pluginExtension(goos string) string {
 
 func writeFileAtomic(targetPath string, data []byte, mode os.FileMode) error {
 	targetDir := filepath.Dir(targetPath)
-	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
-		return fmt.Errorf("create plugin directory: %w", errMkdir)
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return fmt.Errorf("create plugin directory: %w", err)
 	}
 
-	temp, errTemp := os.CreateTemp(targetDir, "."+filepath.Base(targetPath)+".tmp-*")
-	if errTemp != nil {
-		return fmt.Errorf("create temp plugin file: %w", errTemp)
+	temp, err := os.CreateTemp(targetDir, "."+filepath.Base(targetPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp plugin file: %w", err)
 	}
 	tempPath := temp.Name()
 	removeTemp := true
 	closed := false
 	defer func() {
 		if !closed {
-			if errClose := temp.Close(); errClose != nil {
-				log.WithError(errClose).Debug("failed to close temp plugin file")
+			if err := temp.Close(); err != nil {
+				log.WithError(err).Debug("failed to close temp plugin file")
 			}
 		}
 		if removeTemp {
-			if errRemove := os.Remove(tempPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
-				log.WithError(errRemove).Debug("failed to remove temp plugin file")
+			if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.WithError(err).Debug("failed to remove temp plugin file")
 			}
 		}
 	}()
 
-	if errChmod := temp.Chmod(mode); errChmod != nil {
-		return fmt.Errorf("chmod temp plugin file: %w", errChmod)
+	if err := temp.Chmod(mode); err != nil {
+		return fmt.Errorf("chmod temp plugin file: %w", err)
 	}
-	if _, errWrite := temp.Write(data); errWrite != nil {
-		return fmt.Errorf("write temp plugin file: %w", errWrite)
+	if _, err := temp.Write(data); err != nil {
+		return fmt.Errorf("write temp plugin file: %w", err)
 	}
-	if errSync := temp.Sync(); errSync != nil {
-		return fmt.Errorf("sync temp plugin file: %w", errSync)
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync temp plugin file: %w", err)
 	}
-	if errClose := temp.Close(); errClose != nil {
-		return fmt.Errorf("close temp plugin file: %w", errClose)
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close temp plugin file: %w", err)
 	}
 	closed = true
-	if errRename := os.Rename(tempPath, targetPath); errRename != nil {
+	if err := os.Rename(tempPath, targetPath); err != nil {
 		if runtime.GOOS == "windows" {
-			if errRemove := os.Remove(targetPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
-				return fmt.Errorf("remove old plugin file: %w", errRemove)
+			if err := os.Remove(targetPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove old plugin file: %w", err)
 			}
-			if errRenameRetry := os.Rename(tempPath, targetPath); errRenameRetry == nil {
+			if err := os.Rename(tempPath, targetPath); err == nil {
 				removeTemp = false
 				return nil
-			} else {
-				return fmt.Errorf("install plugin file: %w", errRenameRetry)
 			}
+			return fmt.Errorf("install plugin file: %w", err)
 		}
-		return fmt.Errorf("install plugin file: %w", errRename)
+		return fmt.Errorf("install plugin file: %w", err)
 	}
 	removeTemp = false
 	return nil

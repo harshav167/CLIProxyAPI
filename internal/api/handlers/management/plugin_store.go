@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,6 +31,10 @@ const (
 	// pluginReleaseFailureCacheTTL throttles retries after a failed lookup so a
 	// rate-limited or unreachable API is not hammered on every listing.
 	pluginReleaseFailureCacheTTL = 30 * time.Second
+	// pluginReleaseMaxConcurrency limits parallel GitHub release lookups during
+	// plugin store listing. Higher values do not improve latency meaningfully
+	// because GitHub API rate limits and network RTT dominate.
+	pluginReleaseMaxConcurrency = 8
 )
 
 type pluginReleaseCacheEntry struct {
@@ -392,14 +397,19 @@ func pluginStoreManifestForInstall(source pluginstore.Source, plugin pluginstore
 }
 
 func pluginInstallRequestedVersion(c *gin.Context) (string, error) {
+	if c == nil || c.Request == nil {
+		return "", nil
+	}
 	requestedVersion := strings.TrimSpace(c.Query("version"))
-	if c == nil || c.Request == nil || c.Request.Body == nil || c.Request.Body == http.NoBody {
+	if c.Request.Body == nil || c.Request.Body == http.NoBody {
 		return requestedVersion, nil
 	}
 	body, errRead := io.ReadAll(c.Request.Body)
 	if errRead != nil {
 		return "", fmt.Errorf("read install request: %w", errRead)
 	}
+	// Restore the body so later middleware/handlers can read it again.
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	if strings.TrimSpace(string(body)) == "" {
 		return requestedVersion, nil
 	}
@@ -429,11 +439,7 @@ func pluginStoreReleaseTagCandidates(version string) []string {
 }
 
 func normalizePluginStoreRequestedVersion(version string) string {
-	version = strings.TrimSpace(version)
-	if strings.HasPrefix(strings.ToLower(version), "v") {
-		return strings.TrimSpace(version[1:])
-	}
-	return version
+	return pluginstore.NormalizeVersion(version)
 }
 
 // enablePluginConfigLocked sets plugins.configs.<id>.enabled and store while
@@ -505,11 +511,17 @@ func (h *Handler) newPluginStoreClient(proxyURL string, registryURL string, stor
 	if httpClient != nil {
 		return pluginstore.Client{HTTPClient: httpClient, RegistryURL: registryURL, Auth: storeAuth}
 	}
-	client := &http.Client{}
-	if strings.TrimSpace(proxyURL) != "" {
-		util.SetProxy(&sdkconfig.SDKConfig{ProxyURL: strings.TrimSpace(proxyURL)}, client)
+	// Start from the plugin store's safe default client (bounded timeouts)
+	// instead of a bare http.Client, then apply the proxy if configured.
+	baseClient, _ := pluginstore.DefaultHTTPClient().(*http.Client)
+	if baseClient == nil {
+		baseClient = &http.Client{Timeout: 60 * time.Second}
 	}
-	return pluginstore.Client{HTTPClient: client, RegistryURL: registryURL, Auth: storeAuth}
+	client := *baseClient // value copy to avoid mutating the shared default
+	if strings.TrimSpace(proxyURL) != "" {
+		util.SetProxy(&sdkconfig.SDKConfig{ProxyURL: strings.TrimSpace(proxyURL)}, &client)
+	}
+	return pluginstore.Client{HTTPClient: &client, RegistryURL: registryURL, Auth: storeAuth}
 }
 
 func (h *Handler) fetchSourcedPlugins(ctx context.Context, proxyURL string, storeAuth []pluginstore.AuthConfig, sources []pluginstore.Source) ([]sourcedPlugin, []pluginStoreSourceErr) {
@@ -645,13 +657,23 @@ func pluginAuthConfigured(source pluginstore.Source, plugin pluginstore.Plugin, 
 func (h *Handler) latestPluginVersions(ctx context.Context, client pluginstore.Client, plugins []pluginstore.Plugin) []string {
 	versions := make([]string, len(plugins))
 	var wg sync.WaitGroup
-	for index := range plugins {
+	work := make(chan int, pluginReleaseMaxConcurrency)
+
+	// Start a fixed number of workers instead of one goroutine per plugin.
+	for range pluginReleaseMaxConcurrency {
 		wg.Add(1)
-		go func(index int) {
+		go func() {
 			defer wg.Done()
-			versions[index] = h.latestPluginVersion(ctx, client, plugins[index])
-		}(index)
+			for index := range work {
+				versions[index] = h.latestPluginVersion(ctx, client, plugins[index])
+			}
+		}()
 	}
+
+	for index := range plugins {
+		work <- index
+	}
+	close(work)
 	wg.Wait()
 	return versions
 }
@@ -797,10 +819,7 @@ func pluginStoreYAMLScalar(node *yaml.Node) string {
 }
 
 func pluginStoreNormalizeDesiredVersion(version string) string {
-	version = strings.TrimSpace(version)
-	if len(version) > 1 && (version[0] == 'v' || version[0] == 'V') {
-		version = version[1:]
-	}
+	version = pluginstore.NormalizeVersion(version)
 	if version == "" || version[0] < '0' || version[0] > '9' {
 		return ""
 	}
