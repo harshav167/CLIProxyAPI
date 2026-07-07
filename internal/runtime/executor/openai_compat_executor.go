@@ -131,6 +131,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// GLM-specific request rewrite — see helps.NormalizeGLMRequestBody for the
 	// thinking/reasoning_effort coupling and unsupported field stripping.
 	translated = helps.NormalizeGLMRequestBody(translated, e.Identifier(), baseModel)
+	// Alibaba Token Plan explicit cache_control injection — converts the
+	// system+tools prefix and the previous-turn boundary from best-effort 20%
+	// implicit cache hits to deterministic 10% explicit cache hits. No-op for
+	// non-Alibaba base-urls (z.ai, Fireworks, Ollama, etc.).
+	translated = helps.ApplyAlibabaExplicitCache(translated, baseURL)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -337,6 +342,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// GLM-specific request rewrite — see helps.NormalizeGLMRequestBody for the
 	// thinking/reasoning_effort coupling and unsupported field stripping.
 	translated = helps.NormalizeGLMRequestBody(translated, e.Identifier(), baseModel)
+	// Alibaba Token Plan explicit cache_control injection — converts the
+	// system+tools prefix and the previous-turn boundary from best-effort 20%
+	// implicit cache hits to deterministic 10% explicit cache hits. No-op for
+	// non-Alibaba base-urls (z.ai, Fireworks, Ollama, etc.).
+	translated = helps.ApplyAlibabaExplicitCache(translated, baseURL)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
