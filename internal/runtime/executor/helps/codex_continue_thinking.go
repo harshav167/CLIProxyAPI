@@ -1,8 +1,6 @@
 package helps
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -36,9 +34,6 @@ func NormalizeCodexContinueConfig(c *config.CodexContinueConfig) *config.CodexCo
 		c.MinN = CodexContinueDefaultMinN
 	}
 	// MaxN: 0 = uncapped (CodexCont semantics) — leave 0 as-is.
-	if c.Method == "" {
-		c.Method = CodexContinueMethodCommentary
-	}
 	if c.MarkerText == "" {
 		c.MarkerText = CodexContinueDefaultMarkerText
 	}
@@ -92,14 +87,6 @@ func ReasoningTokens(data []byte) (int, bool) {
 	return int(v.Int()), true
 }
 
-// ContinueCallID returns a deterministic call_id derived from a reasoning id
-// (sha1 first 24 hex chars). Same reasoning id → same pair, so the within-turn
-// tail and (optional) cross-turn repair emit byte-identical bytes.
-func ContinueCallID(reasoningID string) string {
-	sum := sha1.Sum([]byte(reasoningID))
-	return "call_" + hex.EncodeToString(sum[:])[:24]
-}
-
 // CommentaryMessage returns a phase:"commentary" assistant message — the clean
 // continuation provocation. phase is an official Responses-API field; agents
 // preserve it cross-turn, and it carries no synthetic tool.
@@ -110,26 +97,6 @@ func CommentaryMessage(text string) map[string]any {
 		"content": []map[string]any{{"type": "output_text", "text": text}},
 		"phase":   "commentary",
 	}
-}
-
-// ContinuePair returns a synthetic (function_call, function_call_output) pair
-// that nudges the model to resume reasoning. Used only when method="tool_pair".
-// Never declare as a real tool — the caller must not register it.
-func ContinuePair(reasoningID string, toolName string, outputText string) (map[string]any, map[string]any) {
-	callID := ContinueCallID(reasoningID)
-	args, _ := json.Marshal(map[string]bool{"continue": true})
-	call := map[string]any{
-		"type":      "function_call",
-		"call_id":   callID,
-		"name":      toolName,
-		"arguments": string(args),
-	}
-	out := map[string]any{
-		"type":    "function_call_output",
-		"call_id": callID,
-		"output":  outputText,
-	}
-	return call, out
 }
 
 // BuildContinuationPayload shapes the agent's original translated request body
@@ -195,17 +162,6 @@ func ReasoningEnabled(body []byte) bool {
 		return true
 	}
 	return v.Type != gjson.False
-}
-
-// JoinContinueInputItem is a convenience for assembling the continuation round's
-// input as []any. It exists so callers don't have to import reflect to convert
-// a slice of map[string]any to []any.
-func JoinContinueInputItem(items []map[string]any) []any {
-	out := make([]any, 0, len(items))
-	for _, it := range items {
-		out = append(out, it)
-	}
-	return out
 }
 
 // StoppedReasonWhenTruncated is the inverse of ShouldContinue: the round IS

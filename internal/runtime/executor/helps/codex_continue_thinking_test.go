@@ -80,20 +80,6 @@ func TestReasoningTokens(t *testing.T) {
 	}
 }
 
-func TestContinueCallIDDeterministic(t *testing.T) {
-	id1 := ContinueCallID("rs_abc123")
-	id2 := ContinueCallID("rs_abc123")
-	if id1 != id2 {
-		t.Errorf("ContinueCallID non-deterministic: %s != %s", id1, id2)
-	}
-	if id1 == ContinueCallID("rs_xyz789") {
-		t.Error("ContinueCallID collides across different reasoning ids")
-	}
-	if len(id1) <= len("call_") {
-		t.Errorf("ContinueCallID too short: %s", id1)
-	}
-}
-
 func TestCommentaryMessage(t *testing.T) {
 	msg := CommentaryMessage("Continue thinking...")
 	if msg["type"] != "message" || msg["role"] != "assistant" || msg["phase"] != "commentary" {
@@ -214,8 +200,8 @@ func TestNormalizeCodexContinueConfigDefaults(t *testing.T) {
 	if got.MaxContinue != 0 || got.MaxN != 0 {
 		t.Errorf("max_continue/max_n should stay 0 (CodexCont: 0=no-cap-or-stop), got %+v", got)
 	}
-	if got.Method != CodexContinueMethodCommentary || got.MarkerText != CodexContinueDefaultMarkerText {
-		t.Errorf("method/marker defaults wrong: %+v", got)
+	if got.MarkerText != CodexContinueDefaultMarkerText {
+		t.Errorf("marker default wrong: %+v", got)
 	}
 	// nil → disabled.
 	if NormalizeCodexContinueConfig(nil).Enabled {

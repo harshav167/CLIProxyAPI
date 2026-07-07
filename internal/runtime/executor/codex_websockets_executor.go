@@ -29,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
@@ -117,6 +118,11 @@ type codexWebsocketSession struct {
 	// warmedUp tracks whether a cache-priming warmup request has been sent on
 	// this session's WebSocket. Set once after the first successful warmup.
 	warmedUp bool
+
+	// warmedUpGen records the connGeneration the warmup primed. The warmup
+	// primes CONNECTION-LOCAL cache, so a reconnect (new connGeneration) must
+	// re-warm. Guarded by connMu.
+	warmedUpGen uint64
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
@@ -255,6 +261,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex websockets executor", body)
+	logCodexFinalReasoningConfig("codex websocket execute", body, requestedModel, baseModel)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -516,6 +523,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex websockets executor", body)
+	logCodexFinalReasoningConfig("codex websocket stream", body, requestedModel, baseModel)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -615,6 +623,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		sess.setActive(readCh)
 	}
 
+	// Cache-priming warmup (v2 `generate:false` prewarm). Best-effort: prime the
+	// connection-local previous-response cache with the stable prompt prefix so
+	// this first real turn chains from it via previous_response_id and hits the
+	// upstream cache (~80-90%) instead of paying a cold first turn.
+	wsReqBody = e.maybeWarmupAndChain(ctx, sess, conn, readCh, wsReqBody)
+
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
@@ -708,6 +722,130 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			case <-ctx.Done():
 				return false
 			}
+		}
+
+		foldCfg := codexContinueConfigForBody(e.cfg, clientBody, "websocket stream")
+		if foldCfg.Enabled {
+			var translatorParam any
+			forwardFoldEvent := func(line []byte, state codexIdentityConfuseState) {
+				payload := codexDataPayload(line)
+				if payload == nil {
+					return
+				}
+				payload = applyCodexIdentityExposeResponsePayload(payload, state)
+				eventType := gjson.GetBytes(payload, "type").String()
+				if cliproxyexecutor.DownstreamWebsocket(ctx) {
+					if !send(cliproxyexecutor.StreamChunk{Payload: payload}) {
+						terminateReason = "context_done"
+						terminateErr = ctx.Err()
+					}
+					return
+				}
+
+				if !shouldForwardEventToClient(ctx, eventType) {
+					return
+				}
+				sseLine := encodeCodexWebsocketAsSSE(payload)
+				chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, clientBody, clientBody, sseLine, &translatorParam)
+				if len(chunks) == 0 && from.String() == "openai" && needsRawFallback(eventType) {
+					if !send(cliproxyexecutor.StreamChunk{Payload: synthesizeChatCompletionsErrorChunk(payload)}) {
+						terminateReason = "context_done"
+						terminateErr = ctx.Err()
+					}
+				} else {
+					for i := range chunks {
+						if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+							terminateReason = "context_done"
+							terminateErr = ctx.Err()
+							return
+						}
+					}
+				}
+				switch eventType {
+				case "response.completed", "response.done", "response.failed",
+					"response.incomplete", "response.error":
+					stopKeepalive()
+				}
+				switch eventType {
+				case "response.in_progress":
+					if !keepaliveStarted && shouldStartCursorKeepalive(ctx, e.cfg, from) && len(chunks) > 0 {
+						cachedChunks := make([][]byte, len(chunks))
+						for i, c := range chunks {
+							cachedChunks[i] = bytes.Clone(c)
+						}
+						interval := cursorKeepaliveInterval(e.cfg)
+						go runCursorKeepalive(ctx, send, cachedChunks, interval, keepaliveStop, executionSessionID)
+						keepaliveStarted = true
+					}
+				case "response.output_text.delta",
+					"response.output_text.done",
+					"response.reasoning_summary_text.delta",
+					"response.reasoning_summary_text.done",
+					"response.reasoning_summary_part.added",
+					"response.reasoning_summary_part.done",
+					"response.reasoning_text.delta",
+					"response.function_call_arguments.delta",
+					"response.function_call_arguments.done",
+					"response.output_item.added",
+					"response.output_item.done",
+					"response.content_part.added",
+					"response.content_part.done":
+					stopKeepalive()
+				}
+			}
+			continuation := &codexWebsocketContinuation{
+				exec:               e,
+				ctx:                ctx,
+				sess:               sess,
+				conn:               conn,
+				readCh:             readCh,
+				wsHeaders:          wsHeaders,
+				auth:               auth,
+				authID:             authID,
+				authLabel:          authLabel,
+				authType:           authType,
+				authValue:          authValue,
+				wsURL:              wsURL,
+				executionSessionID: executionSessionID,
+				ginHeaders:         ginHeaders,
+				userPayload:        userPayload,
+				onReadError: func(errRead error) {
+					if errRead == nil {
+						return
+					}
+					if ctx != nil && ctx.Err() != nil {
+						terminateReason = "context_done"
+						terminateErr = ctx.Err()
+						return
+					}
+					terminateReason = "read_error"
+					terminateErr = errRead
+					helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
+					if sess != nil {
+						e.invalidateUpstreamConn(sess, conn, "read_error", errRead)
+					}
+				},
+			}
+			fx := &codexContinueFoldContext{
+				cfg:              foldCfg,
+				rootConfig:       e.cfg,
+				req:              req,
+				from:             from,
+				to:               to,
+				originalPayload:  clientBody,
+				baseBody:         clientBody,
+				responseFormat:   responseFormat,
+				openContinuation: continuation.open,
+				appendResponse: func(ctx context.Context, payload []byte) {
+					if eventData := codexDataPayload(payload); eventData != nil {
+						helps.AppendAPIWebsocketResponse(ctx, e.cfg, eventData)
+						return
+					}
+					helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
+				},
+			}
+			fx.runFoldLoop(ctx, newCodexWebsocketRoundBody(ctx, sess, conn, readCh, reporter.MarkFirstResponseByte, continuation.onReadError), identityState, out, reporter, codexReasoningReplayScope{}, forwardFoldEvent)
+			return
 		}
 
 		var param any
@@ -898,6 +1036,227 @@ func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Con
 		return fmt.Errorf("codex websockets executor: websocket conn is nil")
 	}
 	return conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+// runCodexWebsocketWarmup performs the v2 `generate:false` cache-priming warmup
+// on a freshly-connected session, synchronously, before the first real turn.
+//
+// It sends the turn body with `generate:false` added, drains upstream events on
+// the session's active read channel until the warmup response reaches a terminal
+// event, and returns the warmup `response.id` so the caller can chain the real
+// turn via `previous_response_id`.
+//
+// Contract (mirrors codex-rs prewarm_websocket, best-effort):
+//   - Only runs when the session exists, config enables it, and the session has
+//     not been warmed on this connection yet (gated by the caller).
+//   - A warmup send/read failure returns ("", err) but MUST NOT be fatal to the
+//     turn: the caller logs and proceeds with the normal (un-chained) request.
+//   - Uses the caller-provided readCh (already set active) so the shared
+//     readUpstreamLoop delivers warmup events here; the caller keeps ownership.
+func (e *CodexWebsocketsExecutor) runCodexWebsocketWarmup(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead, wsReqBody []byte) (string, error) {
+	warmupBody, ok := helps.BuildCodexWebsocketWarmupBody(wsReqBody)
+	if !ok {
+		return "", fmt.Errorf("codex websockets warmup: could not build warmup body")
+	}
+	if errSend := writeCodexWebsocketMessage(sess, conn, warmupBody); errSend != nil {
+		return "", fmt.Errorf("codex websockets warmup: send failed: %w", errSend)
+	}
+	// Drain warmup events until a terminal event. We intentionally discard the
+	// warmup's reasoning/output items — only the response id matters.
+	for {
+		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
+		if errRead != nil {
+			return "", fmt.Errorf("codex websockets warmup: read failed: %w", errRead)
+		}
+		if msgType != websocket.TextMessage || len(payload) == 0 {
+			continue
+		}
+		evt := helps.ParseCodexWebsocketWarmupEvent(payload)
+		if !evt.Terminal {
+			continue
+		}
+		if !evt.Completed {
+			return "", fmt.Errorf("codex websockets warmup: terminated without completion")
+		}
+		return evt.ResponseID, nil
+	}
+}
+
+// maybeWarmupAndChain runs the cache-priming warmup once per connection and, on
+// success, returns wsReqBody chained from the warmup response via
+// previous_response_id. It is best-effort: on any gate miss or warmup failure it
+// returns wsReqBody unchanged so the turn proceeds normally.
+//
+// Gates:
+//   - config enables cursor-warmup,
+//   - a real execution session exists (warmup primes a session's socket),
+//   - the current connection generation has not been warmed yet (warmedUpGen).
+func (e *CodexWebsocketsExecutor) maybeWarmupAndChain(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead, wsReqBody []byte) []byte {
+	if e.cfg == nil || !e.cfg.CursorWarmup.Enabled {
+		return wsReqBody
+	}
+	if sess == nil || conn == nil || readCh == nil || len(wsReqBody) == 0 {
+		return wsReqBody
+	}
+	if gjson.GetBytes(wsReqBody, "previous_response_id").String() != "" {
+		return wsReqBody
+	}
+
+	// Once-per-connection gate: the warmup primes CONNECTION-LOCAL cache, so we
+	// warm on the first turn of each connection generation and skip afterwards.
+	sess.connMu.Lock()
+	currentGen := sess.connGeneration
+	alreadyWarmed := sess.warmedUp && sess.warmedUpGen == currentGen
+	sess.connMu.Unlock()
+	if alreadyWarmed {
+		return wsReqBody
+	}
+
+	respID, errWarm := e.runCodexWebsocketWarmup(ctx, sess, conn, readCh, wsReqBody)
+	if errWarm != nil {
+		// Best-effort: never fail the turn on a warmup error. The read loop may
+		// have been consumed/closed on a read failure; the normal send below
+		// then triggers the executor's existing send-retry/reconnect path.
+		log.Debugf("codex websockets warmup: skipped session=%s gen=%d: %v", sess.sessionID, currentGen, errWarm)
+		return wsReqBody
+	}
+
+	sess.connMu.Lock()
+	sess.warmedUp = true
+	sess.warmedUpGen = currentGen
+	sess.connMu.Unlock()
+
+	if respID == "" {
+		return wsReqBody
+	}
+	log.Debugf("codex websockets warmup: primed session=%s gen=%d resp=%s", sess.sessionID, currentGen, respID)
+	return helps.ApplyCodexWebsocketPreviousResponseID(wsReqBody, respID)
+}
+
+type codexWebsocketRoundBody struct {
+	ctx        context.Context
+	sess       *codexWebsocketSession
+	conn       *websocket.Conn
+	readCh     chan codexWebsocketRead
+	onResponse func()
+	onError    func(error)
+	buf        []byte
+	closed     bool
+}
+
+func newCodexWebsocketRoundBody(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead, onResponse func(), onError func(error)) *codexWebsocketRoundBody {
+	return &codexWebsocketRoundBody{
+		ctx:        ctx,
+		sess:       sess,
+		conn:       conn,
+		readCh:     readCh,
+		onResponse: onResponse,
+		onError:    onError,
+	}
+}
+
+func (b *codexWebsocketRoundBody) Read(p []byte) (int, error) {
+	if b == nil || b.closed {
+		return 0, io.EOF
+	}
+	if len(b.buf) > 0 {
+		n := copy(p, b.buf)
+		b.buf = b.buf[n:]
+		return n, nil
+	}
+	for {
+		msgType, payload, errRead := readCodexWebsocketMessage(b.ctx, b.sess, b.conn, b.readCh)
+		if errRead != nil {
+			if b.onError != nil {
+				b.onError(errRead)
+			}
+			return 0, errRead
+		}
+		if msgType == websocket.BinaryMessage {
+			errBinary := fmt.Errorf("codex websockets executor: unexpected binary message")
+			if b.onError != nil {
+				b.onError(errBinary)
+			}
+			return 0, errBinary
+		}
+		payload = bytes.TrimSpace(payload)
+		if msgType != websocket.TextMessage || len(payload) == 0 {
+			continue
+		}
+		if wsErr, ok := parseCodexWebsocketError(payload); ok {
+			if b.onError != nil {
+				b.onError(wsErr)
+			}
+			return 0, wsErr
+		}
+		if b.onResponse != nil {
+			b.onResponse()
+		}
+		line := encodeCodexWebsocketAsSSE(normalizeCodexWebsocketCompletion(payload))
+		line = append(line, '\n')
+		n := copy(p, line)
+		b.buf = line[n:]
+		return n, nil
+	}
+}
+
+func (b *codexWebsocketRoundBody) Close() error {
+	if b != nil {
+		b.closed = true
+	}
+	return nil
+}
+
+type codexWebsocketContinuation struct {
+	exec               *CodexWebsocketsExecutor
+	ctx                context.Context
+	sess               *codexWebsocketSession
+	conn               *websocket.Conn
+	readCh             chan codexWebsocketRead
+	wsHeaders          http.Header
+	auth               *cliproxyauth.Auth
+	authID             string
+	authLabel          string
+	authType           string
+	authValue          string
+	wsURL              string
+	executionSessionID string
+	ginHeaders         codexClientMetadataHeaders
+	userPayload        []byte
+	onReadError        func(error)
+}
+
+func (c *codexWebsocketContinuation) open(ctx context.Context, body []byte) (*codexContinueRound, error) {
+	if c == nil || c.exec == nil || c.conn == nil {
+		return nil, fmt.Errorf("codex websockets continue: websocket continuation is not initialized")
+	}
+	upstreamBody, identityState := applyCodexIdentityConfuseBody(c.exec.cfg, c.auth, c.userPayload, body)
+	wsHeaders := c.wsHeaders.Clone()
+	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
+	_, wsReqBody := applyCurrentSessionMetadata(c.sess, c.executionSessionID, wsHeaders, upstreamBody, c.ginHeaders)
+	helps.RecordAPIWebsocketRequest(ctx, c.exec.cfg, helps.UpstreamRequestLog{
+		URL:       c.wsURL,
+		Method:    "WEBSOCKET",
+		Headers:   wsHeaders,
+		Body:      wsReqBody,
+		Provider:  c.exec.Identifier(),
+		AuthID:    c.authID,
+		AuthLabel: c.authLabel,
+		AuthType:  c.authType,
+		AuthValue: c.authValue,
+	})
+	if errSend := writeCodexWebsocketMessage(c.sess, c.conn, wsReqBody); errSend != nil {
+		helps.RecordAPIWebsocketError(ctx, c.exec.cfg, "continue_send", errSend)
+		if c.sess != nil {
+			c.exec.invalidateUpstreamConn(c.sess, c.conn, "continue_send_error", errSend)
+		}
+		return nil, errSend
+	}
+	return &codexContinueRound{
+		body:          newCodexWebsocketRoundBody(ctx, c.sess, c.conn, c.readCh, nil, c.onReadError),
+		identityState: identityState,
+		statusCode:    http.StatusOK,
+	}, nil
 }
 
 func buildCodexWebsocketRequestBody(body []byte, clientMetadata map[string]string) []byte {
@@ -2325,15 +2684,15 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if forcePassthroughFromContext(ctx) {
 		return e.httpExec.ExecuteStream(ctx, auth, req, opts)
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
-		if sk := helps.ExecutionSessionIDFromOptions(opts); sk == "" || !e.isWSDisabled(sk) {
-			return e.wsExec.ExecuteStream(ctx, auth, req, opts)
-		}
-	}
 	chainingEnabled := e.cfg != nil && e.cfg.CodexResponseChaining.Enabled
 	if chainingEnabled && codexWebsocketsEnabled(auth) {
 		if result, err, ok := e.bridgedExecuteStream(ctx, auth, req, opts); ok {
 			return result, err
+		}
+	}
+	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+		if sk := helps.ExecutionSessionIDFromOptions(opts); sk == "" || !e.isWSDisabled(sk) {
+			return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 		}
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
@@ -2480,6 +2839,155 @@ func (e *CodexAutoExecutor) doBridgedStream(ctx context.Context, auth *cliproxya
 	return result, err, sentDelta
 }
 
+type codexBridgeCaptureObserver struct {
+	exec                *CodexAutoExecutor
+	sessionKey          string
+	model               string
+	authID              string
+	requestPayload      []byte
+	telemetry           bridgeTurnTelemetry
+	outputItemsByIndex  map[int64][]byte
+	outputItemsFallback [][]byte
+}
+
+func newCodexBridgeCaptureObserver(exec *CodexAutoExecutor, sessionKey, model, authID string, requestPayload []byte, telemetry bridgeTurnTelemetry) *codexBridgeCaptureObserver {
+	return &codexBridgeCaptureObserver{
+		exec:               exec,
+		sessionKey:         sessionKey,
+		model:              model,
+		authID:             authID,
+		requestPayload:     requestPayload,
+		telemetry:          telemetry,
+		outputItemsByIndex: make(map[int64][]byte),
+	}
+}
+
+func (o *codexBridgeCaptureObserver) observe(eventData []byte) {
+	if o == nil || len(eventData) == 0 {
+		return
+	}
+	eventType := gjson.GetBytes(eventData, "type").String()
+	switch eventType {
+	case "response.output_item.done":
+		o.outputItemsFallback = collectOutputItem(eventData, o.outputItemsByIndex, o.outputItemsFallback)
+		return
+	case "response.created":
+		ts := gjson.GetBytes(eventData, "response.turn_state").String()
+		if ts == "" {
+			ts = gjson.GetBytes(eventData, "turn_state").String()
+		}
+		if ts != "" && o.exec != nil {
+			if wsSess := o.exec.getWSSession(o.sessionKey); wsSess != nil {
+				wsSess.connMu.Lock()
+				if wsSess.turnState != ts {
+					wsSess.turnState = ts
+					log.Debugf("codex http-ws bridge: captured turn_state from response.created for session %s", o.sessionKey)
+				}
+				wsSess.connMu.Unlock()
+			}
+		}
+		return
+	case "response.completed", "response.done":
+	default:
+		return
+	}
+
+	respID := extractResponseIDFromSSEPayload(eventData)
+	if respID != "" {
+		capturePayload, patched := patchResponseOutputIfMissing(eventData, o.outputItemsByIndex, o.outputItemsFallback)
+		if patched {
+			log.Debugf("codex http-ws bridge: patched response.output for session %s with %d items", o.sessionKey, len(o.outputItemsByIndex)+len(o.outputItemsFallback))
+		}
+		bridge := getHTTPWSBridge()
+		bridge.CaptureResponse(o.sessionKey, respID, o.model, o.authID, o.requestPayload, capturePayload)
+		bridge.MarkCompleted(o.sessionKey)
+		o.outputItemsByIndex = make(map[int64][]byte)
+		o.outputItemsFallback = nil
+	}
+
+	detail, ok := helps.ParseCodexUsage(eventData)
+	if !ok {
+		return
+	}
+	promptTokensForCache, cachePct := codexCacheReadStats(detail)
+	class := "full_send"
+	if o.telemetry.sentDelta {
+		switch {
+		case o.telemetry.reconnected:
+			class = "reconnect_miss"
+		case detail.CacheReadTokens == 0:
+			class = "cold_miss"
+		case cachePct >= 80:
+			class = "warm_hit"
+		default:
+			class = "partial_hit"
+		}
+	}
+	gapStr := "first"
+	if !o.telemetry.firstTurn {
+		gapStr = o.telemetry.gapSinceLast.Round(time.Millisecond).String()
+	}
+	log.Infof("codex http-ws bridge: turn session=%s model=%s class=%s input_uncached=%d input_total=%d cache_read=%d (%.1f%%) output=%d total=%d sent_delta=%v reconnected=%v conn_gen=%d gap=%s baseline=%d delta_items=%d",
+		o.sessionKey, o.model, class,
+		detail.InputTokens, promptTokensForCache, detail.CacheReadTokens, cachePct, detail.OutputTokens, detail.TotalTokens,
+		o.telemetry.sentDelta, o.telemetry.reconnected, o.telemetry.connGen,
+		gapStr, o.telemetry.baselineBefore, o.telemetry.deltaItems)
+	if o.telemetry.sentDelta && (class == "partial_hit" || class == "cold_miss") {
+		if bridge := getHTTPWSBridge(); bridge != nil {
+			bridge.Reset(o.sessionKey)
+			log.Warnf("codex http-ws bridge: cache-miss recovery — reset session %s after %s (cache=%.1f%%)", o.sessionKey, class, cachePct)
+		}
+	}
+}
+
+func codexCacheReadStats(detail coreusage.Detail) (int64, float64) {
+	promptTokens := detail.InputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
+	if promptTokens <= 0 {
+		return 0, 0
+	}
+	return promptTokens, float64(detail.CacheReadTokens) / float64(promptTokens) * 100
+}
+
+func logCodexFinalReasoningConfig(stage string, body []byte, requestedModel, upstreamModel string) {
+	reasoning := gjson.GetBytes(body, "reasoning")
+	if !reasoning.Exists() {
+		return
+	}
+	log.WithFields(log.Fields{
+		"provider":        "codex",
+		"model":           upstreamModel,
+		"requested_model": requestedModel,
+		"effort":          reasoning.Get("effort").String(),
+		"summary":         reasoning.Get("summary").String(),
+		"context":         reasoning.Get("context").String(),
+	}).Debug(stage + ": final reasoning config after payload overrides |")
+}
+
+func (o *codexBridgeCaptureObserver) observeChunk(payload []byte) {
+	if o == nil || len(payload) == 0 {
+		return
+	}
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return
+	}
+	if gjson.GetBytes(trimmed, "type").String() != "" {
+		o.observe(trimmed)
+		return
+	}
+	for _, line := range bytes.Split(payload, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, dataTag) {
+			continue
+		}
+		eventData := bytes.TrimSpace(line[len(dataTag):])
+		if len(eventData) == 0 || bytes.Equal(eventData, []byte("[DONE]")) {
+			continue
+		}
+		o.observe(eventData)
+	}
+}
+
 func (e *CodexAutoExecutor) wrapBridgedStreamForCapture(sessionKey, model, authID string, requestPayload []byte, result *cliproxyexecutor.StreamResult, telemetry bridgeTurnTelemetry) *cliproxyexecutor.StreamResult {
 	if result != nil && result.Headers != nil {
 		primary := result.Headers.Get("x-codex-primary-used-percent")
@@ -2498,91 +3006,10 @@ func (e *CodexAutoExecutor) wrapBridgedStreamForCapture(sessionKey, model, authI
 	wrappedCh := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(wrappedCh)
-		outputItemsByIndex := map[int64][]byte{}
-		outputItemsFallback := [][]byte{}
+		observer := newCodexBridgeCaptureObserver(e, sessionKey, model, authID, requestPayload, telemetry)
 		for chunk := range result.Chunks {
 			wrappedCh <- chunk
-			if len(chunk.Payload) == 0 {
-				continue
-			}
-			for _, line := range bytes.Split(chunk.Payload, []byte("\n")) {
-				if !bytes.HasPrefix(line, dataTag) {
-					continue
-				}
-				eventData := bytes.TrimSpace(line[5:])
-				eventType := gjson.GetBytes(eventData, "type").String()
-
-				if eventType == "response.output_item.done" {
-					outputItemsFallback = collectOutputItem(eventData, outputItemsByIndex, outputItemsFallback)
-				}
-
-				if eventType == "response.created" {
-					ts := gjson.GetBytes(eventData, "response.turn_state").String()
-					if ts == "" {
-						ts = gjson.GetBytes(eventData, "turn_state").String()
-					}
-					if ts != "" {
-						if wsSess := e.getWSSession(sessionKey); wsSess != nil {
-							wsSess.connMu.Lock()
-							if wsSess.turnState != ts {
-								wsSess.turnState = ts
-								log.Debugf("codex http-ws bridge: captured turn_state from response.created for session %s", sessionKey)
-							}
-							wsSess.connMu.Unlock()
-						}
-					}
-				}
-
-				if eventType == "response.completed" || eventType == "response.done" {
-					respID := extractResponseIDFromSSEPayload(eventData)
-					if respID != "" {
-						capturePayload, patched := patchResponseOutputIfMissing(eventData, outputItemsByIndex, outputItemsFallback)
-						if patched {
-							log.Debugf("codex http-ws bridge: patched response.output for session %s with %d items", sessionKey, len(outputItemsByIndex)+len(outputItemsFallback))
-						}
-						bridge := getHTTPWSBridge()
-						bridge.CaptureResponse(sessionKey, respID, model, authID, requestPayload, capturePayload)
-						bridge.MarkCompleted(sessionKey)
-						outputItemsByIndex = map[int64][]byte{}
-						outputItemsFallback = [][]byte{}
-					}
-					detail, ok := helps.ParseCodexUsage(eventData)
-					if ok {
-						var cachePct float64
-						if detail.InputTokens > 0 {
-							cachePct = float64(detail.CachedTokens) / float64(detail.InputTokens) * 100
-						}
-						class := "full_send"
-						if telemetry.sentDelta {
-							switch {
-							case telemetry.reconnected:
-								class = "reconnect_miss"
-							case detail.CachedTokens == 0:
-								class = "cold_miss"
-							case cachePct >= 80:
-								class = "warm_hit"
-							default:
-								class = "partial_hit"
-							}
-						}
-						gapStr := "first"
-						if !telemetry.firstTurn {
-							gapStr = telemetry.gapSinceLast.Round(time.Millisecond).String()
-						}
-						log.Infof("codex http-ws bridge: turn session=%s model=%s class=%s input=%d cached=%d (%.1f%%) output=%d total=%d sent_delta=%v reconnected=%v conn_gen=%d gap=%s baseline=%d delta_items=%d",
-							sessionKey, model, class,
-							detail.InputTokens, detail.CachedTokens, cachePct, detail.OutputTokens, detail.TotalTokens,
-							telemetry.sentDelta, telemetry.reconnected, telemetry.connGen,
-							gapStr, telemetry.baselineBefore, telemetry.deltaItems)
-						if telemetry.sentDelta && (class == "partial_hit" || class == "cold_miss") {
-							if bridge := getHTTPWSBridge(); bridge != nil {
-								bridge.Reset(sessionKey)
-								log.Warnf("codex http-ws bridge: cache-miss recovery — reset session %s after %s (cache=%.1f%%)", sessionKey, class, cachePct)
-							}
-						}
-					}
-				}
-			}
+			observer.observeChunk(chunk.Payload)
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: wrappedCh}

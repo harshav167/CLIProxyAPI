@@ -217,10 +217,9 @@ type Config struct {
 // Field semantics match CodexCont's config.example.toml:
 //   - enabled: master switch. Default false.
 //   - truncation-step: period of the fingerprint. Default 518.
-//   - max-continue: hard round cap after round 1 (0 = stop after round 1).
+//   - max-continue: hard round cap after round 1 (0 = uncapped).
 //   - min-n: continue only when truncation tier n >= min-n.
 //   - max-n: stop forcing once n > max-n (0 = uncapped).
-//   - method: "commentary" (default, clean) | "tool_pair" (legacy synthetic).
 //   - marker-text: the commentary message text that nudges the model.
 //   - max-total-output-tokens: cumulative cost cap across rounds (0 = off).
 type CodexContinueConfig struct {
@@ -229,9 +228,26 @@ type CodexContinueConfig struct {
 	MaxContinue          int    `yaml:"max-continue" json:"max-continue"`
 	MinN                 int    `yaml:"min-n" json:"min-n"`
 	MaxN                 int    `yaml:"max-n" json:"max-n"`
-	Method               string `yaml:"method" json:"method"`
 	MarkerText           string `yaml:"marker-text" json:"marker-text"`
 	MaxTotalOutputTokens int    `yaml:"max-total-output-tokens" json:"max-total-output-tokens"`
+	// BufferToolCalls controls whether function_call / custom_tool_call items
+	// are buffered (held back until a clean terminal proves the round wasn't
+	// truncated) or streamed live. Default false = stream live, so agentic tool
+	// use fires in real time. Fixture evidence shows truncated rounds emit only
+	// reasoning + message (never tool calls), so live streaming does not leak a
+	// truncated-round side effect. Set true for a paranoid posture that also
+	// buffers tool calls at the cost of serializing them behind round completion.
+	BufferToolCalls bool `yaml:"buffer-tool-calls" json:"buffer-tool-calls"`
+	// RechunkFinalAnswer smooths the buffered message flush. On a clean terminal
+	// the fold flushes the whole buffered answer at once (a burst); with rechunk
+	// on, the answer's text is re-sliced into uniform RechunkSize-char deltas so
+	// it streams like a normal response instead of appearing all at once. Only
+	// affects the buffered message flush; reasoning and tool calls stream live
+	// regardless. Default off preserves the verbatim-replay behaviour.
+	RechunkFinalAnswer bool `yaml:"rechunk-final-answer" json:"rechunk-final-answer"`
+	// RechunkSize is the per-delta character count when RechunkFinalAnswer is on.
+	// Falls back to a sane default when <= 0.
+	RechunkSize int `yaml:"rechunk-size" json:"rechunk-size"`
 }
 
 // RedisQueueConfig configures the optional external Redis/Valkey backend used

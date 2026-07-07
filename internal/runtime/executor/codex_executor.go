@@ -1135,11 +1135,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
-		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("codex executor: close response body error: %v", errClose)
-			}
-		}()
 
 		// Continue-thinking fold (fork-only). When disabled (the default),
 		// runFoldLoop falls through to the legacy scanner path verbatim —
@@ -1148,20 +1143,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		// 518n-2 reasoning-truncation fingerprint and silently opens
 		// continuation rounds, folding N upstream responses into one
 		// downstream stream.
-		foldCfg := helps.NormalizeCodexContinueConfig(e.cfg.CodexContinueThinking)
-		if foldCfg.Enabled && !helps.ReasoningEnabled(body) {
-			// Fold only applies to reasoning requests. Fall through to
-			// legacy path when reasoning is explicitly disabled.
-			foldCfg = &config.CodexContinueConfig{}
-		}
+		foldCfg := codexContinueConfigForBody(e.cfg, body, "http stream")
 		fx := &codexContinueFoldContext{
 			cfg:             foldCfg,
+			rootConfig:      e.cfg,
 			executor:        e,
-			reqCtx:          ctx,
 			auth:            auth,
 			req:             req,
-			opts:            opts,
-			baseModel:       baseModel,
 			from:            from,
 			to:              to,
 			originalPayload: originalPayload,
@@ -1170,10 +1158,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			apiKey:          apiKey,
 			identityState:   identityState,
 			httpClient:      httpClient,
-			streamChunkCh:   out,
 			responseFormat:  responseFormat,
 		}
-		fx.runFoldLoop(ctx, httpResp, identityState, out, reporter, replayScope)
+		fx.runFoldLoop(ctx, httpResp.Body, identityState, out, reporter, replayScope, nil)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
