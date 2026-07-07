@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -21,11 +23,27 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-var (
-	user    = ""
-	account = ""
-	session = ""
-)
+var fallbackUserIDCounter atomic.Uint64
+
+// convertClaudeUserID returns a deterministic-but-unique-per-request user
+// identifier for the Claude metadata.user_id field. Reusing the same IDs
+// across requests collapses distinct upstream users and breaks multi-tenant
+// accounting, so this is generated fresh every call.
+func convertClaudeUserID() string {
+	account, errAccount := uuid.NewRandom()
+	session, errSession := uuid.NewRandom()
+	if errAccount != nil || errSession != nil {
+		// Crypto/rand failure is rare but catastrophic for UUID uniqueness.
+		// Fall back to a time+counter-based identifier rather than reusing a
+		// zero UUID or panicking.
+		counter := fallbackUserIDCounter.Add(1)
+		fallback := fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), counter)
+		return fmt.Sprintf("user_%s_account_%s_session_fallback", fallback, fallback)
+	}
+	sum := sha256.Sum256([]byte(account.String() + session.String()))
+	user := hex.EncodeToString(sum[:])
+	return fmt.Sprintf("user_%s_account_%s_session_%s", user, account.String(), session.String())
+}
 
 // ConvertOpenAIRequestToClaude parses and transforms an OpenAI Chat Completions API request into Claude Code API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
@@ -47,19 +65,7 @@ var (
 func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream bool) []byte {
 	rawJSON := inputRawJSON
 
-	if account == "" {
-		u, _ := uuid.NewRandom()
-		account = u.String()
-	}
-	if session == "" {
-		u, _ := uuid.NewRandom()
-		session = u.String()
-	}
-	if user == "" {
-		sum := sha256.Sum256([]byte(account + session))
-		user = hex.EncodeToString(sum[:])
-	}
-	userID := fmt.Sprintf("user_%s_account_%s_session_%s", user, account, session)
+	userID := convertClaudeUserID()
 
 	// Base Claude Code API template with default max_tokens value
 	out := []byte(fmt.Sprintf(`{"model":"","max_tokens":32000,"messages":[],"metadata":{"user_id":"%s"}}`, userID))
@@ -137,7 +143,13 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		var b strings.Builder
 		// 24 chars random suffix for uniqueness
 		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+			n, errRand := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
+			if errRand != nil || n == nil {
+				// rand.Reader failure is extremely rare; fall back to a deterministic
+				// char so we do not panic on nil.Int64().
+				b.WriteByte('0')
+				continue
+			}
 			b.WriteByte(letters[n.Int64()])
 		}
 		return "toolu_" + b.String()
