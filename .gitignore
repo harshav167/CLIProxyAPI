@@ -65,5 +65,9 @@ _bmad-output/*
 # Local agent scratch / captured traffic (may contain secrets) — never commit
 raw-claude-opus-4.8-and-subagents.folder/
 .cursor/plans/
+.cursor/mcp.json
 .mcp.json
 skills-lock.json
+.codegraph/.gitignore
+.cursor/mcp.json
+server
