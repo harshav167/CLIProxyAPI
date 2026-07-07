@@ -87,13 +87,36 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 	typeResult := rootResult.Get("type")
 	dataType := typeResult.String()
 	if dataType == "response.created" {
-		(*param).(*ConvertCliToOpenAIParams).ResponseID = rootResult.Get("response.id").String()
-		(*param).(*ConvertCliToOpenAIParams).CreatedAt = rootResult.Get("response.created_at").Int()
-		(*param).(*ConvertCliToOpenAIParams).Model = rootResult.Get("response.model").String()
-		if (*param).(*ConvertCliToOpenAIParams).LastImageHashByItemID == nil {
-			(*param).(*ConvertCliToOpenAIParams).LastImageHashByItemID = make(map[string][32]byte)
+		p := (*param).(*ConvertCliToOpenAIParams)
+		p.ResponseID = rootResult.Get("response.id").String()
+		p.CreatedAt = rootResult.Get("response.created_at").Int()
+		p.Model = rootResult.Get("response.model").String()
+		if p.LastImageHashByItemID == nil {
+			p.LastImageHashByItemID = make(map[string][32]byte)
 		}
-		return [][]byte{}
+		// Emit a role:"assistant" opener chunk to establish the assistant turn.
+		// The reasoning/content deltas that follow ALSO carry role:"assistant"
+		// (see the reasoning_summary_text.delta and output_text.delta branches):
+		// verified on the wire (2026-07-07) that both working thinking providers
+		// tag every delta with role — GLM emits
+		// {"delta":{"role":"assistant","reasoning_content":"..."}} and Kimi emits
+		// {"delta":{"role":"assistant","reasoning":"..."}}. Cursor renders the
+		// thinking panel only when role is present on the reasoning delta itself;
+		// a standalone bare-role opener alone is NOT sufficient. This opener is
+		// kept for a clean turn boundary and is harmless (empty delta beyond role).
+		opener := []byte(`{"id":"","object":"chat.completion.chunk","created":12345,"model":"model","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}`)
+		if p.ResponseID != "" {
+			opener, _ = sjson.SetBytes(opener, "id", p.ResponseID)
+		}
+		if p.CreatedAt != 0 {
+			opener, _ = sjson.SetBytes(opener, "created", p.CreatedAt)
+		}
+		if p.Model != "" {
+			opener, _ = sjson.SetBytes(opener, "model", p.Model)
+		} else if modelName != "" {
+			opener, _ = sjson.SetBytes(opener, "model", modelName)
+		}
+		return [][]byte{opener}
 	}
 
 	// Extract and set the model version.
@@ -122,7 +145,11 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		if inputTokensResult := usageResult.Get("input_tokens"); inputTokensResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.prompt_tokens", inputTokensResult.Int())
 		}
-		if cachedTokensResult := usageResult.Get("input_tokens_details.cached_tokens"); cachedTokensResult.Exists() {
+		cachedTokensResult := usageResult.Get("input_tokens_details.cached_tokens")
+		if !cachedTokensResult.Exists() {
+			cachedTokensResult = usageResult.Get("cached_tokens")
+		}
+		if cachedTokensResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.prompt_tokens_details.cached_tokens", cachedTokensResult.Int())
 		}
 		if reasoningTokensResult := usageResult.Get("output_tokens_details.reasoning_tokens"); reasoningTokensResult.Exists() {
@@ -132,6 +159,14 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 	if dataType == "response.reasoning_summary_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
+			// Reasoning deltas carry role:"assistant" on EVERY delta. Verified
+			// on the wire (2026-07-07) against the GLM path that renders the
+			// Cursor thinking panel correctly: glm-5.2-max emits
+			// {"delta":{"role":"assistant","reasoning_content":"..."}} on every
+			// reasoning chunk. Cursor keys the thinking panel off role present on
+			// the reasoning delta itself — a standalone bare-role opener is NOT
+			// enough. Without role here, Cursor drops the reasoning entirely (no
+			// panel), which is exactly what codex gpt-5.5 exhibited.
 			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", deltaResult.String())
 		}
@@ -403,7 +438,11 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 		if inputTokensResult := usageResult.Get("input_tokens"); inputTokensResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.prompt_tokens", inputTokensResult.Int())
 		}
-		if cachedTokensResult := usageResult.Get("input_tokens_details.cached_tokens"); cachedTokensResult.Exists() {
+		cachedTokensResult := usageResult.Get("input_tokens_details.cached_tokens")
+		if !cachedTokensResult.Exists() {
+			cachedTokensResult = usageResult.Get("cached_tokens")
+		}
+		if cachedTokensResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.prompt_tokens_details.cached_tokens", cachedTokensResult.Int())
 		}
 		if reasoningTokensResult := usageResult.Get("output_tokens_details.reasoning_tokens"); reasoningTokensResult.Exists() {

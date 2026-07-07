@@ -7,15 +7,91 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// TestConvertCodexResponseToOpenAI_ReasoningDeltaHasRole locks in the fix for
+// the codex thinking-render regression. Cursor renders the thinking panel ONLY
+// when role:"assistant" is present on EVERY reasoning delta. Verified on the
+// wire (2026-07-07) against the two working thinking providers: GLM emits
+// {"delta":{"role":"assistant","reasoning_content":"..."}} and Kimi emits
+// {"delta":{"role":"assistant","reasoning":"..."}} — both tag role on every
+// reasoning chunk. Codex previously emitted role-less reasoning deltas (plus a
+// standalone bare-role opener), which Cursor dropped entirely (no panel).
+func TestConvertCodexResponseToOpenAI_ReasoningDeltaHasRole(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	modelName := "gpt-5.5"
+
+	feed := func(line string) [][]byte {
+		return ConvertCodexResponseToOpenAI(ctx, modelName, nil, nil, []byte(line), &param)
+	}
+
+	// response.created emits a role:"assistant" opener chunk to open the turn.
+	opener := feed(`data: {"type":"response.created","response":{"id":"r1","created_at":1,"model":"gpt-5.5"}}`)
+	if len(opener) != 1 {
+		t.Fatalf("response.created must emit exactly 1 opener chunk, got %d", len(opener))
+	}
+	if got := gjson.GetBytes(opener[0], "choices.0.delta.role").String(); got != "assistant" {
+		t.Fatalf("opener must carry delta.role=assistant, got %q (%s)", got, opener[0])
+	}
+	if gjson.GetBytes(opener[0], "choices.0.delta.content").Exists() {
+		t.Fatalf("opener must NOT carry content; got %s", opener[0])
+	}
+	if gjson.GetBytes(opener[0], "choices.0.delta.reasoning_content").Exists() {
+		t.Fatalf("opener must NOT carry reasoning_content; got %s", opener[0])
+	}
+
+	// Reasoning delta: must carry reasoning_content AND role:"assistant" —
+	// matching the GLM/Kimi wire shape that Cursor renders as the thinking panel.
+	out := feed(`data: {"type":"response.reasoning_summary_text.delta","delta":"**Thinking**"}`)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 chunk for reasoning delta, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.reasoning_content").String(); got != "**Thinking**" {
+		t.Fatalf("reasoning_content: want %q, got %q (%s)", "**Thinking**", got, out[0])
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.role").String(); got != "assistant" {
+		t.Fatalf("reasoning delta MUST carry role:assistant (Cursor thinking render requires it); got %q (%s)", got, out[0])
+	}
+
+	// Reasoning done: also carries role:"assistant".
+	outDone := feed(`data: {"type":"response.reasoning_summary_text.done"}`)
+	if len(outDone) != 1 {
+		t.Fatalf("expected 1 chunk for reasoning done, got %d", len(outDone))
+	}
+	if got := gjson.GetBytes(outDone[0], "choices.0.delta.role").String(); got != "assistant" {
+		t.Fatalf("reasoning done must carry role:assistant; got %q (%s)", got, outDone[0])
+	}
+
+	// Content delta (the visible answer): role IS expected here — this is the
+	// assistant's visible message, and Cursor keys the message on role.
+	outContent := feed(`data: {"type":"response.output_text.delta","delta":"Hello"}`)
+	if len(outContent) != 1 {
+		t.Fatalf("expected 1 chunk for content delta, got %d", len(outContent))
+	}
+	if got := gjson.GetBytes(outContent[0], "choices.0.delta.content").String(); got != "Hello" {
+		t.Fatalf("content: want %q, got %q (%s)", "Hello", got, outContent[0])
+	}
+	if got := gjson.GetBytes(outContent[0], "choices.0.delta.role").String(); got != "assistant" {
+		t.Fatalf("content delta should carry role:assistant; got %q (%s)", got, outContent[0])
+	}
+}
+
 func TestConvertCodexResponseToOpenAI_StreamSetsModelFromResponseCreated(t *testing.T) {
 	ctx := context.Background()
 	var param any
 
 	modelName := "gpt-5.3-codex"
 
+	// response.created now emits a bare-role opener chunk (establishes the
+	// assistant turn so role-less reasoning deltas render as thinking in Cursor).
 	out := ConvertCodexResponseToOpenAI(ctx, modelName, nil, nil, []byte(`data: {"type":"response.created","response":{"id":"resp_123","created_at":1700000000,"model":"gpt-5.3-codex"}}`), &param)
-	if len(out) != 0 {
-		t.Fatalf("expected no output for response.created, got %d chunks", len(out))
+	if len(out) != 1 {
+		t.Fatalf("expected 1 opener chunk for response.created, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "choices.0.delta.role").String(); got != "assistant" {
+		t.Fatalf("opener must carry delta.role=assistant, got %q (%s)", got, out[0])
+	}
+	if got := gjson.GetBytes(out[0], "model").String(); got != modelName {
+		t.Fatalf("opener model: want %q, got %q", modelName, got)
 	}
 
 	out = ConvertCodexResponseToOpenAI(ctx, modelName, nil, nil, []byte(`data: {"type":"response.output_text.delta","delta":"hello"}`), &param)
@@ -252,6 +328,19 @@ func TestConvertCodexResponseToOpenAI_StreamImageGenerationCallDoneEmitsDeltaIma
 	}
 }
 
+func TestConvertCodexResponseToOpenAI_StreamUsageTopLevelCachedTokens(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.5", nil, nil, []byte(`data: {"type":"response.completed","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.5","usage":{"input_tokens":10,"cached_tokens":4,"output_tokens":2,"total_tokens":12}}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 usage chunk, got %d", len(out))
+	}
+	if got := gjson.GetBytes(out[0], "usage.prompt_tokens_details.cached_tokens").Int(); got != 4 {
+		t.Fatalf("cached_tokens = %d, want 4; chunk=%s", got, out[0])
+	}
+}
+
 func TestConvertCodexResponseToOpenAI_NonStreamImageGenerationCallAddsMessageImages(t *testing.T) {
 	ctx := context.Background()
 
@@ -261,6 +350,17 @@ func TestConvertCodexResponseToOpenAI_NonStreamImageGenerationCallAddsMessageIma
 	gotURL := gjson.GetBytes(out, "choices.0.message.images.0.image_url.url").String()
 	if gotURL != "data:image/png;base64,aGVsbG8=" {
 		t.Fatalf("expected image url %q, got %q; chunk=%s", "data:image/png;base64,aGVsbG8=", gotURL, string(out))
+	}
+}
+
+func TestConvertCodexResponseToOpenAINonStream_UsageTopLevelCachedTokens(t *testing.T) {
+	ctx := context.Background()
+
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_123","created_at":1700000000,"model":"gpt-5.5","status":"completed","usage":{"input_tokens":10,"cached_tokens":4,"output_tokens":2,"total_tokens":12},"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.5", nil, nil, raw, nil)
+
+	if got := gjson.GetBytes(out, "usage.prompt_tokens_details.cached_tokens").Int(); got != 4 {
+		t.Fatalf("cached_tokens = %d, want 4; response=%s", got, out)
 	}
 }
 
