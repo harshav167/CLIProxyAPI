@@ -10,6 +10,16 @@
         "/Users/harsha/Documents/GitHub/claude-tools/ccs/cliproxy/CLIProxyAPI"
       ]
     },
+    "cliproxy-prod-arm": {
+      "type": "stdio",
+      "command": "ssh",
+      "args": [
+        "-i",
+        "~/.ssh/google_compute_engine",
+        "wade@34.87.210.219",
+        "/home/wade/.bun/bin/desktop-commander"
+      ]
+    },
     "signoz": {
       "url": "http://127.0.0.1:57000/mcp"
     }
