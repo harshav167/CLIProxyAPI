@@ -14,6 +14,7 @@ const (
 	xaiBuiltinVideoModelID          = "grok-imagine-video"
 	xaiBuiltinVideo15PreviewModelID = "grok-imagine-video-1.5-preview"
 	xaiBuiltinComposerModelID       = "grok-composer-2.5-fast"
+	xaiBuiltinGrok45ModelID         = "grok-4.5"
 )
 
 // staticModelsJSON mirrors the top-level structure of models.json.
@@ -120,10 +121,17 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
 // not depend on remote models.json updates. It also overrides grok-composer-2.5-fast
-// so its advertised context/output window stays correct even when the remote
-// models.json source reports stale values.
+// and grok-4.5 so advertised context/thinking metadata stay correct even when the
+// remote models.json source reports stale values.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiBuiltinComposerModelInfo())
+	return upsertModelInfos(models,
+		xaiBuiltinImageModelInfo(),
+		xaiBuiltinImageQualityModelInfo(),
+		xaiBuiltinVideoModelInfo(),
+		xaiBuiltinVideo15PreviewModelInfo(),
+		xaiBuiltinComposerModelInfo(),
+		xaiBuiltinGrok45ModelInfo(),
+	)
 }
 
 func normalizeAntigravityCapabilityModelID(modelID string) string {
@@ -229,6 +237,28 @@ func xaiBuiltinComposerModelInfo() *ModelInfo {
 		MaxCompletionTokens: 256000,
 		Thinking: &ThinkingSupport{
 			Levels: []string{"low", "medium", "high"},
+		},
+	}
+}
+
+// xaiBuiltinGrok45ModelInfo pins Grok 4.5 (announced 2026-07-08) so the
+// registry does not wait on the remote models.json feed. Reasoning cannot be
+// disabled; effort is low/medium/high (default high per xAI docs).
+func xaiBuiltinGrok45ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  xaiBuiltinGrok45ModelID,
+		Object:              "model",
+		Created:             1783468800, // 2026-07-08 announcement
+		OwnedBy:             "xai",
+		Type:                "xai",
+		DisplayName:         "Grok 4.5",
+		Name:                xaiBuiltinGrok45ModelID,
+		Description:         "xAI Grok 4.5 model for the Responses API. Reasoning cannot be disabled; effort defaults to high.",
+		ContextLength:       500000,
+		MaxCompletionTokens: 65536,
+		Thinking: &ThinkingSupport{
+			ZeroAllowed: false,
+			Levels:      []string{"low", "medium", "high"},
 		},
 	}
 }

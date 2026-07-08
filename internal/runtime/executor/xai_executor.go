@@ -829,10 +829,12 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	// Payload protocol is the provider identity ("xai"), not the translator
+	// wire format ("codex"). XAI reuses Codex-shaped Responses translation, but
+	// config overrides must target protocol: xai — not leak Codex coupling.
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, e.Identifier(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", stream)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
@@ -854,6 +856,18 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body = sanitizeXAIInputEncryptedContent(body)
 	body = normalizeCodexInstructions(body)
 	body = sanitizeXAIResponsesBody(body, baseModel)
+	// Preserve previous_response_id when the client supplies it. xAI Responses
+	// is stateful by default (docs: continue via response id / encrypted
+	// thinking). Deleting it forced full-history replay and broke the
+	// documented multi-turn contract. When previous_response_id is set, drop
+	// instructions AFTER normalizeCodexInstructions (which would otherwise
+	// re-insert instructions:"") — xAI rejects the pair together (same as WS).
+	// Always keep store:true so encrypted reasoning can be returned/reused
+	// (xAI docs: encrypted content is automatic unless store:false).
+	body, _ = sjson.SetBytes(body, "store", true)
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
+		body, _ = sjson.DeleteBytes(body, "instructions")
+	}
 
 	sessionID, errSession := xaiResolveComposerSessionID(ctx, req, opts, baseModel)
 	if errSession != nil {
@@ -1024,12 +1038,19 @@ func xaiMetadataString(meta map[string]any, key string) string {
 }
 
 func sanitizeXAIResponsesBody(body []byte, model string) []byte {
-	body = removeXAIEncryptedReasoningInclude(body)
+	// xAI docs: encrypted reasoning is returned only when
+	// include contains "reasoning.encrypted_content", and clients must send
+	// that blob back for multi-turn continuity. Never strip it.
+	body = ensureXAIEncryptedReasoningInclude(body)
 	if !xaiSupportsReasoningEffort(model) {
 		body, _ = sjson.DeleteBytes(body, "reasoning.effort")
 		if reasoning := gjson.GetBytes(body, "reasoning"); reasoning.Exists() && reasoning.IsObject() && len(reasoning.Map()) == 0 {
 			body, _ = sjson.DeleteBytes(body, "reasoning")
 		}
+	} else {
+		// grok-4.5 (and any always-on reasoning model) rejects effort "none".
+		// Coerce to "low" so Cursor/suffix "none" / "minimal" do not 400.
+		body = coerceXAIReasoningEffort(body, model)
 	}
 	// tool_choice-without-tools is handled upstream by normalizeXAIToolChoiceForTools
 	// (called in prepareResponsesRequest). The remaining normalisers here fix 4xx
@@ -1624,28 +1645,28 @@ func appendXAIReasoningSummary(previous json.RawMessage, current gjson.Result) (
 	return updated, true
 }
 
-func removeXAIEncryptedReasoningInclude(body []byte) []byte {
+// ensureXAIEncryptedReasoningInclude makes sure the Responses request asks xAI
+// for encrypted reasoning blobs. Cursor chat→Responses translation already sets
+// this; keep/restore it so multi-turn continuity and the local replay cache can
+// observe Grok-native encrypted_content (xAI docs require the include).
+func ensureXAIEncryptedReasoningInclude(body []byte) []byte {
+	const want = "reasoning.encrypted_content"
 	include := gjson.GetBytes(body, "include")
-	if !include.Exists() || !include.IsArray() {
+	if include.Exists() && include.IsArray() {
+		for _, item := range include.Array() {
+			if strings.TrimSpace(item.String()) == want {
+				return body
+			}
+		}
+		body, _ = sjson.SetBytes(body, "include.-1", want)
 		return body
 	}
-	kept := make([]string, 0, len(include.Array()))
-	for _, item := range include.Array() {
-		value := strings.TrimSpace(item.String())
-		if value == "" || value == "reasoning.encrypted_content" {
-			continue
-		}
-		kept = append(kept, value)
-	}
-	body, _ = sjson.SetBytes(body, "include", kept)
+	body, _ = sjson.SetBytes(body, "include", []string{want})
 	return body
 }
 
 func xaiSupportsReasoningEffort(model string) bool {
-	name := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	if idx := strings.LastIndex(name, "/"); idx >= 0 {
-		name = name[idx+1:]
-	}
+	name := xaiBaseModelName(model)
 	switch {
 	case strings.HasPrefix(name, "grok-3-mini"):
 		return true
@@ -1653,9 +1674,40 @@ func xaiSupportsReasoningEffort(model string) bool {
 		return true
 	case strings.HasPrefix(name, "grok-4.3"):
 		return true
+	case strings.HasPrefix(name, "grok-4.5"):
+		return true
 	default:
 		return false
 	}
+}
+
+func xaiBaseModelName(model string) string {
+	name := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return name
+}
+
+// xaiReasoningAlwaysOn reports models that accept reasoning.effort but reject
+// disabling it (xAI docs: grok-4.5 defaults to high; cannot be turned off).
+func xaiReasoningAlwaysOn(model string) bool {
+	return strings.HasPrefix(xaiBaseModelName(model), "grok-4.5")
+}
+
+func coerceXAIReasoningEffort(body []byte, model string) []byte {
+	if !xaiReasoningAlwaysOn(model) {
+		return body
+	}
+	effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String()))
+	switch effort {
+	case "none", "minimal", "off", "disabled":
+		// grok-4.5 cannot disable reasoning; map "off" intents to the lowest
+		// allowed effort. Missing effort is left unset so xAI's default (high)
+		// applies.
+		body, _ = sjson.SetBytes(body, "reasoning.effort", "low")
+	}
+	return body
 }
 
 func xaiNormalizeReasoningSummaryEventLine(line []byte, eventName string) []byte {

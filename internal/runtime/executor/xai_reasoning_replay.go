@@ -59,7 +59,16 @@ func xaiReasoningReplayScopeFromRequest(ctx context.Context, from sdktranslator.
 }
 
 func xaiReasoningReplayEnabledForSource(from sdktranslator.Format) bool {
-	return sourceFormatEqual(from, sdktranslator.FormatClaude)
+	// Claude Messages cannot carry Grok encrypted_content natively.
+	// Cursor chat-completions also cannot: the chat↔Responses translators map
+	// only reasoning_content summaries, so encrypted blobs are lost across
+	// turns unless we cache/inject them locally. OpenAI Responses clients that
+	// already round-trip encrypted_content still benefit when the field is
+	// missing; filterXAIReasoningReplayItemsForInput skips when input already
+	// has valid Grok ciphertext.
+	return sourceFormatEqual(from, sdktranslator.FormatClaude) ||
+		sourceFormatEqual(from, sdktranslator.FormatOpenAI) ||
+		sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse)
 }
 
 func xaiInputHasValidReasoningEncryptedContent(body []byte) bool {

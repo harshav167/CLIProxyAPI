@@ -27,18 +27,23 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - Cursor does **not** send Anthropic Messages format to the proxy on ingress, even when the user picked a native Claude/Fable model in Cursor. Cursor sends an **OpenAI chat-completions style** request body to cliproxy, and cliproxy's Claude path translates it later.
 - If you need the exact raw Cursor `system` prompt or native tool array, inspect the proxy's **request/response logs**, not ProxyMan captures from Claude Code:
   - local container: `docker/logs/cliproxy/`
-  - prod VM: `~/cliproxy/logs/`
+  - prod VM: `~/cliproxy/logs/` on the ARM Axion prod VM (see Production deploy target below)
 - For prompt-shape questions, `=== REQUEST BODY ===` is the raw Cursor payload and `=== API REQUEST ===` is what cliproxy finally sent upstream.
 
-## Production Observability — Use SigNoz First (MANDATORY)
+## Production Observability — SigNoz currently DISABLED (2026-07-06)
 
-The prod proxy ships full traces/metrics/logs to SigNoz at `kaecilius.ecorp.cc`. For ANY question about prod behaviour — errors, latency, throughput, which auth was selected, what upstream returned, why a request failed — query SigNoz first. The MCP server is `project-2-CLIProxyAPI-signoz` (tools: `signoz_search_logs`, `signoz_search_traces`, `signoz_aggregate_logs`, `signoz_aggregate_traces`, `signoz_get_trace_details`, `signoz_query_metrics`, `signoz_get_field_values`, `signoz_list_metrics`).
+**SigNoz observability is intentionally turned off for the time being while we decide what to do with it.** Until it's re-enabled:
 
-DO NOT default to `gcloud compute ssh` for log inspection. SSH is the fallback only when SigNoz is genuinely unreachable AND the user asked for SSH explicitly. If SigNoz returns a 502 / non-200, the FIRST action is to diagnose and fix the SigNoz pipeline — not to silently sidestep into SSH. Tell the user SigNoz is down, fix it, then resume the original investigation.
+- **Do NOT query the SigNoz MCP server** (`project-2-CLIProxyAPI-signoz`) for prod behaviour — it will return empty/stale data or fail. Treat any result it returns as unreliable.
+- **Do NOT assume the `cliproxy.instance = "clanker"` / `local-docker` series are live.** They are not being exported right now.
+- For prod-behaviour questions while SigNoz is down, fall back to the proxy's on-disk request/response logs on the prod VM (`~/cliproxy/logs/`) and `docker logs <cliproxy-service>`, accessed via the `cliproxy-prod-arm` MCP (see "Prod VM access" section below — no direct SSH).
+- The "Use SigNoz First (MANDATORY)" rule that used to live here is **suspended** for the duration of the outage. When SigNoz is re-enabled, restore that rule and delete this paragraph.
 
-### SigNoz infrastructure map (verified 2026-06-13)
+The full infrastructure map and the fix-first checklist below are kept as reference so the pipeline can be brought back without re-deriving it. **They are not currently operational.**
 
-This is the actual path a query takes. Memorise it; do not guess at it.
+### SigNoz infrastructure map (reference only — currently disabled; verified 2026-06-13)
+
+This is the path a query takes when SigNoz is running. Memorise it for when it comes back; do not guess at it.
 
 ```
 Cursor MCP / agent
@@ -72,20 +77,38 @@ host 192.168.1.202 on LAN ── runs the SigNoz docker-compose stack
 ClickHouse + query-service inside SigNoz stack
 ```
 
-The prod proxy on the GCP VM also runs its OWN otel-collector (via `docker/docker-compose.local.yml` style stack) and exports through this same tunnel. Sources of telemetry on SigNoz:
-- `service.namespace = "cliproxy"` / `cliproxy.instance = "clanker"` → GCP prod proxy
+When SigNoz is re-enabled, the prod proxy on the prod VM runs its OWN otel-collector (via `docker/docker-compose.local.yml` style stack) and exports through this same tunnel. Sources of telemetry on SigNoz:
+- `service.namespace = "cliproxy"` / `cliproxy.instance = "clanker"` → prod proxy on the ARM Axion VM (the instance label is unchanged from the old x86 VM; only the host moved)
 - `cliproxy.instance = "local-docker"` → developer Mac local container
 Both push through `https://kaecilius.ecorp.cc/v1/{traces,logs,metrics}`.
 
-### Known SigNoz failure modes + fix-first checklist
+### Known SigNoz failure modes + fix-first checklist (reference only — currently disabled)
 
 1. **cloudflared paper-tunnel is dead on the Mac.** Symptom: `curl https://kaecilius.ecorp.cc` returns 502 with a sub-second `time_total`. Fix: `launchctl kickstart -k gui/$(id -u)/cc.ecorp.cloudflared-paper`, wait 5s, retry. The plist owns the lifecycle; do NOT `kill`-and-restart by hand.
 2. **cloudflared config points at the wrong host IP.** Historic cause of outages: someone migrates SigNoz off the Mac to a LAN host and forgets to update `~/.cloudflared/config.yml`. Verify against the map above. Both `kaecilius.ecorp.cc` ingress rules must point at the host that actually runs SigNoz (currently `192.168.1.202`).
 3. **192.168.1.202 is up on LAN but SigNoz container is down.** Symptom: `curl http://192.168.1.202:57080` returns connection refused or 5xx, but ping works. Fix: `ssh root@192.168.1.202`, find the SigNoz `docker-compose` stack, `docker compose up -d`. The compose file location on .202 is not yet inventoried here — once located, write the absolute path into this section.
 4. **signoz-mcp-server container on the Mac is stale.** Symptom: SigNoz UI loads in browser but MCP tools return 502 / empty. Fix: `docker restart signoz-mcp-server`. The MCP container is a thin HTTP proxy that talks to `kaecilius.ecorp.cc` — if the tunnel is down, MCP returns the same upstream error.
-5. **GCP prod proxy stopped exporting.** Symptom: SigNoz UI works locally but the `cliproxy.instance = "clanker"` series stops. The prod proxy's compose stack on the GCP VM owns its own otel-collector. SSH into the prod VM (`gcloud compute ssh --zone "asia-southeast1-a" wade@production --project "mediprepai"`) and check `docker ps`. This is the ONE case where SSH is legitimate — not for reading logs but for fixing the collector that produces them.
+5. **Prod proxy stopped exporting.** Symptom: SigNoz UI works locally but the prod `cliproxy.instance` series stops. The prod proxy's compose stack on the prod VM owns its own otel-collector. Use the `cliproxy-prod-arm` MCP (`start_process` → `docker ps`) to inspect; do NOT direct-SSH (see "Prod VM access").
 
 If the user ever has to re-explain that SigNoz is the source of truth, that is a process failure. Update this section the moment any infrastructure detail changes.
+
+## Prod VM access — `cliproxy-prod-arm` MCP ONLY (2026-07-06)
+
+**The ONLY sanctioned way to inspect or manage the prod VM (`wade@proxy`, `australia-southeast1-c`, ARM Axion) is the `cliproxy-prod-arm` MCP server** (`project-0-CLIProxyAPI-cliproxy-prod-arm`, a Desktop-Commander-style server running ON the prod VM). Use its tools:
+
+- `list_directory` / `read_file` / `read_multiple_files` — inspect files (config, logs, auths).
+- `start_process` + `read_process_output` — run shell commands on prod (`docker ps`, `docker logs`, `grep`, `ls`, etc.). Always pass an explicit `timeout_ms`.
+- `start_search` — content/file search on prod without dumping raw output into context.
+- `get_file_info` — file metadata.
+
+**Rules:**
+- **Do NOT `gcloud compute ssh` to prod.** Direct SSH to `wade@proxy` is no longer the access path for agents. The only legitimate direct-SSH case was the old SigNoz-collector fix, which is moot while SigNoz is disabled.
+- **Do NOT run destructive commands on prod** (`docker compose down`, `rm`, volume removal, config overwrites) without explicit user approval. Read-only inspection (`docker ps`, `docker logs --tail`, `cat`/`grep` of config, reading log files) is fine.
+- The prod cliproxy service is `cli-proxy-api-test` (image `ghcr.io/harshav167/cliproxyapi:prod-arm64`), running from `/home/wade/cliproxy/compose.yaml`, container internal port 8317 exposed on host ports 80 and 8312, labeled `cliproxy.instance=clanker`, started with `--local-model`. A sibling `cpa-usage-keeper` container (port 8313) also runs. Deploy: `docker compose pull cli-proxy-api-test && docker compose up -d cli-proxy-api-test`.
+- On-disk request/response logs live at `/home/wade/cliproxy/logs/` on the VM; `=== REQUEST BODY ===` is the raw Cursor payload, `=== API REQUEST ===` is what cliproxy sent upstream. Use these for prompt-shape and cache questions.
+- Config: the hand-edited prod config is `/home/wade/cliproxy/config/config.yaml` — holds the `openai-compatibility` providers (z.ai GLM, Alibaba Token Plan, etc.), `overrides`, and `oauth-model-alias` mappings. Back up (`compose.yaml.bak-*` / `config.yaml.bak-*`) before any edit.
+
+When SigNoz is re-enabled, the "SigNoz first" rule returns and this MCP becomes the SSH-equivalent fallback for log/collector fixes. Until then, this MCP is the primary and only prod access path.
 
 ## Cursor rendering contract: `delta.reasoning_content` = visible thinking (verified 2026-06-27)
 
@@ -119,7 +142,7 @@ GLM effort aliases use `protocol: openai` payload overrides (matched on the clie
     params: { stream: true, thinking.type: enabled, reasoning_effort: high, clear_thinking: false, tool_stream: true }
 ```
 
-Per z.ai spec: `reasoning_effort` only takes effect when `thinking.type: enabled`; `low`/`medium`→`high`, `xhigh`→`max`, `none`/`minimal` skip thinking. `clear_thinking: false` preserves prior-turn `reasoning_content` across turns. `tool_stream: true` streams tool_call deltas (GLM-4.6+). Always back up the hand-edited prod config (`config.yaml.bak-*`) before editing; restart `cli-proxy-api-test` to load.
+Per z.ai spec: `reasoning_effort` only takes effect when `thinking.type: enabled`; `low`/`medium`→`high`, `xhigh`→`max`, `none`/`minimal` skip thinking. `clear_thinking: false` preserves prior-turn `reasoning_content` across turns. `tool_stream: true` streams tool_call deltas (GLM-4.6+). Always back up the hand-edited prod config (`config.yaml.bak-*`) before editing; restart the prod cliproxy service (service name on the ARM Axion host not yet confirmed — see Production deploy target) to load.
 
 ## Fork features to preserve across upstream merges
 
@@ -131,18 +154,23 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
 - `internal/runtime/executor/helps/cursor_system_prompt_test.go` / `claude_cursor_system_prompt_test.go` — assertions for the canonical layout. Update tests when prompt redline changes.
 
 ### xAI / Grok Composer fixes (NOT upstream)
-- `internal/runtime/executor/xai_executor.go::sanitizeXAIResponsesBody` runs three normalisers in order:
-  1. `rewriteOrphanXAICustomToolCalls` — fixes 422 "untagged enum ModelInput" when `apply_patch` (or any other custom tool) was stripped from `tools` but its `custom_tool_call` / `custom_tool_call_output` history items remain. Rewrites them to `function_call` / `function_call_output` with arguments wrapped as `{"input": "..."}` JSON-object strings.
-  2. `normalizeXAIFunctionCallArguments` — fixes 400 "expected JSON object for tool arguments" when prior turn's interrupted streaming left `function_call.arguments` as `""` or non-JSON. Coerces missing / empty / non-object args to `"{}"`.
-  3. `stampXAIInputMessageType` — adds `type: "message"` to bare role-bearing items that droid emits without a type (xAI's `ModelInput` enum rejects untyped variants; OpenAI tolerates them).
+- `internal/runtime/executor/xai_executor.go::sanitizeXAIResponsesBody` runs normalisers in order:
+  1. `ensureXAIEncryptedReasoningInclude` — **keeps/adds** `include: ["reasoning.encrypted_content"]` per xAI docs (encrypted reasoning is only returned when requested; clients must send it back for multi-turn). Do NOT strip this.
+  2. `rewriteOrphanXAICustomToolCalls` — fixes 422 "untagged enum ModelInput" when `apply_patch` (or any other custom tool) was stripped from `tools` but its `custom_tool_call` / `custom_tool_call_output` history items remain. Rewrites them to `function_call` / `function_call_output` with arguments wrapped as `{"input": "..."}` JSON-object strings.
+  3. `normalizeXAIFunctionCallArguments` — fixes 400 "expected JSON object for tool arguments" when prior turn's interrupted streaming left `function_call.arguments` as `""` or non-JSON. Coerces missing / empty / non-object args to `"{}"`.
+  4. `stampXAIInputMessageType` — adds `type: "message"` to bare role-bearing items that droid emits without a type (xAI's `ModelInput` enum rejects untyped variants; OpenAI tolerates them).
+- HTTP path preserves `previous_response_id` when present, forces `store: true`, and drops `instructions` when continuing (xAI rejects the pair). Do NOT delete `previous_response_id` — that broke the documented stateful Responses contract.
+- Payload overrides use `protocol: xai` (provider identity). Translation still reuses Codex-shaped Responses helpers internally; that must NOT leak into config as `protocol: codex`.
+- `internal/runtime/executor/xai_reasoning_replay.go` — local encrypted-reasoning replay for Claude **and** Cursor chat (`openai` / `openai-response`) because chat-completions cannot round-trip Grok `encrypted_content` blobs; injects cached items on the next turn keyed by `prompt_cache_key` / execution session.
+- Grok 4.5: builtin registry entry (500k context, effort low/medium/high, cannot disable); `coerceXAIReasoningEffort` maps `none`/`minimal`→`low`; oauth aliases `grok-4.5` / `grok-4.5-{low,medium,high}` / `grok-latest` + payload effort overrides.
 - `internal/runtime/executor/xai_executor.go::normalizeXAITool` — drops `apply_patch` from `tools` entirely (xAI refuses to register it). Pairs with the orphan rewrite above.
-- `internal/runtime/executor/xai_executor_test.go` — covers all three normalisers with the actual prod failure repros.
+- `internal/runtime/executor/xai_executor_test.go` — covers normalisers, include/store/previous_response_id, Grok 4.5 coercion, and Cursor-source replay enablement.
 
 ### Cursor Fable 5 alias (`f5-*` family, bypasses Cursor ZDR routing gate)
 - `internal/runtime/executor/helps/cursor_fable_alias.go` — `ApplyCursorFableAliasSnapshot` swaps `system` and `tools` transactionally when inbound model matches `f5-*`. Both `sjson` writes succeed-or-rollback; if either fails the original payload is returned and the failure is logged.
 - `internal/runtime/executor/helps/cursor_fable_snapshot/` — embedded Go asset (`//go:embed`) containing the captured Cursor → Anthropic Opus 4.7 thinking-max system blocks (identity swapped to "Claude Fable 5") + the 19 native Cursor tools (`Shell`, `Read`, `Grep`, `StrReplace`, `Task`, `TodoWrite`, …). DO NOT replace this with a live capture; the embedded version is the contract.
 - `internal/runtime/executor/claude_executor.go` — hook point: the line immediately after `thinking.ApplyThinking` and before `applyCloaking`. Calls `helps.ApplyCursorFableAliasSnapshot(body, req.Model)`. Hook MUST run before `applyCloaking` so the rest of the Cursor pipeline sees the swapped body.
-- `docker/config/cliproxy-config.yaml` — five `overrides:` (each `protocol: claude`) and five `oauth-model-alias: claude:` entries map `f5-low` / `f5-medium` / `f5-high` / `f5-xhigh` / `f5-max` to `claude-fable-5` with the matching effort level. Same config is mirrored on the prod VM at `/home/wade/cliproxy/config/config.yaml` (back up before editing — file is hand-edited in place).
+- `docker/config/cliproxy-config.yaml` — five `overrides:` (each `protocol: claude`) and five `oauth-model-alias: claude:` entries map `f5-low` / `f5-medium` / `f5-high` / `f5-xhigh` / `f5-max` to `claude-fable-5` with the matching effort level. Same config is mirrored on the prod VM (ARM Axion, `wade@proxy`) — back up before editing, file is hand-edited in place.
 - If a user asks whether `f5-*` is sending the "right" prompt/tools, verify in the request logs above. The expected behavior is: inbound model `f5-*` → snapshot injects Cursor-native Anthropic-model `system` + 19 native tools → normal Claude rewrite pipeline continues.
 
 ### Codex workspace / billing reality
@@ -173,12 +201,20 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
   5. Sorts `tools[]` by `function.name` for a byte-stable cacheable prefix (Cursor doesn't guarantee tool order across turns). Bails on non-function tools (web_search/retrieval) to avoid partial sort.
 - z.ai prompt cache is IMPLICIT (no `cache_control` markers, no `prompt_cache_key`). Hit reporting via `usage.prompt_tokens_details.cached_tokens` — already parsed by `helps.ParseOpenAIUsage`, flows to SigNoz unchanged. Verified in prod 2026-06-21: warm turn hit 64/96 prompt tokens.
 - `internal/runtime/executor/helps/glm_normalizer_test.go` — 13 tests incl. the `none`/`minimal` skip-thinking guard and idempotency.
-- Prod config (`/home/wade/cliproxy/config/config.yaml`, lines ~730) has the `glm` openai-compatibility provider: base-url `https://api.z.ai/api/coding/paas/v4` (GLM Coding Plan — do NOT downgrade to `/paas/v4`), models `GLM-5.2` / `glm-5.1` / `glm-5-turbo`.
+- Prod config is `/home/wade/cliproxy/config/config.yaml` on the ARM Axion prod VM (`wade@proxy`). Back up before editing; the file is hand-edited in place. Has the `glm` openai-compatibility provider: base-url `https://api.z.ai/api/coding/paas/v4` (GLM Coding Plan — do NOT downgrade to `/paas/v4`), models `GLM-5.2` / `glm-5.1` / `glm-5-turbo`.
+
+### Codex continue-thinking fold (NOT upstream)
+- `internal/runtime/executor/codex_continue_fold.go` — default-off multi-round fold for Codex reasoning models. Detects the OpenAI `518n-2` reasoning-truncation fingerprint and silently opens continuation rounds, folding N upstream responses into one downstream stream. Requires `codex_continue_thinking.enabled: true` and a reasoning model.
+- `internal/runtime/executor/helps/codex_continue_thinking.go` — pure helpers for truncation detection, continuation payload construction, and guard logic.
+- `internal/runtime/executor/codex_executor.go` — fold entry point gated by `codex_continue_thinking.enabled` and `reasoning` presence.
+
+### OpenAI-compatible stream normalizer (NOT upstream)
+- `internal/runtime/executor/helps/openai_compat_stream_normalizer.go::NormalizeOpenAICompatStreamLine` — provider-agnostic SSE line normalizer that fixes Cursor rendering for providers (e.g., Alibaba MaaS compatible-mode) which emit explicit empty-string `delta.content` / `delta.reasoning_content` on every chunk. Drops empty fields and restores `role:"assistant"` on content-bearing deltas. Applied on the openai-compat streaming path for all providers.
 
 ### Build / packaging
-- `Dockerfile` — `ENV TZ=Australia/Sydney`. Reverted upstream's `debian:bookworm + CGO_ENABLED=1` to `alpine + CGO_ENABLED=0` with `BUILDPLATFORM` / `TARGETARCH` for fast native cross-compilation. Trade-off: no runtime `.so` plugin loading; acceptable for our deployment.
-- Image tags on `ghcr.io/harshav167/cliproxyapi`: `:prod` is the rolling production tag (manually retagged after each deploy), `:f5-and-grok-fixes-<sha>`, `:upstream-sync-<sha>` and `:glm-cache-<sha>` are content-addressed pins. DO NOT push `:latest`. Current `:prod` digest as of 2026-07-03: `sha256:905499680e0b0103ad324b7c3ff2de09ae1db71273f234019f236df4594dc769` (tag `:upstream-sync-d6a3780d`, commit `d6a3780d` — http.Transport connection-pool caching + Kimi $ref inliner/reasoning fixes from `81c433ed`), deployed to the `cli-proxy-api-test` clanker container with `--local-model`. Prior: `sha256:caabeb57c6bd93ebb2b72f0169743c6459641caeb083d60702520654e736bb43` (tag `:glm-cache-70205e6b`, GLM normalizer + xAI content[] merge fix). Prior: `sha256:bdf02e241c362003ac54f0e91c70ea7139d8d75f008ad33b7623c8b93f9ca76d` from `2ee2bf64`.
-- Prod deploy target: the `cli-proxy-api-test` service in `/home/wade/cliproxy/compose.yaml` runs `ghcr.io/harshav167/cliproxyapi:prod` (`pull_policy: always`) on port 8312, labeled `cliproxy.instance=clanker`. The OTHER container `cli-proxy-api-plus` runs a DIFFERENT binary (`cliproxyplus:latest`, `./CLIProxyAPIPlus`) on 8317 — not built from this repo. Deploy: `docker compose pull cli-proxy-api-test && docker compose up -d cli-proxy-api-test`.
+- `Dockerfile` — `ENV TZ=Australia/Sydney`. **Production runtime is `gcr.io/distroless/base-debian12:nonroot`** (glibc + libssl + ca-certificates + tzdata baked in, NO shell / apt / curl / coreutils — minimal attack surface, runs as non-root uid 65532, ~25 MB base). Builder is still `golang:1.26-bookworm` + `CGO_ENABLED=1` + `zig cc` cross-compilation (unchanged). The real Go `plugin` loader is CGO-only (`runtime/plugin` fails to compile with `CGO_ENABLED=0`), and store-downloaded `.so` plugins need glibc at runtime (musl in alpine cannot load them); distroless base-debian12 ships glibc so the store's `.so` plugins load natively. **No `time/tzdata` import needed** — distroless base already ships `tzdata`, so `ENV TZ=Australia/Sydney` works with zero apt installs. Healthcheck: distroless has no curl/shell, so the in-container `curl /healthz` healthcheck is dropped; rely on the `cpa-usage-keeper` sidecar + compose restart policy + an external HTTP probe of `GET /healthz` (the endpoint exists at `internal/api/server.go:424`). `Dockerfile.debug` keeps the OLD `debian:bookworm-slim` + shell + curl runtime for debugging situations where you need `docker exec -it <ctr> sh` — build/tag it as `:prod-arm64-debug` only when needed; prod runs the distroless Dockerfile. **Prod is ARM** — build/verify with `CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="zig cc -target aarch64-linux-gnu" go build ./cmd/server` (the prior `GOARCH=amd64` verification line was for the decommissioned x86 prod). Image tag scheme: `:prod-arm64` (single-arch arm64, what prod pulls), `:prod-amd64` (single-arch amd64, for local intel Mac / CI testing), `:prod` (multi-arch manifest of both) — never push `:latest`. Verified 2026-07-06: distroless amd64 image builds clean via `wade-remote` buildx builder, binary execs directly (no shell), `/bin/sh` absent, image history shows only glibc+libssl+cacerts base layers + the 66.7 MB binary + 26.7 KB config.
+- Image tags on `ghcr.io/harshav167/cliproxyapi`: `:prod` is the rolling production tag (manually retagged after each deploy), `:f5-and-grok-fixes-<sha>`, `:upstream-sync-<sha>` and `:glm-cache-<sha>` are content-addressed pins. DO NOT push `:latest`. Prod is now **ARM** — the `:prod` tag must point at a `linux/arm64` image built for the Axion host. (Prior x86 prod digests — e.g. `sha256:905499680e0b0103ad324b7c3ff2de09ae1db71273f234019f236df4594dc769` from `:upstream-sync-d6a3780d` on 2026-07-03 — were `linux/amd64` and are NOT valid for the current prod host. Refresh this line with the current ARM `:prod` digest after the next deploy.)
+- Prod deploy target: **ARM Axion high-CPU/high-throughput GCP VM** `wade@proxy`, zone `australia-southeast1-c`, project `mediprepai`. Access ONLY via the `cliproxy-prod-arm` MCP — no direct SSH (see "Prod VM access"). The cliproxy service is `cli-proxy-api-test` in `/home/wade/cliproxy/compose.yaml`, running `ghcr.io/harshav167/cliproxyapi:prod-arm64` (host ports 80 + 8312 → container 8317), labeled `cliproxy.instance=clanker`, started with `--local-model`. Deploy: `docker compose pull cli-proxy-api-test && docker compose up -d cli-proxy-api-test`. The old x86 prod target (`wade@production` in `asia-southeast1-a`) is DECOMMISSIONED — do not deploy there.
 
 ### Docs / governance
 - `AGENTS.md` (this file) — fork-only. Upstream doesn't have it.
@@ -198,9 +234,9 @@ Full playbook (conflict table, CGO trap, deploy gate): **`.agents/skills/upstrea
 6. Commit with `chore: sync upstream/main (<N> commits incl. <themes>)`.
 7. Update `MIGRATION-LEDGER.md` with the sync date, commit count, and what each fork-only file required during merge (no change / re-applied / restructured).
 8. Fast-forward `main` only after tests pass. Push to `origin/main`.
-9. Build a new image tagged `:upstream-sync-<sha8>` and `:prod`. Rebuild local container on **8312** and get user sign-off in Cursor FIRST; do NOT pull on the prod VM until local smoke tests pass.
+9. Build a new image tagged `:upstream-sync-<sha8>` and `:prod` (must include `linux/arm64` — prod is the ARM Axion VM). Rebuild local container on **8312** and get user sign-off in Cursor FIRST; do NOT pull on the prod VM (`wade@proxy`, `australia-southeast1-c`) until local smoke tests pass.
 
-**CGO=0 Dockerfile trap:** upstream flips the Dockerfile to `bookworm + CGO_ENABLED=1` claiming the plugin host needs cgo. It does NOT for us — the cgo loader is build-tag gated (`internal/pluginhost/loader_unix.go` vs `loader_unsupported.go`). Keep our `alpine + CGO_ENABLED=0` cross-compile; verify with `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/server`. Accepting upstream's change silently regresses build speed ~15s → ~3min and gains nothing we use.
+**Dockerfile CGO choice:** this branch deliberately switched away from the old `alpine + CGO_ENABLED=0` fork build and now keeps upstream's `debian:bookworm + CGO_ENABLED=1` build with `zig cc`. The reason is plugin support: Go's real `plugin` package only compiles when `CGO_ENABLED=1`, and store-downloaded `.so` plugins require glibc at load time (musl-based alpine cannot host them). With CGO disabled, the management API cannot advertise plugin support and the plugin store would be dead code. The bookworm + CGO=1 build is therefore a functional requirement, not an upstream default we blindly accepted. If you ever re-evaluate the trade-off (faster alpine builds vs plugin support), update both `Dockerfile` and this section together.
 
 ## Architecture
 - `cmd/server/` — Server entrypoint
@@ -240,24 +276,25 @@ Full playbook (conflict table, CGO trap, deploy gate): **`.agents/skills/upstrea
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **CLIProxyAPI** (21912 symbols, 68823 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **CLIProxyAPI** (18607 symbols, 72829 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
 
 ## Never Do
 
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER edit a function, class, or method without first running `impact` on it.
 - NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
+- NEVER commit changes without running `detect_changes()` to check affected scope.
 
 ## Resources
 

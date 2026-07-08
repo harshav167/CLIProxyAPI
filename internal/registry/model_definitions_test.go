@@ -54,6 +54,44 @@ func TestWithXAIBuiltinsOverridesComposerWindow(t *testing.T) {
 	}
 }
 
+func TestWithXAIBuiltinsIncludesGrok45(t *testing.T) {
+	stale := []*ModelInfo{{
+		ID:                  xaiBuiltinGrok45ModelID,
+		Type:                "xai",
+		ContextLength:       128000,
+		MaxCompletionTokens: 32768,
+		Thinking: &ThinkingSupport{
+			ZeroAllowed: true,
+			Levels:      []string{"none", "low", "medium", "high"},
+		},
+	}}
+	models := WithXAIBuiltins(stale)
+
+	var grok45 *ModelInfo
+	count := 0
+	for _, model := range models {
+		if model != nil && model.ID == xaiBuiltinGrok45ModelID {
+			grok45 = model
+			count++
+		}
+	}
+	if grok45 == nil {
+		t.Fatalf("expected builtin %s in output", xaiBuiltinGrok45ModelID)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one %s entry, got %d", xaiBuiltinGrok45ModelID, count)
+	}
+	if grok45.ContextLength != 500000 {
+		t.Fatalf("context_length = %d, want 500000", grok45.ContextLength)
+	}
+	if grok45.Thinking == nil || grok45.Thinking.ZeroAllowed {
+		t.Fatalf("grok-4.5 must not allow zero/none effort, got %+v", grok45.Thinking)
+	}
+	if len(grok45.Thinking.Levels) != 3 {
+		t.Fatalf("grok-4.5 levels = %v, want low/medium/high", grok45.Thinking.Levels)
+	}
+}
+
 func TestAntigravityWebSearchModelForRequiresRequestedModelCapability(t *testing.T) {
 	registryRef := GetGlobalRegistry()
 	registryRef.RegisterClient("test-antigravity-websearch-route", "antigravity", []*ModelInfo{

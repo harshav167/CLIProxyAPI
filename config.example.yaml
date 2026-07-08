@@ -438,8 +438,14 @@ nonstream-keepalive-interval: 0
 #     - name: "kimi-k2.5"
 #       alias: "k2.5"
 #   xai:
-#     - name: "grok-4.3"
+#     - name: "grok-4.5"
 #       alias: "grok-latest"
+#     - name: "grok-4.5"
+#       alias: "grok-4.5-low"
+#     - name: "grok-4.5"
+#       alias: "grok-4.5-medium"
+#     - name: "grok-4.5"
+#       alias: "grok-4.5-high"
 #   sample-provider:                  # plugin provider keys are supported for OAuth plugins
 #     - name: "sample-model-latest"
 #       alias: "sample-latest"
@@ -494,6 +500,26 @@ nonstream-keepalive-interval: 0
 #           protocol: "codex"
 #       params:
 #         service_tier: priority
+#     # Grok 4.5 effort aliases: match protocol "xai" (provider identity).
+#     # XAI reuses Codex-shaped Responses translation internally, but payload
+#     # rules must NOT use protocol: codex.
+#     - models:
+#         - name: "grok-4.5-low"
+#           protocol: "xai"
+#       params:
+#         "reasoning.effort": "low"
+#     - models:
+#         - name: "grok-4.5-medium"
+#           protocol: "xai"
+#       params:
+#         "reasoning.effort": "medium"
+#     - models:
+#         - name: "grok-4.5-high"
+#           protocol: "xai"
+#         - name: "grok-latest"
+#           protocol: "xai"
+#       params:
+#         "reasoning.effort": "high"
 #     - models:
 #         - name: "gpt-*" # Supports wildcards (e.g., "gpt-*")
 #           protocol: "codex" # restricts the rule to a specific protocol, options: openai, gemini, claude, codex, antigravity
