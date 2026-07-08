@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -43,6 +44,14 @@ type ConvertCliToOpenAIParams struct {
 	// would reset the flag, then the FIRST call's .done would wrongly re-emit
 	// its full arguments after its deltas already streamed (duplicated args).
 	ArgsDeltaSeenByID map[string]bool
+	// ItemNameByID/Index let argument events identify special Cursor tools
+	// without parsing partial JSON argument deltas.
+	ItemNameByID    map[string]string
+	ItemNameByIndex map[int]string
+	// ArgsBufferByID/Index buffers only tool calls that must be sanitized as a
+	// whole JSON object before Cursor validates them.
+	ArgsBufferByID    map[string]string
+	ArgsBufferByIndex map[int]string
 }
 
 // ConvertCodexResponseToOpenAI translates a single chunk of a streaming response from the
@@ -71,6 +80,10 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			LastImageHashByItemID:     make(map[string][32]byte),
 			ItemIndexByID:             make(map[string]int),
 			ArgsDeltaSeenByID:         make(map[string]bool),
+			ItemNameByID:              make(map[string]string),
+			ItemNameByIndex:           make(map[int]string),
+			ArgsBufferByID:            make(map[string]string),
+			ArgsBufferByIndex:         make(map[int]string),
 		}
 	}
 
@@ -234,6 +247,11 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		// argument deltas/done events for the SAME item resolve to the right
 		// Chat Completions tool_calls index even if another tool call is
 		// announced in between (interleaved/parallel tool calls).
+		itemName := itemResult.Get("name").String()
+		if p.ItemNameByIndex == nil {
+			p.ItemNameByIndex = make(map[int]string)
+		}
+		p.ItemNameByIndex[p.FunctionCallIndex] = itemName
 		if itemID := itemResult.Get("id").String(); itemID != "" {
 			if p.ItemIndexByID == nil {
 				p.ItemIndexByID = make(map[string]int)
@@ -243,13 +261,17 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 				p.ArgsDeltaSeenByID = make(map[string]bool)
 			}
 			p.ArgsDeltaSeenByID[itemID] = false
+			if p.ItemNameByID == nil {
+				p.ItemNameByID = make(map[string]string)
+			}
+			p.ItemNameByID[itemID] = itemName
 		}
 
 		functionCallItemTemplate := []byte(`{"index":0,"id":"","type":"function","function":{"name":"","arguments":""}}`)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", p.FunctionCallIndex)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", itemResult.Get("call_id").String())
 
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", itemResult.Get("name").String())
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", itemName)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", "")
 
 		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
@@ -267,7 +289,12 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		}
 
 		deltaValue := rootResult.Get("delta").String()
-		toolCallIndex := resolveToolCallIndex(p, rootResult.Get("item_id").String())
+		itemID := rootResult.Get("item_id").String()
+		toolCallIndex := resolveToolCallIndex(p, itemID)
+		if isCursorSubagentToolCall(p, itemID, toolCallIndex) {
+			bufferCursorToolArgumentsDelta(p, itemID, toolCallIndex, deltaValue)
+			return [][]byte{}
+		}
 		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", toolCallIndex)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", deltaValue)
@@ -289,6 +316,25 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 				argsAlreadyStreamed = false
 			}
 		}
+		itemID := rootResult.Get("item_id").String()
+		toolCallIndex := resolveToolCallIndex(p, itemID)
+		if isCursorSubagentToolCall(p, itemID, toolCallIndex) {
+			fullArgs := popCursorToolArgumentsBuffer(p, itemID, toolCallIndex)
+			if fullArgs == "" {
+				fullArgs = rootResult.Get("arguments").String()
+			}
+			if fullArgs == "" {
+				fullArgs = rootResult.Get("input").String()
+			}
+			fullArgs = sanitizeCursorSubagentArguments(fullArgs)
+			functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
+			functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", toolCallIndex)
+			functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", fullArgs)
+
+			template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
+			template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
+			return [][]byte{template}
+		}
 		if argsAlreadyStreamed {
 			// Arguments were already streamed via delta events; nothing to emit.
 			return [][]byte{}
@@ -299,7 +345,6 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		if fullArgs == "" {
 			fullArgs = rootResult.Get("input").String()
 		}
-		toolCallIndex := resolveToolCallIndex(p, rootResult.Get("item_id").String())
 		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", toolCallIndex)
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", fullArgs)
@@ -372,6 +417,9 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		args := itemResult.Get("arguments").String()
 		if args == "" {
 			args = itemResult.Get("input").String()
+		}
+		if itemResult.Get("name").String() == "Subagent" {
+			args = sanitizeCursorSubagentArguments(args)
 		}
 		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", args)
 		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
@@ -505,6 +553,9 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 				if args == "" {
 					args = outputItem.Get("input").String()
 				}
+				if outputItem.Get("name").String() == "Subagent" {
+					args = sanitizeCursorSubagentArguments(args)
+				}
 				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", args)
 
 				toolCalls = append(toolCalls, functionCallTemplate)
@@ -586,6 +637,86 @@ func resolveToolCallIndex(p *ConvertCliToOpenAIParams, itemID string) int {
 		}
 	}
 	return p.FunctionCallIndex
+}
+
+func isCursorSubagentToolCall(p *ConvertCliToOpenAIParams, itemID string, toolCallIndex int) bool {
+	if p == nil {
+		return false
+	}
+	if itemID != "" && p.ItemNameByID != nil {
+		return p.ItemNameByID[itemID] == "Subagent"
+	}
+	if p.ItemNameByIndex != nil {
+		return p.ItemNameByIndex[toolCallIndex] == "Subagent"
+	}
+	return false
+}
+
+func bufferCursorToolArgumentsDelta(p *ConvertCliToOpenAIParams, itemID string, toolCallIndex int, delta string) {
+	if p == nil || delta == "" {
+		return
+	}
+	if itemID != "" {
+		if p.ArgsBufferByID == nil {
+			p.ArgsBufferByID = make(map[string]string)
+		}
+		p.ArgsBufferByID[itemID] += delta
+		return
+	}
+	if p.ArgsBufferByIndex == nil {
+		p.ArgsBufferByIndex = make(map[int]string)
+	}
+	p.ArgsBufferByIndex[toolCallIndex] += delta
+}
+
+func popCursorToolArgumentsBuffer(p *ConvertCliToOpenAIParams, itemID string, toolCallIndex int) string {
+	if p == nil {
+		return ""
+	}
+	if itemID != "" && p.ArgsBufferByID != nil {
+		args := p.ArgsBufferByID[itemID]
+		delete(p.ArgsBufferByID, itemID)
+		if args != "" {
+			return args
+		}
+	}
+	if p.ArgsBufferByIndex == nil {
+		return ""
+	}
+	args := p.ArgsBufferByIndex[toolCallIndex]
+	delete(p.ArgsBufferByIndex, toolCallIndex)
+	return args
+}
+
+func sanitizeCursorSubagentArguments(args string) string {
+	if strings.TrimSpace(args) == "" {
+		return args
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(args), &payload); err != nil {
+		return args
+	}
+
+	dropEmptyString(payload, "model")
+	dropEmptyString(payload, "resume")
+	dropEmptyString(payload, "environment")
+	dropEmptyString(payload, "cloud_base_branch")
+
+	if environment, ok := payload["environment"].(string); !ok || environment != "cloud" {
+		delete(payload, "cloud_base_branch")
+	}
+
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return args
+	}
+	return string(out)
+}
+
+func dropEmptyString(payload map[string]any, key string) {
+	if value, ok := payload[key].(string); ok && strings.TrimSpace(value) == "" {
+		delete(payload, key)
+	}
 }
 
 func mimeTypeFromCodexOutputFormat(outputFormat string) string {

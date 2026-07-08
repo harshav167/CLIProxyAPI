@@ -160,6 +160,122 @@ func TestConvertCodexResponseToOpenAI_ToolCallArgsDoneFallbackWhenNoDelta(t *tes
 	}
 }
 
+func TestConvertCodexResponseToOpenAI_SanitizesSubagentArgsDoneFallback(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	modelName := "gpt-5.5"
+
+	feed := func(line string) [][]byte {
+		return ConvertCodexResponseToOpenAI(ctx, modelName, nil, nil, []byte(line), &param)
+	}
+
+	feed(`data: {"type":"response.created","response":{"id":"r1","created_at":1,"model":"gpt-5.5"}}`)
+	feed(`data: {"type":"response.output_item.added","item":{"id":"item_subagent","type":"function_call","call_id":"call_subagent","name":"Subagent"}}`)
+
+	out := feed(`data: {"type":"response.function_call_arguments.done","item_id":"item_subagent","arguments":"{\"description\":\"Goal Review\",\"prompt\":\"review\",\"model\":\"\",\"resume\":\"\",\"readonly\":true,\"subagent_type\":\"sisyphus-junior\",\"file_attachments\":[],\"environment\":\"local\",\"cloud_base_branch\":\"\",\"interrupt\":false,\"run_in_background\":true}"}`)
+	if len(out) != 1 {
+		t.Fatalf("expected sanitized fallback args chunk, got %d", len(out))
+	}
+
+	args := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").String()
+	if !gjson.Valid(args) {
+		t.Fatalf("sanitized arguments are not valid JSON: %q", args)
+	}
+	if gjson.Get(args, "cloud_base_branch").Exists() {
+		t.Fatalf("expected cloud_base_branch to be removed, got %s", args)
+	}
+	if gjson.Get(args, "model").Exists() {
+		t.Fatalf("expected empty model to be removed, got %s", args)
+	}
+	if gjson.Get(args, "resume").Exists() {
+		t.Fatalf("expected empty resume to be removed, got %s", args)
+	}
+	if got := gjson.Get(args, "environment").String(); got != "local" {
+		t.Fatalf("environment = %q, want local; args=%s", got, args)
+	}
+	if got := gjson.Get(args, "readonly").Bool(); !got {
+		t.Fatalf("readonly was not preserved; args=%s", args)
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_BuffersAndSanitizesSubagentArgumentDeltas(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	modelName := "gpt-5.5"
+
+	feed := func(line string) [][]byte {
+		return ConvertCodexResponseToOpenAI(ctx, modelName, nil, nil, []byte(line), &param)
+	}
+
+	feed(`data: {"type":"response.created","response":{"id":"r1","created_at":1,"model":"gpt-5.5"}}`)
+	feed(`data: {"type":"response.output_item.added","item":{"id":"item_subagent","type":"function_call","call_id":"call_subagent","name":"Subagent"}}`)
+
+	out := feed(`data: {"type":"response.function_call_arguments.delta","item_id":"item_subagent","delta":"{\"description\":\"Goal Review\",\"prompt\":\"review\",\"environment\":\"local\","}`)
+	if len(out) != 0 {
+		t.Fatalf("Subagent argument deltas should be buffered for sanitization; got %d chunks: %s", len(out), out)
+	}
+	out = feed(`data: {"type":"response.function_call_arguments.delta","item_id":"item_subagent","delta":"\"cloud_base_branch\":\"\",\"model\":\"\",\"run_in_background\":true}"}`)
+	if len(out) != 0 {
+		t.Fatalf("Subagent argument deltas should remain buffered; got %d chunks: %s", len(out), out)
+	}
+
+	out = feed(`data: {"type":"response.function_call_arguments.done","item_id":"item_subagent","arguments":"{\"description\":\"Goal Review\",\"prompt\":\"review\",\"environment\":\"local\",\"cloud_base_branch\":\"\",\"model\":\"\",\"run_in_background\":true}"}`)
+	if len(out) != 1 {
+		t.Fatalf("expected sanitized buffered args chunk, got %d", len(out))
+	}
+	args := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").String()
+	if gjson.Get(args, "cloud_base_branch").Exists() {
+		t.Fatalf("expected cloud_base_branch to be removed, got %s", args)
+	}
+	if gjson.Get(args, "model").Exists() {
+		t.Fatalf("expected empty model to be removed, got %s", args)
+	}
+	if got := gjson.Get(args, "run_in_background").Bool(); !got {
+		t.Fatalf("run_in_background was not preserved; args=%s", args)
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_SanitizesSubagentOutputItemDoneFallback(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.5", nil, nil, []byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_subagent","name":"Subagent","arguments":"{\"description\":\"Goal Review\",\"prompt\":\"review\",\"environment\":\"local\",\"cloud_base_branch\":\"\",\"resume\":\"\"}"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected sanitized output_item.done chunk, got %d", len(out))
+	}
+	args := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").String()
+	if gjson.Get(args, "cloud_base_branch").Exists() {
+		t.Fatalf("expected cloud_base_branch to be removed, got %s", args)
+	}
+	if gjson.Get(args, "resume").Exists() {
+		t.Fatalf("expected empty resume to be removed, got %s", args)
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_SubagentCloudBaseBranchRequiresCloudEnvironment(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.5", nil, nil, []byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_subagent","name":"Subagent","arguments":"{\"description\":\"Goal Review\",\"prompt\":\"review\",\"cloud_base_branch\":\"main\"}"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected sanitized output_item.done chunk, got %d", len(out))
+	}
+	args := gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").String()
+	if gjson.Get(args, "cloud_base_branch").Exists() {
+		t.Fatalf("expected cloud_base_branch without cloud environment to be removed, got %s", args)
+	}
+
+	param = nil
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.5", nil, nil, []byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_subagent","name":"Subagent","arguments":"{\"description\":\"Goal Review\",\"prompt\":\"review\",\"environment\":\"cloud\",\"cloud_base_branch\":\"main\"}"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected cloud output_item.done chunk, got %d", len(out))
+	}
+	args = gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").String()
+	if got := gjson.Get(args, "cloud_base_branch").String(); got != "main" {
+		t.Fatalf("expected cloud_base_branch to be preserved for cloud environment, got %q; args=%s", got, args)
+	}
+}
+
 func TestConvertCodexResponseToOpenAI_FirstChunkUsesRequestModelName(t *testing.T) {
 	ctx := context.Background()
 	var param any
