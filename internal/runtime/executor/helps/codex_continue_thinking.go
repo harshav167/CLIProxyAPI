@@ -37,6 +37,13 @@ func NormalizeCodexContinueConfig(c *config.CodexContinueConfig) *config.CodexCo
 	if c.MarkerText == "" {
 		c.MarkerText = CodexContinueDefaultMarkerText
 	}
+	if c.OutputCommitPolicy == "" {
+		c.OutputCommitPolicy = "live_commit_barrier"
+	}
+	// 0 means "unset" → default 0.95. Negative disables the guard.
+	if c.ContextLimitGuardRatio == 0 {
+		c.ContextLimitGuardRatio = 0.95
+	}
 	return c
 }
 

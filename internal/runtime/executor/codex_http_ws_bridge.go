@@ -473,6 +473,13 @@ func (b *HTTPToWSBridge) CaptureResponse(sessionKey, responseID, model, authID s
 		return
 	}
 
+	chainResponseID := responseID
+	if foldedID := strings.TrimSpace(gjson.GetBytes(responsePayload, "response.metadata.proxy_upstream_previous_response_id").String()); foldedID != "" {
+		chainResponseID = foldedID
+	} else if foldedID := strings.TrimSpace(gjson.GetBytes(responsePayload, "metadata.proxy_upstream_previous_response_id").String()); foldedID != "" {
+		chainResponseID = foldedID
+	}
+
 	baselineItems := make([][]byte, 0)
 	input := gjson.GetBytes(requestPayload, "input")
 	if input.IsArray() {
@@ -494,14 +501,14 @@ func (b *HTTPToWSBridge) CaptureResponse(sessionKey, responseID, model, authID s
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.sessions[sessionKey] = &bridgeSession{
-		lastResponseID: responseID,
+		lastResponseID: chainResponseID,
 		requestShape:   requestShape,
 		baselineItems:  baselineItems,
 		model:          model,
 		authID:         authID,
 		updatedAt:      time.Now(),
 	}
-	respIDPreview := responseID
+	respIDPreview := chainResponseID
 	if len(respIDPreview) > 20 {
 		respIDPreview = respIDPreview[:20]
 	}

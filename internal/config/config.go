@@ -238,6 +238,11 @@ type CodexContinueConfig struct {
 	// truncated-round side effect. Set true for a paranoid posture that also
 	// buffers tool calls at the cost of serializing them behind round completion.
 	BufferToolCalls bool `yaml:"buffer-tool-calls" json:"buffer-tool-calls"`
+	// OutputCommitPolicy controls fold-active non-reasoning output semantics.
+	// Empty / "live_commit_barrier" preserves native Codex UX: executable tool
+	// calls stream live and become a continuation barrier if the round truncates.
+	// "on_clean_terminal" buffers executable tool calls until a clean terminal.
+	OutputCommitPolicy string `yaml:"output-commit-policy" json:"output-commit-policy"`
 	// RechunkFinalAnswer smooths the buffered message flush. On a clean terminal
 	// the fold flushes the whole buffered answer at once (a burst); with rechunk
 	// on, the answer's text is re-sliced into uniform RechunkSize-char deltas so
@@ -248,6 +253,12 @@ type CodexContinueConfig struct {
 	// RechunkSize is the per-delta character count when RechunkFinalAnswer is on.
 	// Falls back to a sane default when <= 0.
 	RechunkSize int `yaml:"rechunk-size" json:"rechunk-size"`
+	// ContextLimitGuardRatio stops continuation when a truncated round's
+	// input_tokens already sit at or above this fraction of the model context
+	// window. Continuation replays full input + encrypted reasoning and would
+	// otherwise tip a near-limit session into context_length_exceeded.
+	// Default 0.95; set < 0 to disable.
+	ContextLimitGuardRatio float64 `yaml:"context-limit-guard-ratio" json:"context-limit-guard-ratio"`
 }
 
 // RedisQueueConfig configures the optional external Redis/Valkey backend used

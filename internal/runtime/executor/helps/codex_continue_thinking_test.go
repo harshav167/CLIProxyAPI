@@ -203,6 +203,16 @@ func TestNormalizeCodexContinueConfigDefaults(t *testing.T) {
 	if got.MarkerText != CodexContinueDefaultMarkerText {
 		t.Errorf("marker default wrong: %+v", got)
 	}
+	if got.OutputCommitPolicy != "live_commit_barrier" {
+		t.Errorf("output commit policy default wrong: %+v", got)
+	}
+	if got.ContextLimitGuardRatio != 0.95 {
+		t.Errorf("context limit guard ratio default = %v, want 0.95", got.ContextLimitGuardRatio)
+	}
+	disabled := NormalizeCodexContinueConfig(&config.CodexContinueConfig{Enabled: true, ContextLimitGuardRatio: -1})
+	if disabled.ContextLimitGuardRatio != -1 {
+		t.Errorf("negative context limit guard ratio should stay disabled, got %v", disabled.ContextLimitGuardRatio)
+	}
 	// nil → disabled.
 	if NormalizeCodexContinueConfig(nil).Enabled {
 		t.Error("nil config normalized to enabled")

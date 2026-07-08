@@ -494,30 +494,6 @@ func shouldStripTrailingOpenAIResponsesModelPrefill(lastContent gjson.Result) bo
 	return true
 }
 
-func isTrailingOpenAIResponsesAssistantPrefill(items []gjson.Result, assistantIndex int) bool {
-	if assistantIndex < 0 || assistantIndex >= len(items) {
-		return false
-	}
-	for j := assistantIndex + 1; j < len(items); j++ {
-		itemType := items[j].Get("type").String()
-		itemRole := items[j].Get("role").String()
-		if itemType == "" && itemRole != "" {
-			itemType = "message"
-		}
-		switch itemType {
-		case "reasoning", "function_call", "function_call_output":
-			return false
-		case "message":
-			if strings.EqualFold(itemRole, "system") || strings.EqualFold(itemRole, "developer") {
-				continue
-			}
-			return false
-		}
-	}
-	_, ok := openAIResponsesAssistantVisibleText(items[assistantIndex])
-	return ok
-}
-
 func openAIResponsesAssistantVisibleText(item gjson.Result) (string, bool) {
 	itemType := item.Get("type").String()
 	itemRole := item.Get("role").String()

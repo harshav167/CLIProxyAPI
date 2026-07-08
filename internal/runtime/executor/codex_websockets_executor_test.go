@@ -580,11 +580,11 @@ func TestCodexAutoExecuteStreamDownstreamWebsocketContinueFoldOpensContinuation(
 	if !strings.Contains(joined, "final answer") {
 		t.Fatalf("final continuation answer missing downstream:\n%s", joined)
 	}
-	if strings.Contains(joined, "resp-1") {
-		t.Fatalf("first truncated terminal leaked downstream:\n%s", joined)
+	if strings.Contains(joined, `"response":{"id":"resp-1"`) {
+		t.Fatalf("first truncated lifecycle leaked downstream:\n%s", joined)
 	}
-	if !strings.Contains(joined, "resp-2") {
-		t.Fatalf("final terminal response missing downstream:\n%s", joined)
+	if !strings.Contains(joined, `proxy_upstream_previous_response_id":"resp-2"`) {
+		t.Fatalf("folded terminal missing final upstream id metadata:\n%s", joined)
 	}
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("upstream request count = %d, want 2", got)

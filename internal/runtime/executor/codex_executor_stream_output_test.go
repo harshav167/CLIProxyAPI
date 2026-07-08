@@ -3,9 +3,11 @@ package executor
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -254,5 +256,98 @@ func TestCodexExecutorExecuteStream_EmptyStreamCompletionOutputUsesOutputItemDon
 	gotContent := gjson.GetBytes(completed, "response.output.0.content.0.text").String()
 	if gotContent != "ok" {
 		t.Fatalf("response.output[0].content[0].text = %q, want %q; completed=%s", gotContent, "ok", string(completed))
+	}
+}
+
+func TestCodexExecutorExecuteStreamContinueFoldOpensHTTPContinuation(t *testing.T) {
+	capturedPayloads := make(chan []byte, 4)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("request path = %s, want /responses", r.URL.Path)
+			return
+		}
+		payload, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Errorf("read request body: %v", errRead)
+			return
+		}
+		capturedPayloads <- bytes.Clone(payload)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requests.Add(1) {
+		case 1:
+			events := append([]string{
+				foldCreated("resp-http-visible", 0),
+				foldReasoningDone(0, "rs-http-1", "enc-http-1", 2),
+			}, foldMessageEvents(1, "msg-http-discard", "http truncated", 3)...)
+			events = append(events, foldCompleted("resp-http-1", 10, 0, 516, 516, 9))
+			_, _ = w.Write([]byte(foldSSE(events...)))
+		case 2:
+			events := append([]string{foldCreated("resp-http-2", 0)}, foldMessageEvents(0, "msg-http-final", "http final", 1)...)
+			events = append(events, foldCompleted("resp-http-2", 3, 0, 6, 2, 9))
+			_, _ = w.Write([]byte(foldSSE(events...)))
+		default:
+			t.Errorf("unexpected request count")
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}}
+	cfg.CodexContinueThinking = &config.CodexContinueConfig{Enabled: true, MaxContinue: 1}
+	executor := NewCodexExecutor(cfg)
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(foldBaseBody(foldUserInput("one"))),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	payloads := drainStreamPayloads(t, result)
+
+	firstPayload := waitPayload(t, capturedPayloads)
+	secondPayload := waitPayload(t, capturedPayloads)
+	if got := gjson.GetBytes(firstPayload, "previous_response_id").String(); got != "" {
+		t.Fatalf("first upstream previous_response_id = %q, want empty; payload=%s", got, firstPayload)
+	}
+	input := gjson.GetBytes(secondPayload, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("continuation input length = %d, want original + reasoning + marker; payload=%s", len(input), secondPayload)
+	}
+	if got := gjson.GetBytes([]byte(input[1].Raw), "encrypted_content").String(); got != "enc-http-1" {
+		t.Fatalf("continuation did not replay encrypted reasoning, got %q; payload=%s", got, secondPayload)
+	}
+	if got := gjson.GetBytes([]byte(input[2].Raw), "phase").String(); got != "commentary" {
+		t.Fatalf("continuation marker phase = %q, want commentary; payload=%s", got, secondPayload)
+	}
+
+	joined := string(bytes.Join(payloads, []byte("\n")))
+	if strings.Contains(joined, "http truncated") {
+		t.Fatalf("truncated tentative answer leaked downstream:\n%s", joined)
+	}
+	if !strings.Contains(joined, "http final") {
+		t.Fatalf("final continuation answer missing downstream:\n%s", joined)
+	}
+	terminal := lastFoldPayloadOfType(t, payloads, "response.completed")
+	if got := gjson.GetBytes(terminal, "response.id").String(); got != "resp-http-visible" {
+		t.Fatalf("folded terminal response.id = %q, want visible first-round id; terminal=%s", got, terminal)
+	}
+	if got := gjson.GetBytes(terminal, "response.metadata.proxy_upstream_previous_response_id").String(); got != "resp-http-2" {
+		t.Fatalf("folded terminal upstream id = %q, want resp-http-2; terminal=%s", got, terminal)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("upstream request count = %d, want 2", got)
 	}
 }
