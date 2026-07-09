@@ -427,8 +427,7 @@ Upstream-intended deletions accepted (NOT fork features):
   `xai`); our XAIExecutor registration in `service.go` and the 20
   `xai_executor_test.go` unit tests are intact.
 
-Dockerfile: no conflict this round — alpine + CGO_ENABLED=0 cross-compile
-retained as-is (upstream did not touch it).
+Dockerfile: upstream switched to `debian:bookworm + CGO_ENABLED=1` with `zig cc` cross-compilation to support runtime `.so` plugin loading. Adopted upstream's build on this branch.
 
 Verification: `gofmt -w .` clean; `go build ./cmd/server` clean; `go test ./...`
 green (68 packages, 0 fail), including the two hand-merged packages
@@ -492,8 +491,7 @@ unchanged-or-expanded: `AGENTS.md`, `MIGRATION-LEDGER.md`,
 `internal/registry/model_definitions.go`. The `f5-*` Fable-5 hook point
 in `claude_executor.go` is preserved (the `prepared.*` flow survives).
 
-Dockerfile: no conflict this round — alpine + CGO_ENABLED=0
-cross-compile retained as-is (upstream did not touch it).
+Dockerfile: upstream switched to `debian:bookworm + CGO_ENABLED=1` with `zig cc`. Adopted on this branch for plugin support.
 
 Pre-existing flake noted (NOT introduced by this merge): on clean
 `main`, `TestAntigravityRefresh_DeduplicatesConcurrentRefresh` in
@@ -501,6 +499,16 @@ Pre-existing flake noted (NOT introduced by this merge): on clean
 returns). Reproduced on `main` HEAD `1adff3a3` before redoing the merge.
 Skipped via `-skip` for the green re-run; the rest of
 `internal/runtime/executor` passes in 2.5s.
+
+Post-sync fork-only commits added on this branch:
+- `cefdc6e5` — feat(codex): port CodexCont continue-thinking fold into the
+  codex executor (`internal/runtime/executor/codex_continue_fold.go` +
+  `internal/runtime/executor/helps/codex_continue_thinking.go`). Default-off,
+  gated by `codex_continue_thinking.enabled` + reasoning model.
+- `be27a21c` — feat(deploy): GLM thinking dialect guard + openai-compat stream
+  normalizer (`internal/runtime/executor/helps/openai_compat_stream_normalizer.go`)
+  + adopt upstream's `bookworm + CGO_ENABLED=1 + zig` Dockerfile for plugin
+  host support.
 
 Verification: `gofmt -w .` clean; `go build -o /tmp/cli-proxy-build
 ./cmd/server` clean; `go test -timeout 120s -skip
@@ -510,3 +518,27 @@ packages pass, 0 fail).
 Pending: commit, fast-forward `main`, push `origin/main`, build
 `:upstream-sync-<sha8>` + `:prod`, local 8312 smoke + user Cursor
 sign-off BEFORE prod pull.
+
+## Post-Sync Fork Commits
+
+Two fork-only commits were added on top of the upstream sync to land new
+features and fix review findings. They must be preserved in the next upstream
+merge.
+
+- `cefdc6e5` — feat(codex): port CodexCont continue-thinking fold into the
+codex executor. New files: `internal/runtime/executor/codex_continue_fold.go`,
+`internal/runtime/executor/helps/codex_continue_thinking.go`. Hook in
+`internal/runtime/executor/codex_executor.go`. Default-off; gated by
+`codex_continue_thinking.enabled` and a reasoning model.
+
+- `be27a21c` — feat(deploy): GLM thinking dialect guard + openai-compat stream
+normalizer + CGO=1 plugin host. New file:
+`internal/runtime/executor/helps/openai_compat_stream_normalizer.go`, called
+from `internal/runtime/executor/openai_compat_executor.go`. Dockerfile switched
+to `debian:bookworm + CGO_ENABLED=1 + zig cc` for plugin support. GLM
+normalizer updated with thinking guards.
+
+- (review fixes) Dead-code removal, identity-state per-round fix, response-body
+leak fix, per-request Claude user IDs, plugin-store safe HTTP client, bounded
+plugin-version concurrency, and doc updates were applied in follow-up edits on
+this branch.
