@@ -16,7 +16,7 @@ import (
 // Applier implements thinking.ProviderApplier for Codex models.
 //
 // Codex-specific behavior:
-//   - Output format: reasoning.effort (string: low/medium/high/xhigh)
+//   - Output format: reasoning.effort (string: low/medium/high/xhigh/max/ultra)
 //   - Level-only mode: no numeric budget support
 //   - Some models support ZeroAllowed (gpt-5.1, gpt-5.2)
 type Applier struct{}

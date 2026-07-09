@@ -55,8 +55,11 @@ const (
 	// LevelXHigh sets extra-high thinking effort
 	LevelXHigh ThinkingLevel = "xhigh"
 	// LevelMax sets maximum thinking effort.
-	// This is currently used by Claude 4.6 adaptive thinking (opus supports "max").
+	// Used by Claude adaptive thinking and GPT-5.6 Sol/Terra/Luna.
 	LevelMax ThinkingLevel = "max"
+	// LevelUltra sets maximum reasoning with automatic task delegation.
+	// GPT-5.6 Sol/Terra expose this via Codex /models supported_reasoning_levels.
+	LevelUltra ThinkingLevel = "ultra"
 )
 
 // ThinkingConfig represents a unified thinking configuration.
