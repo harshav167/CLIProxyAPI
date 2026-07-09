@@ -125,7 +125,7 @@ func MapToClaudeEffort(level string, supportsMax bool) (string, bool) {
 		return "low", true
 	case "low", "medium", "high":
 		return level, true
-	case "xhigh", "max":
+	case "xhigh", "max", "ultra":
 		if supportsMax {
 			return "max", true
 		}
