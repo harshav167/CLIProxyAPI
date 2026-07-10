@@ -10,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -116,6 +117,10 @@ func foldMessageEvents(index int, id string, text string, seq int) []string {
 func foldCompleted(id string, inputTokens, cachedTokens, outputTokens, reasoningTokens, seq int) string {
 	totalTokens := inputTokens + outputTokens
 	return `{"type":"response.completed","sequence_number":` + strconv.Itoa(seq) + `,"response":{"id":"` + id + `","status":"completed","output":[],"usage":{"input_tokens":` + strconv.Itoa(inputTokens) + `,"input_tokens_details":{"cached_tokens":` + strconv.Itoa(cachedTokens) + `},"output_tokens":` + strconv.Itoa(outputTokens) + `,"output_tokens_details":{"reasoning_tokens":` + strconv.Itoa(reasoningTokens) + `},"total_tokens":` + strconv.Itoa(totalTokens) + `}}}`
+}
+
+func foldDone(id string, inputTokens, cachedTokens, outputTokens, reasoningTokens, seq int) string {
+	return strings.Replace(foldCompleted(id, inputTokens, cachedTokens, outputTokens, reasoningTokens, seq), "response.completed", "response.done", 1)
 }
 
 func foldPayloadsOfType(t *testing.T, lines [][]byte, eventType string) [][]byte {
@@ -364,6 +369,103 @@ func TestCodexContinueFoldOnCleanTerminalBuffersToolCallAndContinues(t *testing.
 	}
 }
 
+func TestCodexContinueFoldTreatsResponseDoneAsSuccessfulTerminal(t *testing.T) {
+	baseBody := foldBaseBody(foldUserInput("start"))
+	round := foldSSE(
+		foldCreated("resp-1", 0),
+		foldDone("resp-1", 10, 0, 4, 0, 1),
+	)
+	continuations := 0
+	fx := &codexContinueFoldContext{
+		cfg:             &config.CodexContinueConfig{Enabled: true, MaxContinue: 1},
+		rootConfig:      &config.Config{},
+		baseBody:        []byte(baseBody),
+		from:            sdktranslator.FormatOpenAI,
+		to:              sdktranslator.FormatCodex,
+		responseFormat:  sdktranslator.FormatOpenAI,
+		req:             cliproxyexecutor.Request{Model: "gpt-5-codex"},
+		originalPayload: []byte(`{"model":"gpt-5-codex","messages":[{"role":"user","content":"start"}]}`),
+		appendResponse:  func(context.Context, []byte) {},
+	}
+	fx.openContinuation = func(context.Context, []byte) (*codexContinueRound, error) {
+		continuations++
+		return nil, nil
+	}
+	out := make(chan cliproxyexecutor.StreamChunk, 16)
+	fx.runFoldLoop(context.Background(), respBody(round), codexIdentityConfuseState{}, out, nil, codexReasoningReplayScope{}, nil)
+	close(out)
+	var payloads [][]byte
+	for chunk := range out {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		payloads = append(payloads, chunk.Payload)
+	}
+	joined := bytes.Join(payloads, []byte("\n"))
+	if continuations != 0 {
+		t.Fatalf("continuation requests = %d, want none", continuations)
+	}
+	if got := bytes.Count(joined, []byte(`"object":"chat.completion.chunk"`)); got == 0 {
+		t.Fatalf("completed chat lifecycle missing: %s", joined)
+	}
+	if !bytes.Contains(joined, []byte(`"finish_reason":"stop"`)) {
+		t.Fatalf("finish_reason stop missing: %s", joined)
+	}
+	if bytes.Contains(joined, []byte("response.done")) {
+		t.Fatalf("raw response.done leaked: %s", joined)
+	}
+}
+
+func TestCodexContinueFoldTreatsResponseErrorAsTerminal(t *testing.T) {
+	baseBody := foldBaseBody(foldUserInput("start"))
+	round := foldSSE(
+		foldCreated("resp-1", 0),
+		`{"type":"response.error","sequence_number":1,"response":{"id":"resp-1","status":"failed","error":{"code":"server_error","message":"upstream failed"}}}`,
+	)
+
+	run := runCodexFoldTest(t, nil, baseBody, round)
+	if len(run.continuation) != 0 {
+		t.Fatalf("continuation requests = %d, want none", len(run.continuation))
+	}
+	if got := len(foldPayloadsOfType(t, run.forwarded, "response.error")); got != 1 {
+		t.Fatalf("response.error events = %d, want one", got)
+	}
+	if got := len(foldPayloadsOfType(t, run.forwarded, "response.incomplete")); got != 0 {
+		t.Fatalf("synthetic response.incomplete events = %d, want none", got)
+	}
+}
+
+func TestCodexContinueFoldFailureDoesNotContinueOrDoubleForward(t *testing.T) {
+	tests := []struct {
+		name     string
+		terminal string
+	}{
+		{name: "response failed", terminal: `{"type":"response.failed","response":{"id":"resp-1","status":"failed","error":{"code":"server_error","message":"upstream failed"},"usage":{"input_tokens":10,"output_tokens":516,"output_tokens_details":{"reasoning_tokens":516}}}}`},
+		{name: "response error", terminal: `{"type":"response.error","response":{"id":"resp-1","status":"failed","error":{"code":"server_error","message":"upstream failed"},"usage":{"input_tokens":10,"output_tokens":516,"output_tokens_details":{"reasoning_tokens":516}}}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run := runCodexFoldTestAllowErrors(t, nil, foldBaseBody(foldUserInput("start")), foldSSE(
+				foldCreated("resp-1", 0),
+				foldReasoningDone(0, "rs-1", "enc-1", 2),
+				tt.terminal,
+			))
+			if len(run.continuation) != 0 {
+				t.Fatalf("continuation requests = %d, want none", len(run.continuation))
+			}
+			failureCount := len(run.errs)
+			for _, line := range run.forwarded {
+				if event := gjson.GetBytes(codexDataPayload(line), "type").String(); event == "response.failed" || event == "response.error" {
+					failureCount++
+				}
+			}
+			if failureCount != 1 {
+				t.Fatalf("downstream failures = %d, want exactly one; forwarded=%s errors=%v", failureCount, bytes.Join(run.forwarded, []byte("\n")), run.errs)
+			}
+		})
+	}
+}
+
 func TestCodexContinueFoldSurfacesContinuationContextLengthErrorAndFlushesBufferedOutput(t *testing.T) {
 	baseBody := foldBaseBody(foldUserInput("start"))
 	round1 := foldSSE(
@@ -381,9 +483,6 @@ func TestCodexContinueFoldSurfacesContinuationContextLengthErrorAndFlushesBuffer
 	}
 	if strings.Contains(joined, "upstream_eof") {
 		t.Fatalf("terminal error was misreported as upstream_eof:\n%s", joined)
-	}
-	if !strings.Contains(joined, "context_length_exceeded") {
-		t.Fatalf("upstream context-length error payload was not forwarded:\n%s", joined)
 	}
 	if len(run.errs) != 1 {
 		t.Fatalf("stream errors = %d, want one surfaced upstream error; errs=%v", len(run.errs), run.errs)

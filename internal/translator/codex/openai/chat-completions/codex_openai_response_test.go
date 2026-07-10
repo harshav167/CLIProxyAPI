@@ -515,3 +515,32 @@ func TestConvertCodexResponseToOpenAI_NonStreamMultiMessageEmptyTrailingKeepsCon
 		t.Fatalf("expected content %q, got %q; resp=%s", "the real answer", got.String(), string(out))
 	}
 }
+
+func TestConvertCodexResponseToOpenAINonStreamIncomplete(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{name: "max output tokens maps to length", reason: "max_output_tokens", want: "length"},
+		{name: "content filter is preserved", reason: "content_filter", want: "content_filter"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Given
+			raw := []byte(`{"type":"response.incomplete","response":{"id":"resp_123","model":"gpt-5.5","status":"incomplete","incomplete_details":{"reason":"` + tt.reason + `"},"output":[]}}`)
+
+			// When
+			got := ConvertCodexResponseToOpenAINonStream(context.Background(), "gpt-5.5", nil, nil, raw, nil)
+
+			// Then
+			if finishReason := gjson.GetBytes(got, "choices.0.finish_reason").String(); finishReason != tt.want {
+				t.Fatalf("finish_reason = %q, want %q; response=%s", finishReason, tt.want, got)
+			}
+			if nativeFinishReason := gjson.GetBytes(got, "choices.0.native_finish_reason").String(); nativeFinishReason != tt.want {
+				t.Fatalf("native_finish_reason = %q, want %q; response=%s", nativeFinishReason, tt.want, got)
+			}
+		})
+	}
+}

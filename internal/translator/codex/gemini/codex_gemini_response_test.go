@@ -149,3 +149,30 @@ func TestConvertCodexResponseToGeminiNonStreamPreservesFunctionCallID(t *testing
 		t.Fatalf("expected functionCall.id %q, got %q; chunk=%s", "call_gateway", got, string(out))
 	}
 }
+
+func TestConvertCodexResponseToGeminiNonStreamIncomplete(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{name: "max output tokens maps to max tokens", reason: "max_output_tokens", want: "MAX_TOKENS"},
+		{name: "content filter maps to safety", reason: "content_filter", want: "SAFETY"},
+		{name: "unknown reason maps to other", reason: "unexpected", want: "OTHER"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Given
+			raw := []byte(`{"type":"response.incomplete","response":{"id":"resp_123","status":"incomplete","incomplete_details":{"reason":"` + tt.reason + `"},"output":[]}}`)
+
+			// When
+			got := ConvertCodexResponseToGeminiNonStream(context.Background(), "gemini-2.5-pro", []byte(`{"tools":[]}`), nil, raw, nil)
+
+			// Then
+			if finishReason := gjson.GetBytes(got, "candidates.0.finishReason").String(); finishReason != tt.want {
+				t.Fatalf("finishReason = %q, want %q; response=%s", finishReason, tt.want, got)
+			}
+		})
+	}
+}

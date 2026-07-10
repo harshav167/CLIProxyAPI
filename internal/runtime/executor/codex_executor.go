@@ -56,7 +56,7 @@ func collectCodexOutputItemDone(eventData []byte, outputItemsByIndex map[int64][
 	*outputItemsFallback = append(*outputItemsFallback, []byte(itemResult.Raw))
 }
 
-func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+func patchCodexTerminalOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
 	outputResult := gjson.GetBytes(eventData, "response.output")
 	shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
 	if !shouldPatchOutput {
@@ -857,9 +857,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			continue
 		}
 
-		eventData := bytes.TrimSpace(line[5:])
+		eventData := normalizeCodexCompletionEvent(bytes.TrimSpace(line[5:]))
 		eventType := gjson.GetBytes(eventData, "type").String()
 
+		event := helps.ClassifyCodexResponsesEvent(eventData)
 		if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 				return resp, errClearReplay
@@ -867,57 +868,42 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			err = streamErr
 			return resp, err
 		}
+		if event.Failure {
+			terminalBody := synthesizeChatCompletionsErrorChunk(eventData)
+			err = newCodexStatusErr(http.StatusBadGateway, terminalBody)
+			return resp, err
+		}
 
 		if eventType == "response.output_item.done" {
-			itemResult := gjson.GetBytes(eventData, "item")
-			if !itemResult.Exists() || itemResult.Type != gjson.JSON {
-				continue
-			}
-			outputIndexResult := gjson.GetBytes(eventData, "output_index")
-			if outputIndexResult.Exists() {
-				outputItemsByIndex[outputIndexResult.Int()] = []byte(itemResult.Raw)
-			} else {
-				outputItemsFallback = append(outputItemsFallback, []byte(itemResult.Raw))
-			}
+			collectCodexOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 			continue
 		}
 
-		if eventType != "response.completed" {
+		if !event.Success && !event.Incomplete {
 			continue
 		}
 
-		if detail, ok := helps.ParseCodexUsage(eventData); ok {
+		terminalData := patchCodexTerminalOutput(eventData, outputItemsByIndex, outputItemsFallback)
+		if event.Success {
+			cacheCodexReasoningReplayFromCompleted(replayScope, terminalData)
+		}
+		if errValidate := validateCodexIncompleteResponseFormat(responseFormat, terminalData); errValidate != nil {
+			return resp, errValidate
+		}
+		if detail, ok := helps.ParseCodexUsage(terminalData); ok {
 			reporter.Publish(ctx, detail)
 		}
-		publishCodexImageToolUsage(ctx, reporter, body, eventData)
+		publishCodexImageToolUsage(ctx, reporter, body, terminalData)
 
-		completedData := eventData
-		outputResult := gjson.GetBytes(completedData, "response.output")
-		shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
-		if shouldPatchOutput {
-			completedDataPatched := completedData
-			completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output", []byte(`[]`))
-
-			indexes := make([]int64, 0, len(outputItemsByIndex))
-			for idx := range outputItemsByIndex {
-				indexes = append(indexes, idx)
+		clientTerminalData := applyCodexIdentityExposeResponsePayload(terminalData, identityState)
+		out := clientTerminalData
+		if responseFormat != sdktranslator.FormatCodex {
+			var param any
+			out = sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientTerminalData, &param)
+			if len(out) == 0 {
+				return resp, codexTerminalTranslationError(eventType, responseFormat)
 			}
-			sort.Slice(indexes, func(i, j int) bool {
-				return indexes[i] < indexes[j]
-			})
-			for _, idx := range indexes {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", outputItemsByIndex[idx])
-			}
-			for _, item := range outputItemsFallback {
-				completedDataPatched, _ = sjson.SetRawBytes(completedDataPatched, "response.output.-1", item)
-			}
-			completedData = completedDataPatched
 		}
-		cacheCodexReasoningReplayFromCompleted(replayScope, completedData)
-
-		var param any
-		clientCompletedData := applyCodexIdentityExposeResponsePayload(completedData, identityState)
-		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, clientCompletedData, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -1721,8 +1707,10 @@ func isGPTModelName(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-")
 }
 
-var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)
-var imageGenToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
+var (
+	imageGenToolJSON      = []byte(`{"type":"image_generation","output_format":"png"}`)
+	imageGenToolArrayJSON = []byte(`[{"type":"image_generation","output_format":"png"}]`)
+)
 
 func isCodexFreePlanAuth(auth *cliproxyauth.Auth) bool {
 	if auth == nil || auth.Attributes == nil {

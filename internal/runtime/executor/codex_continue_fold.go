@@ -132,6 +132,23 @@ func (fx *codexContinueFoldContext) runFoldLoop(
 		var translatorParam any
 		forwardEvent = func(line []byte, state codexIdentityConfuseState) {
 			line = applyCodexIdentityExposeResponsePayload(line, state)
+			payload := codexDataPayload(line)
+			if payload != nil && fx.from.String() == "openai" {
+				if incompleteChunk, ok := translateCodexIncompleteToChatChunk(payload); ok {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: incompleteChunk}:
+					case <-ctx.Done():
+					}
+					return
+				}
+				if needsRawFallback(gjson.GetBytes(payload, "type").String()) {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: synthesizeChatCompletionsErrorChunk(payload)}:
+					case <-ctx.Done():
+					}
+					return
+				}
+			}
 			chunks := sdktranslator.TranslateStream(ctx, fx.to, fx.responseFormat, fx.req.Model,
 				fx.originalPayload, fx.baseBody, line, &translatorParam)
 			for i := range chunks {
@@ -197,13 +214,20 @@ func (fx *codexContinueFoldContext) runFoldLoop(
 		totalOutputTokens += tokens
 		state.addRound(roundNo, roundOut, tokens)
 
-		// Upstream terminal stream errors (context_length_exceeded, usage limit,
-		// invalid signature) must stop the fold — never treat them as a
-		// zero-reasoning stall that opens another continuation.
-		if roundOut.terminalErr != nil {
+		terminalOutcome := helps.ClassifyCodexResponsesEvent(terminalPayload)
+		if terminalOutcome.Failure || roundOut.terminalErr != nil {
+			fx.flushBufferedRound(ctx, state, roundOut, identityState, forwardEvent)
+			if roundOut.terminalErr != nil {
+				fx.forwardFoldError(ctx, out, reporter, roundOut.terminalErr)
+			} else {
+				forwardEvent(roundOut.terminalEvent, identityState)
+			}
+			closeContinuationRound(round)
+			return
+		}
+		if terminalOutcome.Incomplete {
 			fx.flushBufferedRound(ctx, state, roundOut, identityState, forwardEvent)
 			forwardEvent(roundOut.terminalEvent, identityState)
-			fx.forwardFoldError(ctx, out, reporter, roundOut.terminalErr)
 			closeContinuationRound(round)
 			return
 		}
@@ -256,7 +280,7 @@ func (fx *codexContinueFoldContext) runFoldLoop(
 			terminal := fx.buildFoldedTerminal(state, roundOut, stoppedReason)
 			forwardEvent(terminal, identityState)
 			// Cache reasoning replay from the completed event (same as legacy).
-			if roundOut.terminalType == "response.completed" {
+			if helps.ClassifyCodexResponsesEvent(codexSSEDataPayload(terminal)).Success {
 				cacheCodexReasoningReplayFromCompleted(replayScope, codexSSEDataPayload(terminal))
 			}
 			if reporter != nil {

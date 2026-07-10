@@ -16,9 +16,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-var (
-	dataTag = []byte("data:")
-)
+var dataTag = []byte("data:")
 
 // ConvertCodexResponseToGeminiParams holds parameters for response conversion.
 type ConvertCodexResponseToGeminiParams struct {
@@ -243,13 +241,23 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	rootResult := gjson.ParseBytes(rawJSON)
 
-	// Verify this is a response.completed event
-	if rootResult.Get("type").String() != "response.completed" {
+	eventType := rootResult.Get("type").String()
+	if eventType != "response.completed" && eventType != "response.incomplete" {
 		return []byte{}
 	}
 
 	// Base Gemini response template for non-streaming
 	template := []byte(`{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"trafficType":"PROVISIONED_THROUGHPUT"},"modelVersion":"","createTime":"","responseId":""}`)
+	if eventType == "response.incomplete" {
+		finishReason := "OTHER"
+		switch rootResult.Get("response.incomplete_details.reason").String() {
+		case "max_output_tokens":
+			finishReason = "MAX_TOKENS"
+		case "content_filter":
+			finishReason = "SAFETY"
+		}
+		template, _ = sjson.SetBytes(template, "candidates.0.finishReason", finishReason)
+	}
 
 	// Set model version
 	template, _ = sjson.SetBytes(template, "modelVersion", modelName)
@@ -373,11 +381,13 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 			flushPendingFunctionCalls()
 		}
 
-		// Set finish reason based on whether there were tool calls
-		if hasToolCall {
-			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
-		} else {
-			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
+		// Preserve the completed response's existing finish reason behavior.
+		if eventType == "response.completed" {
+			if hasToolCall {
+				template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
+			} else {
+				template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
+			}
 		}
 	}
 	return template

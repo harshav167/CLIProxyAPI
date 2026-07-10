@@ -832,9 +832,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		if optional {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
 				// Missing and optional: return empty config (cloud deploy standby).
-				cfg := &Config{}
+				cfg := newConfigWithDefaults()
 				cfg.NormalizePluginsConfig()
-				return cfg, nil
+				return &cfg, nil
 			}
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
@@ -842,42 +842,19 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(data) == 0 {
-		cfg := &Config{}
+		cfg := newConfigWithDefaults()
 		cfg.NormalizePluginsConfig()
-		return cfg, nil
+		return &cfg, nil
 	}
 
 	// Unmarshal the YAML data into the Config struct.
-	var cfg Config
-	// Set defaults before unmarshal so that absent keys keep defaults.
-	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
-	cfg.LoggingToFile = false
-	cfg.LogsMaxTotalSizeMB = 0
-	cfg.ErrorLogsMaxFiles = 10
-	cfg.UsageStatisticsEnabled = false
-	cfg.RedisUsageQueueRetentionSeconds = 60
-	cfg.Observability.ServiceName = "cliproxy"
-	cfg.Observability.Environment = "local"
-	cfg.Observability.OTLP.Endpoint = "http://localhost:57018"
-	cfg.Observability.OTLP.Protocol = "http/protobuf"
-	cfg.Observability.OTLP.Insecure = true
-	cfg.Observability.OTLP.Traces = true
-	cfg.Observability.OTLP.Metrics = true
-	cfg.Observability.OTLP.Logs = true
-	cfg.Observability.OTLP.SampleRatio = 1.0
-	cfg.DisableCooling = false
-	cfg.SaveCooldownStatus = false
-	cfg.TransientErrorCooldownSeconds = 0
-	cfg.DisableImageGeneration = DisableImageGenerationOff
-	cfg.Pprof.Enable = false
-	cfg.Pprof.Addr = DefaultPprofAddr
-	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg := newConfigWithDefaults()
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
-			cfgOptional := &Config{}
+			cfgOptional := newConfigWithDefaults()
 			cfgOptional.NormalizePluginsConfig()
-			return cfgOptional, nil
+			return &cfgOptional, nil
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
@@ -1623,6 +1600,19 @@ func appendPath(path []string, key string) []string {
 // represents a known default value that should not be written to the config file.
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
+	if len(path) == 1 && path[0] == "codex-response-chaining" && node != nil && node.Kind == yaml.MappingNode {
+		if enabledIndex := findMapKeyIndex(node, "enabled"); enabledIndex >= 0 && enabledIndex+1 < len(node.Content) {
+			enabledNode := node.Content[enabledIndex+1]
+			if enabledNode != nil && enabledNode.Kind == yaml.ScalarNode && enabledNode.Tag == "!!bool" && enabledNode.Value == "false" {
+				return false
+			}
+		}
+	}
+	if len(path) == 2 && path[0] == "codex-response-chaining" && path[1] == "enabled" &&
+		node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		return node.Value == "true"
+	}
+
 	// First check if it's a zero value
 	if isZeroValueNode(node) {
 		return true

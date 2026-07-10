@@ -16,34 +16,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("config payload is empty")
 	}
 
-	var cfg Config
-	// Keep defaults aligned with LoadConfigOptional.
-	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
-	cfg.LoggingToFile = false
-	cfg.LogsMaxTotalSizeMB = 0
-	cfg.ErrorLogsMaxFiles = 10
-	cfg.UsageStatisticsEnabled = false
-	cfg.RedisUsageQueueRetentionSeconds = 60
-	// Mirror LoadConfigOptional's observability defaults so a home/SDK parsed
-	// config that sets observability.enabled also registers exporters (otherwise
-	// Traces/Metrics/Logs default to false and Start publishes an active state
-	// that exports nothing).
-	cfg.Observability.ServiceName = "cliproxy"
-	cfg.Observability.Environment = "local"
-	cfg.Observability.OTLP.Endpoint = "http://localhost:57018"
-	cfg.Observability.OTLP.Protocol = "http/protobuf"
-	cfg.Observability.OTLP.Insecure = true
-	cfg.Observability.OTLP.Traces = true
-	cfg.Observability.OTLP.Metrics = true
-	cfg.Observability.OTLP.Logs = true
-	cfg.Observability.OTLP.SampleRatio = 1.0
-	cfg.DisableCooling = false
-	cfg.SaveCooldownStatus = false
-	cfg.TransientErrorCooldownSeconds = 0
-	cfg.DisableImageGeneration = DisableImageGenerationOff
-	cfg.Pprof.Enable = false
-	cfg.Pprof.Addr = DefaultPprofAddr
-	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg := newConfigWithDefaults()
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config payload: %w", err)

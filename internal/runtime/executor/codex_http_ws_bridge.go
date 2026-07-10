@@ -2,12 +2,14 @@ package executor
 
 import (
 	"bytes"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -44,15 +46,60 @@ func normalizeSynthIDs(data []byte) []byte {
 // the client's chunk parser.
 //
 // The only events the translator has no rule for AND which clients need to
-// observe are terminal-failure events: response.failed and response.error.
-// Without forwarding those, the client sees buffered=0 and emits
-// empty_stream 500.
+// observe are terminal failures. Without forwarding those, the client sees
+// buffered=0 and emits empty_stream 500.
 func needsRawFallback(eventType string) bool {
 	switch eventType {
-	case "response.failed", "response.error":
+	case "response.failed", "response.error", "error":
 		return true
 	default:
 		return false
+	}
+}
+
+func translateCodexIncompleteToChatChunk(payload []byte) ([]byte, bool) {
+	eventType := gjson.GetBytes(payload, "type").String()
+	if eventType != "response.incomplete" {
+		return nil, false
+	}
+	finishReason, ok := codexIncompleteFinishReason(payload)
+	if !ok {
+		return synthesizeChatCompletionsErrorChunk(payload), true
+	}
+	out := []byte(`{"id":"","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"","native_finish_reason":""}]}`)
+	if id := gjson.GetBytes(payload, "response.id").String(); id != "" {
+		out, _ = sjson.SetBytes(out, "id", id)
+	}
+	out, _ = sjson.SetBytes(out, "choices.0.finish_reason", finishReason)
+	out, _ = sjson.SetBytes(out, "choices.0.native_finish_reason", finishReason)
+	return out, true
+}
+
+func codexIncompleteFinishReason(payload []byte) (string, bool) {
+	switch gjson.GetBytes(payload, "response.incomplete_details.reason").String() {
+	case "max_output_tokens":
+		return "length", true
+	case "content_filter":
+		return "content_filter", true
+	default:
+		return "", false
+	}
+}
+
+func validateCodexIncompleteResponseFormat(responseFormat sdktranslator.Format, payload []byte) error {
+	if gjson.GetBytes(payload, "type").String() != "response.incomplete" || responseFormat != sdktranslator.FormatOpenAI {
+		return nil
+	}
+	if _, ok := codexIncompleteFinishReason(payload); ok {
+		return nil
+	}
+	return codexTerminalTranslationError("response.incomplete", responseFormat)
+}
+
+func codexTerminalTranslationError(eventType string, responseFormat sdktranslator.Format) statusErr {
+	return statusErr{
+		code: 502,
+		msg:  fmt.Sprintf("codex terminal event %s could not be translated to %s", eventType, responseFormat.String()),
 	}
 }
 
@@ -80,6 +127,9 @@ func synthesizeChatCompletionsErrorChunk(payload []byte) []byte {
 	msg := gjson.GetBytes(payload, "response.error.message").String()
 	if msg == "" {
 		msg = gjson.GetBytes(payload, "error.message").String()
+	}
+	if msg == "" {
+		msg = gjson.GetBytes(payload, "response.incomplete_details.reason").String()
 	}
 	if code == "" {
 		code = gjson.GetBytes(payload, "error.code").String()

@@ -319,59 +319,33 @@ func mapLen(m map[string]time.Time) int {
 	return len(m)
 }
 
-// TestBridgeSessionKeyRejectsSyntheticPrefix is the regression test for the
-// High-severity collision fix: bridgeSessionKey() must NOT use synthetic
-// "cli-proxy-" keys for stateful WS-bridge routing. Synthetic keys are
-// content-derived (sha256 of model + first user message) and would collide
-// across distinct chats with the same opening prompt — using them as bridge
-// session IDs would route chat B's request to chat A's previous_response_id
-// chain upstream → cross-conversation context leakage.
-//
-// The synthetic key still flows upstream as prompt_cache_key in the request
-// body (the inject helper's actual purpose — server-side prompt cache
-// benefit, where same content sharing a cache is the desired behavior).
-func TestBridgeSessionKeyRejectsSyntheticPrefix(t *testing.T) {
+func TestBridgeSessionKeyRequiresDerivedExecutionSession(t *testing.T) {
 	cases := []struct {
 		name    string
 		payload string
-		want    string // expected return; "" means "bridge skipped"
 	}{
 		{
-			name:    "synthetic cli-proxy- key → rejected (bridge skipped)",
+			name:    "synthetic key",
 			payload: `{"prompt_cache_key":"cli-proxy-c5e144e6850fb66b513b002f552aa985"}`,
-			want:    "",
 		},
 		{
-			name:    "real Cursor UUID-style key → accepted (bridge routes)",
+			name:    "raw client key",
 			payload: `{"prompt_cache_key":"d3498f66-5fae-5e1e-9b81-81de4bb1441a"}`,
-			want:    "d3498f66-5fae-5e1e-9b81-81de4bb1441a",
 		},
 		{
-			name:    "Droid-style session key → accepted (bridge routes)",
+			name:    "droid-style key",
 			payload: `{"prompt_cache_key":"droid-session-abc-123"}`,
-			want:    "droid-session-abc-123",
 		},
 		{
-			name:    "no prompt_cache_key at all → empty (bridge skipped, expected)",
+			name:    "no key",
 			payload: `{"model":"gpt-5.5"}`,
-			want:    "",
-		},
-		{
-			name:    "empty string prompt_cache_key → empty (bridge skipped)",
-			payload: `{"prompt_cache_key":""}`,
-			want:    "",
-		},
-		{
-			name:    "key starting with literal 'cli-proxy' but no dash → accepted (only the exact prefix triggers rejection)",
-			payload: `{"prompt_cache_key":"cli-proxy"}`,
-			want:    "cli-proxy",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := bridgeSessionKey(cliproxyexecutor.Options{}, []byte(tc.payload))
-			if got != tc.want {
-				t.Errorf("bridgeSessionKey(%s) = %q, want %q", tc.payload, got, tc.want)
+			if got != "" {
+				t.Errorf("bridgeSessionKey(%s) = %q, want empty without derived execution session", tc.payload, got)
 			}
 		})
 	}
@@ -496,48 +470,46 @@ func TestCursorKeepaliveIntervalDefault(t *testing.T) {
 // when its stop channel closes — covers the "first content event arrived"
 // case where the read loop signals "no more keepalives needed".
 func TestRunCursorKeepaliveStopsOnSignal(t *testing.T) {
-	emitted := 0
-	send := func(c cliproxyexecutor.StreamChunk) bool {
-		emitted++
-		return true
-	}
+	out := make(chan cliproxyexecutor.StreamChunk)
 	stop := make(chan struct{})
 	done := make(chan struct{})
 
-	go func() {
-		runCursorKeepalive(context.Background(), send, [][]byte{[]byte(`{"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{}}]}`)}, 50*time.Millisecond, stop, "test-session")
-		close(done)
-	}()
+	go runCursorKeepalive(context.Background(), out, [][]byte{[]byte(`{"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{}}]}`)}, 50*time.Millisecond, stop, done, "test-session")
 
-	// Let it tick a few times, then stop.
-	time.Sleep(180 * time.Millisecond) // ~3 ticks
+	emitted := 0
+	for emitted < 3 {
+		select {
+		case <-out:
+			emitted++
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("timed out waiting for keepalive emissions")
+		}
+	}
 	close(stop)
 
 	select {
 	case <-done:
-		// Goroutine returned cleanly.
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("runCursorKeepalive did not exit within 500ms of stop signal")
-	}
-	if emitted < 2 || emitted > 5 {
-		t.Errorf("emitted %d keepalives in ~180ms with 50ms interval; expected 2-5", emitted)
 	}
 }
 
 // TestRunCursorKeepaliveStopsOnContextDone verifies the goroutine exits
 // when the request context is canceled (e.g. client disconnect).
 func TestRunCursorKeepaliveStopsOnContextDone(t *testing.T) {
-	send := func(c cliproxyexecutor.StreamChunk) bool { return true }
 	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan cliproxyexecutor.StreamChunk)
 	stop := make(chan struct{})
 	defer close(stop)
 	done := make(chan struct{})
 
-	go func() {
-		runCursorKeepalive(ctx, send, [][]byte{[]byte(`{}`)}, 50*time.Millisecond, stop, "test-session")
-		close(done)
-	}()
-	time.Sleep(80 * time.Millisecond)
+	go runCursorKeepalive(ctx, out, [][]byte{[]byte(`{}`)}, 50*time.Millisecond, stop, done, "test-session")
+
+	select {
+	case <-out:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for keepalive emission")
+	}
 	cancel()
 
 	select {
@@ -552,31 +524,22 @@ func TestRunCursorKeepaliveStopsOnContextDone(t *testing.T) {
 // emit, so emitting raw Codex payload would risk breaking chat.completion.chunk
 // parsers (the High reviewer fix).
 func TestRunCursorKeepaliveSkipsWhenNoChunks(t *testing.T) {
-	called := false
-	send := func(c cliproxyexecutor.StreamChunk) bool {
-		called = true
-		return true
-	}
+	out := make(chan cliproxyexecutor.StreamChunk, 1)
 	stop := make(chan struct{})
 	defer close(stop)
 	done := make(chan struct{})
 
-	go func() {
-		runCursorKeepalive(context.Background(), send, nil, 30*time.Millisecond, stop, "test-session")
-		close(done)
-	}()
-
-	// Wait long enough that any keepalive ticks would have fired.
-	time.Sleep(100 * time.Millisecond)
+	go runCursorKeepalive(context.Background(), out, nil, 30*time.Millisecond, stop, done, "test-session")
 
 	select {
 	case <-done:
-		// Goroutine returned promptly without emitting.
-	default:
+	case <-time.After(500 * time.Millisecond):
 		t.Fatal("runCursorKeepalive should return immediately when cachedChunks is nil/empty")
 	}
-	if called {
+	select {
+	case <-out:
 		t.Fatal("runCursorKeepalive must not call send when cachedChunks is empty (would risk emitting wrong shape)")
+	default:
 	}
 }
 
@@ -584,11 +547,7 @@ func TestRunCursorKeepaliveSkipsWhenNoChunks(t *testing.T) {
 // re-emission. If the translator returned 3 chunks for response.in_progress,
 // each tick should re-emit all 3 (preserving the original event boundaries).
 func TestRunCursorKeepaliveEmitsAllChunksPerTick(t *testing.T) {
-	emitted := 0
-	send := func(c cliproxyexecutor.StreamChunk) bool {
-		emitted++
-		return true
-	}
+	out := make(chan cliproxyexecutor.StreamChunk)
 	stop := make(chan struct{})
 	done := make(chan struct{})
 
@@ -597,13 +556,17 @@ func TestRunCursorKeepaliveEmitsAllChunksPerTick(t *testing.T) {
 		[]byte(`{"chunk":2}`),
 		[]byte(`{"chunk":3}`),
 	}
-	go func() {
-		runCursorKeepalive(context.Background(), send, chunks, 50*time.Millisecond, stop, "test-session")
-		close(done)
-	}()
+	go runCursorKeepalive(context.Background(), out, chunks, 50*time.Millisecond, stop, done, "test-session")
 
-	// Let ~3 ticks fire.
-	time.Sleep(180 * time.Millisecond)
+	emitted := 0
+	for emitted < 9 {
+		select {
+		case <-out:
+			emitted++
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("timed out waiting for keepalive chunks")
+		}
+	}
 	close(stop)
 
 	select {
@@ -612,33 +575,55 @@ func TestRunCursorKeepaliveEmitsAllChunksPerTick(t *testing.T) {
 		t.Fatal("runCursorKeepalive did not exit within 500ms of stop")
 	}
 
-	// Per tick we send 3 chunks. ~3 ticks → ~9 emissions. Allow loose bounds for scheduler jitter.
-	if emitted < 6 || emitted > 12 {
-		t.Errorf("emitted %d chunks in ~180ms with 50ms ticker × 3 chunks/tick; expected 6-12", emitted)
-	}
-	// Must always emit in multiples of 3 (whole-tick boundary on stop).
 	if emitted%3 != 0 {
 		t.Errorf("emitted %d chunks; expected multiple of 3 (chunks-per-tick)", emitted)
 	}
 }
 
-// TestRunCursorKeepaliveStopsOnSendFailure verifies the goroutine exits
-// when send() returns false (client closed the stream out from under us).
-func TestRunCursorKeepaliveStopsOnSendFailure(t *testing.T) {
-	send := func(c cliproxyexecutor.StreamChunk) bool { return false } // simulate disconnect
+func TestRunCursorKeepaliveStopsOnOutputContextDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan cliproxyexecutor.StreamChunk)
 	stop := make(chan struct{})
 	defer close(stop)
 	done := make(chan struct{})
 
-	go func() {
-		runCursorKeepalive(context.Background(), send, [][]byte{[]byte(`{}`)}, 30*time.Millisecond, stop, "test-session")
-		close(done)
-	}()
+	go runCursorKeepalive(ctx, out, [][]byte{[]byte(`{}`)}, time.Millisecond, stop, done, "test-session")
+	cancel()
 
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("runCursorKeepalive did not exit within 500ms after send failure")
+		t.Fatal("runCursorKeepalive did not exit within 500ms after context cancellation")
+	}
+}
+
+func TestRunCursorKeepaliveStopsWhenOutputIsBlocked(t *testing.T) {
+	out := make(chan cliproxyexecutor.StreamChunk)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go runCursorKeepalive(
+		context.Background(),
+		out,
+		[][]byte{[]byte(`{"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{}}]}`)},
+		time.Millisecond,
+		stop,
+		done,
+		"blocked-output-session",
+	)
+
+	close(stop)
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("runCursorKeepalive remained blocked after producer shutdown")
+	}
+
+	select {
+	case chunk := <-out:
+		t.Fatalf("keepalive emitted after producer shutdown: %s", chunk.Payload)
+	default:
 	}
 }
 

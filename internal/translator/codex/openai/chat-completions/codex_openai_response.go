@@ -17,9 +17,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-var (
-	dataTag = []byte("data:")
-)
+var dataTag = []byte("data:")
 
 // ConvertCliToOpenAIParams holds parameters for response conversion.
 type ConvertCliToOpenAIParams struct {
@@ -447,8 +445,8 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 //   - []byte: An OpenAI-compatible JSON response containing all message content and metadata
 func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	rootResult := gjson.ParseBytes(rawJSON)
-	// Verify this is a response.completed event
-	if rootResult.Get("type").String() != "response.completed" {
+	eventType := rootResult.Get("type").String()
+	if eventType != "response.completed" && eventType != "response.incomplete" {
 		return []byte{}
 	}
 
@@ -605,17 +603,25 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 		}
 	}
 
-	// Extract and set the finish reason based on status
-	if statusResult := responseResult.Get("status"); statusResult.Exists() {
-		status := statusResult.String()
-		if status == "completed" {
-			finishReason := "stop"
+	finishReason := ""
+	if eventType == "response.completed" {
+		if responseResult.Get("status").String() == "completed" {
+			finishReason = "stop"
 			if len(toolCalls) > 0 {
 				finishReason = "tool_calls"
 			}
-			template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
-			template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", finishReason)
 		}
+	} else {
+		switch responseResult.Get("incomplete_details.reason").String() {
+		case "max_output_tokens":
+			finishReason = "length"
+		case "content_filter":
+			finishReason = "content_filter"
+		}
+	}
+	if finishReason != "" {
+		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
+		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", finishReason)
 	}
 
 	return template

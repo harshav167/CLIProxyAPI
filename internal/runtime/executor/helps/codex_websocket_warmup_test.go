@@ -42,80 +42,59 @@ func TestBuildCodexWebsocketWarmupBody_InvalidInput(t *testing.T) {
 	}
 }
 
-func TestParseCodexWebsocketWarmupEvent_Completed(t *testing.T) {
-	evt := ParseCodexWebsocketWarmupEvent([]byte(`data: {"type":"response.completed","response":{"id":"resp_abc123"}}`))
-	if !evt.Terminal || !evt.Completed {
-		t.Fatalf("expected terminal+completed, got %+v", evt)
+func TestClassifyCodexResponsesEvent(t *testing.T) {
+	tests := []struct {
+		name             string
+		payload          string
+		terminal         bool
+		success          bool
+		incomplete       bool
+		failure          bool
+		incompleteReason string
+		responseID       string
+	}{
+		{name: "completed with SSE framing", payload: `data: {"type":"response.completed","response":{"id":"resp_nested"}}`, terminal: true, success: true, responseID: "resp_nested"},
+		{name: "done with top-level id", payload: `{"type":"response.done","id":"resp_top"}`, terminal: true, success: true, responseID: "resp_top"},
+		{name: "failed", payload: `{"type":"response.failed"}`, terminal: true, failure: true},
+		{name: "incomplete max output tokens", payload: `{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}`, terminal: true, incomplete: true, incompleteReason: "max_output_tokens"},
+		{name: "incomplete content filter", payload: `{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}`, terminal: true, incomplete: true, incompleteReason: "content_filter"},
+		{name: "response error", payload: `{"type":"response.error"}`, terminal: true, failure: true},
+		{name: "top-level error", payload: `{"type":"error"}`, terminal: true, failure: true},
+		{name: "created remains open", payload: `{"type":"response.created"}`},
+		{name: "unknown remains open", payload: `{"type":"response.future_event"}`},
+		{name: "malformed remains open", payload: `data: not json`},
+		{name: "empty remains open"},
 	}
-	if evt.ResponseID != "resp_abc123" {
-		t.Fatalf("response id = %q, want resp_abc123", evt.ResponseID)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := ClassifyCodexResponsesEvent([]byte(tt.payload))
+			if event.Terminal != tt.terminal || event.Success != tt.success || event.Incomplete != tt.incomplete || event.Failure != tt.failure || event.IncompleteReason != tt.incompleteReason || event.ResponseID != tt.responseID {
+				t.Fatalf("ClassifyCodexResponsesEvent() = %+v, want terminal=%v success=%v incomplete=%v failure=%v incompleteReason=%q responseID=%q", event, tt.terminal, tt.success, tt.incomplete, tt.failure, tt.incompleteReason, tt.responseID)
+			}
+		})
 	}
 }
 
-func TestParseCodexWebsocketWarmupEvent_CompletedNoFraming(t *testing.T) {
-	// Same event without the leading "data: " SSE framing.
-	evt := ParseCodexWebsocketWarmupEvent([]byte(`{"type":"response.completed","response":{"id":"resp_x"}}`))
-	if !evt.Completed || evt.ResponseID != "resp_x" {
-		t.Fatalf("expected completed with id resp_x, got %+v", evt)
+func TestIsCodexPreviousResponseNotFoundEvent(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{name: "nested response failed", payload: `{"type":"response.failed","response":{"error":{"code":"previous_response_not_found"}}}`, want: true},
+		{name: "nested response error", payload: `data: {"type":"response.error","response":{"error":{"message":"previous_response_id was not found"}}}`, want: true},
+		{name: "top level error", payload: `{"type":"error","error":{"code":"PREVIOUS_RESPONSE_NOT_FOUND"}}`, want: true},
+		{name: "unrelated failure", payload: `{"type":"response.failed","response":{"error":{"code":"server_error"}}}`},
+		{name: "malformed input", payload: `{`},
+		{name: "non terminal input", payload: `{"type":"response.created","code":"previous_response_not_found"}`},
 	}
-}
-
-// response.done must be treated as a successful terminal identical to
-// response.completed — the WS executor accepts both (and normalizes done ->
-// completed). If only completed were accepted, a done-terminated warmup would
-// hang the drain loop until the socket idle timeout.
-func TestParseCodexWebsocketWarmupEvent_DoneIsSuccessfulTerminal(t *testing.T) {
-	evt := ParseCodexWebsocketWarmupEvent([]byte(`data: {"type":"response.done","response":{"id":"resp_done_1"}}`))
-	if !evt.Terminal || !evt.Completed {
-		t.Fatalf("response.done must be terminal+completed, got %+v", evt)
-	}
-	if evt.ResponseID != "resp_done_1" {
-		t.Fatalf("response id = %q, want resp_done_1", evt.ResponseID)
-	}
-}
-
-// Some event shapes carry the id at top level rather than under response.id.
-func TestParseCodexWebsocketWarmupEvent_TopLevelIDFallback(t *testing.T) {
-	evt := ParseCodexWebsocketWarmupEvent([]byte(`{"type":"response.completed","id":"resp_top"}`))
-	if !evt.Completed || evt.ResponseID != "resp_top" {
-		t.Fatalf("expected completed with top-level id resp_top, got %+v", evt)
-	}
-}
-
-func TestParseCodexWebsocketWarmupEvent_FailedIsTerminalNotCompleted(t *testing.T) {
-	for _, typ := range []string{"response.failed", "response.incomplete", "response.error"} {
-		evt := ParseCodexWebsocketWarmupEvent([]byte(`{"type":"` + typ + `"}`))
-		if !evt.Terminal {
-			t.Fatalf("%s must be terminal", typ)
-		}
-		if evt.Completed {
-			t.Fatalf("%s must NOT be completed", typ)
-		}
-		if evt.ResponseID != "" {
-			t.Fatalf("%s must not carry a response id", typ)
-		}
-	}
-}
-
-func TestParseCodexWebsocketWarmupEvent_NonTerminalIgnored(t *testing.T) {
-	for _, typ := range []string{
-		"response.created", "response.in_progress",
-		"response.output_text.delta", "response.reasoning_summary_text.delta",
-		"response.output_item.done",
-	} {
-		evt := ParseCodexWebsocketWarmupEvent([]byte(`{"type":"` + typ + `"}`))
-		if evt.Terminal {
-			t.Fatalf("%s must be non-terminal", typ)
-		}
-	}
-}
-
-func TestParseCodexWebsocketWarmupEvent_Garbage(t *testing.T) {
-	for _, tc := range [][]byte{nil, {}, []byte("data: [DONE]"), []byte("data: not json"), []byte(": comment")} {
-		evt := ParseCodexWebsocketWarmupEvent(tc)
-		if evt.Terminal || evt.Completed || evt.ResponseID != "" {
-			t.Fatalf("garbage %q must yield zero event, got %+v", tc, evt)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsCodexPreviousResponseNotFoundEvent([]byte(tt.payload)); got != tt.want {
+				t.Fatalf("IsCodexPreviousResponseNotFoundEvent() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

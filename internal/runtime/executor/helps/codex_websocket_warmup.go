@@ -2,6 +2,7 @@ package helps
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -43,60 +44,65 @@ func BuildCodexWebsocketWarmupBody(wsReqBody []byte) ([]byte, bool) {
 	return out, true
 }
 
-// CodexWebsocketWarmupEvent classifies a single upstream SSE payload observed
-// while draining a warmup response. It reports whether the event is terminal
-// (the warmup completed/failed and the drain loop should stop) and, on a
-// successful completion, the response id to chain the next turn from.
-type CodexWebsocketWarmupEvent struct {
-	// Terminal is true once the warmup response reached a terminal event
-	// (completed / failed / incomplete / error), meaning the drain loop should
-	// stop reading.
-	Terminal bool
-	// Completed is true only for a clean `response.completed`.
-	Completed bool
-	// ResponseID is the warmup response's id, populated on `response.completed`
-	// so the next real turn can set `previous_response_id`.
-	ResponseID string
+// CodexResponsesEvent classifies the lifecycle state of one Responses event.
+type CodexResponsesEvent struct {
+	Terminal   bool
+	Success    bool
+	Incomplete bool
+	Failure    bool
+
+	IncompleteReason string
+	ResponseID       string
 }
 
-// ParseCodexWebsocketWarmupEvent inspects one upstream SSE payload (the JSON
-// object, with or without the leading `data: ` framing) during a warmup drain.
-//
-// Terminal events MUST match the WS executor's own terminal contract, which
-// treats BOTH `response.completed` and `response.done` as successful terminals
-// (the executor even rewrites `response.done` -> `response.completed` in
-// normalizeCodexWebsocketCompletion). If this helper recognized only
-// `response.completed`, a warmup that terminates with `response.done` would
-// never be seen as terminal and the drain loop would block until context
-// cancellation or the socket idle timeout, delaying the first real turn.
-//
-//   - response.completed / response.done -> Terminal + Completed, ResponseID captured
-//   - response.failed / response.incomplete / response.error -> Terminal only
-//
-// All other events are non-terminal (Terminal=false) and should be ignored:
-// warmup produces reasoning/output items we intentionally discard.
-func ParseCodexWebsocketWarmupEvent(payload []byte) CodexWebsocketWarmupEvent {
+// ClassifyCodexResponsesEvent accepts a raw JSON event or one SSE data frame.
+// Unknown and malformed events remain non-terminal.
+func ClassifyCodexResponsesEvent(payload []byte) CodexResponsesEvent {
 	trimmed := bytes.TrimSpace(payload)
 	if bytes.HasPrefix(trimmed, []byte("data:")) {
 		trimmed = bytes.TrimSpace(trimmed[len("data:"):])
 	}
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return CodexWebsocketWarmupEvent{}
+	if len(trimmed) == 0 || trimmed[0] != '{' || !gjson.ValidBytes(trimmed) {
+		return CodexResponsesEvent{}
 	}
 	switch gjson.GetBytes(trimmed, "type").String() {
 	case "response.completed", "response.done":
-		return CodexWebsocketWarmupEvent{Terminal: true, Completed: true, ResponseID: codexWarmupResponseID(trimmed)}
-	case "response.failed", "response.incomplete", "response.error":
-		return CodexWebsocketWarmupEvent{Terminal: true}
+		return CodexResponsesEvent{Terminal: true, Success: true, ResponseID: codexResponsesEventResponseID(trimmed)}
+	case "response.incomplete":
+		return CodexResponsesEvent{
+			Terminal:         true,
+			Incomplete:       true,
+			IncompleteReason: gjson.GetBytes(trimmed, "response.incomplete_details.reason").String(),
+			ResponseID:       codexResponsesEventResponseID(trimmed),
+		}
+	case "response.failed", "response.error", "error":
+		return CodexResponsesEvent{Terminal: true, Failure: true}
 	default:
-		return CodexWebsocketWarmupEvent{}
+		return CodexResponsesEvent{}
 	}
 }
 
-// codexWarmupResponseID extracts the warmup response id, mirroring the
-// executor's extractResponseIDFromSSEPayload: prefer `response.id`, fall back to
-// a top-level `id` (used by some event shapes).
-func codexWarmupResponseID(payload []byte) string {
+// IsCodexPreviousResponseNotFoundEvent reports whether a terminal failure
+// indicates that the upstream connection no longer knows the chained response.
+func IsCodexPreviousResponseNotFoundEvent(payload []byte) bool {
+	trimmed := bytes.TrimSpace(payload)
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		trimmed = bytes.TrimSpace(trimmed[len("data:"):])
+	}
+	if !ClassifyCodexResponsesEvent(trimmed).Failure {
+		return false
+	}
+	for _, path := range []string{"response.error.code", "error.code", "code"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(trimmed, path).String()), "previous_response_not_found") {
+			return true
+		}
+	}
+	message := strings.ToLower(string(trimmed))
+	return strings.Contains(message, "previous_response_not_found") ||
+		strings.Contains(message, "previous_response_id") && strings.Contains(message, "not found")
+}
+
+func codexResponsesEventResponseID(payload []byte) string {
 	if id := gjson.GetBytes(payload, "response.id").String(); id != "" {
 		return id
 	}

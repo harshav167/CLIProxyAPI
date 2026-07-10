@@ -19,6 +19,7 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
@@ -46,11 +47,15 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 	}
 }
 
-type responsesSSEFramer struct {
-	pending              []byte
+type responsesOutputCollector struct {
 	outputItems          map[int][]byte
 	outputOrder          []int
 	unindexedOutputItems [][]byte
+}
+
+type responsesSSEFramer struct {
+	pending []byte
+	output  responsesOutputCollector
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -109,9 +114,12 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 
 	switch gjson.GetBytes(payload, "type").String() {
 	case "response.output_item.done":
-		f.recordOutputItem(payload)
-	case "response.completed":
-		repaired := f.repairCompletedPayload(payload)
+		f.output.recordOutputItem(payload)
+	default:
+		if !helps.ClassifyCodexResponsesEvent(payload).Success {
+			return frame
+		}
+		repaired := f.output.repairTerminalPayload(payload)
 		if !bytes.Equal(repaired, payload) {
 			return responsesSSEFrameWithData(frame, repaired)
 		}
@@ -158,7 +166,7 @@ func responsesSSEFrameWithData(frame, payload []byte) []byte {
 	return out.Bytes()
 }
 
-func (f *responsesSSEFramer) recordOutputItem(payload []byte) {
+func (c *responsesOutputCollector) recordOutputItem(payload []byte) {
 	item := gjson.GetBytes(payload, "item")
 	if !item.Exists() || !item.IsObject() || item.Get("type").String() == "" {
 		return
@@ -166,21 +174,21 @@ func (f *responsesSSEFramer) recordOutputItem(payload []byte) {
 
 	if outputIndex := gjson.GetBytes(payload, "output_index"); outputIndex.Exists() {
 		index := int(outputIndex.Int())
-		if f.outputItems == nil {
-			f.outputItems = make(map[int][]byte)
+		if c.outputItems == nil {
+			c.outputItems = make(map[int][]byte)
 		}
-		if _, exists := f.outputItems[index]; !exists {
-			f.outputOrder = append(f.outputOrder, index)
+		if _, exists := c.outputItems[index]; !exists {
+			c.outputOrder = append(c.outputOrder, index)
 		}
-		f.outputItems[index] = append([]byte(nil), item.Raw...)
+		c.outputItems[index] = append([]byte(nil), item.Raw...)
 		return
 	}
 
-	f.unindexedOutputItems = append(f.unindexedOutputItems, append([]byte(nil), item.Raw...))
+	c.unindexedOutputItems = append(c.unindexedOutputItems, append([]byte(nil), item.Raw...))
 }
 
-func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
-	if len(f.outputOrder) == 0 && len(f.unindexedOutputItems) == 0 {
+func (c *responsesOutputCollector) repairTerminalPayload(payload []byte) []byte {
+	if len(c.outputOrder) == 0 && len(c.unindexedOutputItems) == 0 {
 		return payload
 	}
 	output := gjson.GetBytes(payload, "response.output")
@@ -190,11 +198,11 @@ func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
 
 	var outputJSON bytes.Buffer
 	outputJSON.WriteByte('[')
-	indexes := append([]int(nil), f.outputOrder...)
+	indexes := append([]int(nil), c.outputOrder...)
 	sort.Ints(indexes)
 	written := 0
 	for _, index := range indexes {
-		item, ok := f.outputItems[index]
+		item, ok := c.outputItems[index]
 		if !ok {
 			continue
 		}
@@ -204,7 +212,7 @@ func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
 		outputJSON.Write(item)
 		written++
 	}
-	for _, item := range f.unindexedOutputItems {
+	for _, item := range c.unindexedOutputItems {
 		if written > 0 {
 			outputJSON.WriteByte(',')
 		}
@@ -404,7 +412,6 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 	} else {
 		h.handleNonStreamingResponse(c, rawJSON)
 	}
-
 }
 
 // ResponsesPassthrough handles POST /v1/passthrough/responses (mounted with
@@ -449,6 +456,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	c.Header("Content-Type", "application/json")
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = withOpenAIExecutionSessionID(cliCtx, c, rawJSON)
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "responses/compact")
 	stopKeepAlive()
@@ -474,6 +482,7 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = withOpenAIExecutionSessionID(cliCtx, c, rawJSON)
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
@@ -493,6 +502,7 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponseViaChat(c *gin.Con
 
 	modelName := gjson.GetBytes(chatJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = withOpenAIExecutionSessionID(cliCtx, c, originalResponsesJSON)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, OpenAI, modelName, chatJSON, "")
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
@@ -537,6 +547,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = withOpenAIExecutionSessionID(cliCtx, c, rawJSON)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {
@@ -607,6 +618,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponseViaChat(c *gin.Contex
 
 	modelName := gjson.GetBytes(chatJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	cliCtx = withOpenAIExecutionSessionID(cliCtx, c, originalResponsesJSON)
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, OpenAI, modelName, chatJSON, "")
 	var param any
 

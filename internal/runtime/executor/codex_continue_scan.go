@@ -121,12 +121,14 @@ func (fx *codexContinueFoldContext) scanOneRound(
 		translatedLine := bytes.Clone(line)
 
 		if bytes.HasPrefix(line, dataTag) {
-			data := bytes.TrimSpace(line[5:])
+			data := normalizeCodexCompletionEvent(bytes.TrimSpace(line[5:]))
+			translatedLine = append([]byte("data: "), data...)
 
 			eventType := gjson.GetBytes(data, "type").String()
+			event := helps.ClassifyCodexResponsesEvent(data)
 
 			// Legacy: surface terminal stream errors as chunk errors.
-			if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
+			if streamErr, terminalBody, ok := codexTerminalStreamErr(data); event.Failure && ok {
 				if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 					helps.RecordAPIResponseError(ctx, fx.config(), errClearReplay)
 					if reporter != nil {
@@ -171,17 +173,18 @@ func (fx *codexContinueFoldContext) scanOneRound(
 
 			// Terminal event → record + break out (fold path) OR handle
 			// legacy-style and forward.
-			if eventType == "response.completed" || eventType == "response.failed" ||
-				eventType == "response.incomplete" || eventType == "error" {
+			if event.Terminal {
 				if !fx.foldActive() {
 					// Legacy path: handle response.completed inline.
-					if eventType == "response.completed" {
+					if event.Success || event.Incomplete {
 						if detail, ok := helps.ParseCodexUsage(data); ok {
 							reporter.Publish(ctx, detail)
 						}
 						publishCodexImageToolUsage(ctx, reporter, body, data)
-						data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
-						cacheCodexReasoningReplayFromCompleted(replayScope, data)
+						data = patchCodexTerminalOutput(data, outputItemsByIndex, outputItemsFallback)
+						if event.Success {
+							cacheCodexReasoningReplayFromCompleted(replayScope, data)
+						}
 						translatedLine = append([]byte("data: "), data...)
 					}
 					forwardEvent(translatedLine, identityState)

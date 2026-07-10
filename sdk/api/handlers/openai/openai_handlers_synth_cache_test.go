@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,8 +11,59 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+type executionSessionCaptureExecutor struct {
+	sessionIDs []string
+}
+
+func (e *executionSessionCaptureExecutor) Identifier() string { return "openai" }
+func (e *executionSessionCaptureExecutor) Execute(_ context.Context, _ *coreauth.Auth, _ coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
+	sessionID, _ := opts.Metadata[coreexecutor.ExecutionSessionMetadataKey].(string)
+	e.sessionIDs = append(e.sessionIDs, sessionID)
+	return coreexecutor.Response{Payload: []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"metadata-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)}, nil
+}
+
+func (e *executionSessionCaptureExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, _ coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	sessionID, _ := opts.Metadata[coreexecutor.ExecutionSessionMetadataKey].(string)
+	e.sessionIDs = append(e.sessionIDs, sessionID)
+	chunks := make(chan coreexecutor.StreamChunk, 1)
+	chunks <- coreexecutor.StreamChunk{Payload: []byte(`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"metadata-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)}
+	close(chunks)
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *executionSessionCaptureExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *executionSessionCaptureExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (e *executionSessionCaptureExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
+func newExecutionSessionCaptureHandler(t *testing.T) (*OpenAIResponsesAPIHandler, *executionSessionCaptureExecutor) {
+	t.Helper()
+	executor := &executionSessionCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "metadata-auth", Provider: "openai", Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "metadata-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	return NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)), executor
+}
 
 func TestMaybeInjectSyntheticPromptCacheKeyInjectsWhenAbsent(t *testing.T) {
 	c, _ := newTestGinContext(t, "Cursor/1.0")
@@ -294,17 +346,17 @@ func TestWithCursorExecutionSessionID_WrapsWhenSessionDerivable(t *testing.T) {
 	cursorCtx, _ := newTestGinContext(t, "Cursor/1.0")
 
 	cursorBody := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"hello"}]}`)
-	wrapped := withCursorExecutionSessionID(bg, cursorCtx, cursorBody)
+	wrapped := withOpenAIExecutionSessionID(bg, cursorCtx, cursorBody)
 	if wrapped == bg {
 		t.Fatalf("expected wrapped context to differ from input when session id derivable; got identical context")
 	}
 
 	plainBody := []byte(`{"model":"some-other-model","messages":[{"role":"user","content":"hi"}]}`)
-	if got := withCursorExecutionSessionID(bg, cursorCtx, plainBody); got != bg {
+	if got := withOpenAIExecutionSessionID(bg, cursorCtx, plainBody); got != bg {
 		t.Fatalf("expected input context to be returned unchanged when session id not derivable; got wrapped context %p (input %p)", got, bg)
 	}
 
-	if got := withCursorExecutionSessionID(bg, cursorCtx, cursorBody); got == bg {
+	if got := withOpenAIExecutionSessionID(bg, cursorCtx, cursorBody); got == bg {
 		t.Fatalf("expected second wrap to also differ from input")
 	}
 }
@@ -314,7 +366,7 @@ func TestWithCursorExecutionSessionIDRecordsCacheIdentity(t *testing.T) {
 	cursorCtx, _ := newTestGinContext(t, "Cursor/1.0")
 	body := []byte(`{"model":"gpt-5.5","user":"cursor-user","metadata":{"cursorConversationId":"conv-1"},"prompt_cache_key":"cli-proxy-cache","messages":[{"role":"user","content":"hello"}]}`)
 
-	wrapped := withCursorExecutionSessionID(bg, cursorCtx, body)
+	wrapped := withOpenAIExecutionSessionID(bg, cursorCtx, body)
 	identity := internallogging.GetCacheIdentity(wrapped)
 	if identity.ConversationID != "conv-1" {
 		t.Fatalf("ConversationID = %q, want conv-1", identity.ConversationID)
@@ -324,17 +376,75 @@ func TestWithCursorExecutionSessionIDRecordsCacheIdentity(t *testing.T) {
 	}
 }
 
-func TestWithCursorExecutionSessionIDRequiresCursorUserAgent(t *testing.T) {
+func TestWithOpenAIExecutionSessionIDSupportsNonCursorPrincipals(t *testing.T) {
 	bg := context.Background()
 	nonCursorCtx, _ := newTestGinContext(t, "factory-cli/0.108.0")
+	nonCursorCtx.Set("userApiKey", "tenant-a-key")
 	body := []byte(`{"model":"gpt-5.5","user":"generic-user","metadata":{"cursorConversationId":"77a73183-b276-4253-a768-ae20279c9e82"},"messages":[{"role":"user","content":"hello"}]}`)
 
-	if got := withCursorExecutionSessionID(bg, nonCursorCtx, body); got != bg {
-		t.Fatalf("non-Cursor chat request must not receive Cursor execution session context")
+	if got := withOpenAIExecutionSessionID(bg, nonCursorCtx, body); got == bg {
+		t.Fatalf("non-Cursor request with a stable conversation must receive execution session context")
 	}
 
-	if got := withCursorExecutionSessionID(bg, nil, body); got != bg {
-		t.Fatalf("nil gin context must not receive Cursor execution session context")
+	if got := withOpenAIExecutionSessionID(bg, nil, body); got != bg {
+		t.Fatalf("nil gin context must not receive execution session context")
+	}
+}
+
+func TestWithOpenAIExecutionSessionIDIsolatesSamePromptCacheKeyByPrincipal(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","prompt_cache_key":"cli-proxy-shared-client-key","messages":[{"role":"user","content":"hello"}]}`)
+	tenantA, _ := newTestGinContext(t, "factory-cli/0.108.0")
+	tenantA.Set("userApiKey", "tenant-a-key")
+	tenantB, _ := newTestGinContext(t, "factory-cli/0.108.0")
+	tenantB.Set("userApiKey", "tenant-b-key")
+
+	sessionA := deriveOpenAIExecutionSessionID(tenantA, body)
+	sessionB := deriveOpenAIExecutionSessionID(tenantB, body)
+	if sessionA == "" || sessionB == "" {
+		t.Fatalf("derived session IDs must be non-empty: %q / %q", sessionA, sessionB)
+	}
+	if sessionA == sessionB {
+		t.Fatalf("different principals must receive distinct session IDs: %q", sessionA)
+	}
+}
+
+func TestHandleNonStreamingResponseViaChatSetsExecutionSessionID(t *testing.T) {
+	handler, executor := newExecutionSessionCaptureHandler(t)
+	original := []byte(`{"model":"metadata-model","prompt_cache_key":"cli-proxy-session-key","input":"hello"}`)
+	chat := []byte(`{"model":"metadata-model","messages":[{"role":"user","content":"hello"}]}`)
+	for _, principal := range []string{"tenant-a-key", "tenant-a-key", "tenant-b-key"} {
+		c, _ := newTestGinContext(t, "factory-cli/0.108.0")
+		c.Set("userApiKey", principal)
+		handler.handleNonStreamingResponseViaChat(c, original, chat)
+	}
+	assertRepeatedPrincipalExecutionSessions(t, executor.sessionIDs)
+}
+
+func TestHandleStreamingResponseViaChatSetsExecutionSessionID(t *testing.T) {
+	handler, executor := newExecutionSessionCaptureHandler(t)
+	original := []byte(`{"model":"metadata-model","prompt_cache_key":"cli-proxy-session-key","input":"hello"}`)
+	chat := []byte(`{"model":"metadata-model","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	for _, principal := range []string{"tenant-a-key", "tenant-a-key", "tenant-b-key"} {
+		c, _ := newTestGinContext(t, "factory-cli/0.108.0")
+		c.Set("userApiKey", principal)
+		handler.handleStreamingResponseViaChat(c, original, chat)
+	}
+	assertRepeatedPrincipalExecutionSessions(t, executor.sessionIDs)
+}
+
+func assertRepeatedPrincipalExecutionSessions(t *testing.T, sessionIDs []string) {
+	t.Helper()
+	if len(sessionIDs) != 3 {
+		t.Fatalf("captured session IDs = %q, want three calls", sessionIDs)
+	}
+	if sessionIDs[0] == "" || sessionIDs[1] == "" || sessionIDs[2] == "" {
+		t.Fatalf("session IDs must be non-empty: %q", sessionIDs)
+	}
+	if sessionIDs[0] != sessionIDs[1] {
+		t.Fatalf("same principal/request IDs differ: %q", sessionIDs)
+	}
+	if sessionIDs[0] == sessionIDs[2] {
+		t.Fatalf("different principal IDs collide: %q", sessionIDs)
 	}
 }
 

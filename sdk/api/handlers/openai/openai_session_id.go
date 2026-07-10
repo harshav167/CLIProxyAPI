@@ -357,16 +357,36 @@ func deriveCursorSessionID(rawJSON []byte, salt string) string {
 	return "cursor-" + hex.EncodeToString(sum[:12])
 }
 
-func withCursorExecutionSessionID(ctx context.Context, c *gin.Context, rawJSON []byte) context.Context {
-	if c == nil || c.Request == nil || !strings.HasPrefix(c.Request.UserAgent(), "Cursor/") {
+func withOpenAIExecutionSessionID(ctx context.Context, c *gin.Context, rawJSON []byte) context.Context {
+	if c == nil || c.Request == nil {
 		return ctx
 	}
-	ctx = withCursorCacheIdentity(ctx, rawJSON)
-	sessionID := deriveCursorSessionID(rawJSON, principalSalt(c))
+	if strings.HasPrefix(c.Request.UserAgent(), "Cursor/") {
+		ctx = withCursorCacheIdentity(ctx, rawJSON)
+	}
+	sessionID := deriveOpenAIExecutionSessionID(c, rawJSON)
 	if sessionID == "" {
 		return ctx
 	}
 	return handlers.WithExecutionSessionID(ctx, sessionID)
+}
+
+func deriveOpenAIExecutionSessionID(c *gin.Context, rawJSON []byte) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	salt := principalSalt(c)
+	sessionID := deriveCursorSessionID(rawJSON, salt)
+	if sessionID == "" {
+		if promptCacheKey := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String()); promptCacheKey != "" {
+			sum := sha256.Sum256([]byte("openai-pck\x00" + salt + "\x00" + promptCacheKey))
+			sessionID = "openai-pck-" + hex.EncodeToString(sum[:12])
+		}
+	}
+	if sessionID == "" {
+		return ""
+	}
+	return sessionID
 }
 
 func withCursorCacheIdentity(ctx context.Context, rawJSON []byte) context.Context {

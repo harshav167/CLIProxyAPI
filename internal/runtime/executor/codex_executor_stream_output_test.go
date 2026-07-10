@@ -50,6 +50,142 @@ func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *t
 	}
 }
 
+func TestCodexExecutorExecuteAcceptsResponseDone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.done","response":{"id":"resp_done","object":"response","status":"completed","model":"gpt-5.5","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	resp, err := executeCodexNonStreamFixture(t, server.URL)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "id").String(); got != "resp_done" {
+		t.Fatalf("id = %q, want resp_done; payload=%s", got, resp.Payload)
+	}
+	if gjson.GetBytes(resp.Payload, "response").Exists() || gjson.GetBytes(resp.Payload, "type").Exists() {
+		t.Fatalf("raw event envelope leaked: %s", resp.Payload)
+	}
+}
+
+func TestCodexExecutorExecuteReturnsResponseIncomplete(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}}` + "\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	resp, err := executeCodexNonStreamFixture(t, server.URL)
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "id").String(); got != "resp_incomplete" {
+		t.Fatalf("id = %q, want resp_incomplete; payload=%s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "status").String(); got != "incomplete" {
+		t.Fatalf("status = %q, want incomplete; payload=%s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.content.0.text").String(); got != "partial" {
+		t.Fatalf("output text = %q, want partial; payload=%s", got, resp.Payload)
+	}
+	if gjson.GetBytes(resp.Payload, "response").Exists() || gjson.GetBytes(resp.Payload, "type").Exists() {
+		t.Fatalf("raw event envelope leaked: %s", resp.Payload)
+	}
+}
+
+func TestCodexExecutorExecuteTranslatesResponseIncompleteToChatCompletion(t *testing.T) {
+	tests := []struct {
+		reason string
+		want   string
+	}{
+		{reason: "max_output_tokens", want: "length"},
+		{reason: "content_filter", want: "content_filter"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.reason, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(`data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"` + tt.reason + `"},"output":[]}}` + "\n\n"))
+			}))
+			defer server.Close()
+
+			resp, err := executeCodexNonStreamFixtureFormat(t, server.URL, sdktranslator.FromString("openai"))
+			if err != nil {
+				t.Fatalf("Execute error: %v", err)
+			}
+			if got := gjson.GetBytes(resp.Payload, "choices.0.finish_reason").String(); got != tt.want {
+				t.Fatalf("finish_reason = %q, want %q; payload=%s", got, tt.want, resp.Payload)
+			}
+			if got := gjson.GetBytes(resp.Payload, "choices.0.native_finish_reason").String(); got != tt.want {
+				t.Fatalf("native_finish_reason = %q, want %q; payload=%s", got, tt.want, resp.Payload)
+			}
+			if gjson.GetBytes(resp.Payload, "response").Exists() || gjson.GetBytes(resp.Payload, "type").Exists() {
+				t.Fatalf("raw event envelope leaked: %s", resp.Payload)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorExecuteRejectsUnknownResponseIncompleteReasonForChatCompletion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"upstream_unknown"},"output":[]}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	_, err := executeCodexNonStreamFixtureFormat(t, server.URL, sdktranslator.FromString("openai"))
+	if err == nil {
+		t.Fatal("expected translation error")
+	}
+	if statusCodeFromTestError(t, err) != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; err=%v", statusCodeFromTestError(t, err), http.StatusBadGateway, err)
+	}
+	want := "codex terminal event response.incomplete could not be translated to openai"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestCodexExecutorExecuteReturnsClassifiedFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.error","response":{"error":{"code":"server_error","message":"upstream exploded"}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	_, err := executeCodexNonStreamFixture(t, server.URL)
+	if err == nil {
+		t.Fatal("expected classified terminal failure")
+	}
+	if statusCodeFromTestError(t, err) != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; err=%v", statusCodeFromTestError(t, err), http.StatusBadGateway, err)
+	}
+	if !strings.Contains(err.Error(), "upstream exploded") {
+		t.Fatalf("failure message missing upstream error: %v", err)
+	}
+}
+
+func executeCodexNonStreamFixture(t *testing.T, baseURL string) (cliproxyexecutor.Response, error) {
+	t.Helper()
+	return executeCodexNonStreamFixtureFormat(t, baseURL, sdktranslator.FromString("openai-response"))
+}
+
+func executeCodexNonStreamFixtureFormat(t *testing.T, baseURL string, responseFormat sdktranslator.Format) (cliproxyexecutor.Response, error) {
+	t.Helper()
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": baseURL, "api_key": "test"}}
+	return executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: responseFormat,
+		Stream:         false,
+	})
+}
+
 func TestCodexExecutorExecuteSurfacesTerminalStreamError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

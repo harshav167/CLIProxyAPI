@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -19,16 +20,17 @@ import (
 // sequential requests: with pooling, that count should be 1; without a shared
 // transport it grows with N.
 func TestProxyClient_ReusesConnectionsAcrossRequests(t *testing.T) {
-	var dials int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var dials atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	}))
 	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		if state == http.StateNew {
-			dials++
+			dials.Add(1)
 		}
 	}
+	srv.Start()
 	defer srv.Close()
 
 	cfg := &config.Config{}
@@ -44,9 +46,10 @@ func TestProxyClient_ReusesConnectionsAcrossRequests(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	t.Logf("distinct server connections for %d sequential requests: %d", n, dials)
-	if dials > 1 {
-		t.Errorf("expected connection reuse (1 dial) across %d requests, got %d new connections", n, dials)
+	dialCount := dials.Load()
+	t.Logf("distinct server connections for %d sequential requests: %d", n, dialCount)
+	if dialCount > 1 {
+		t.Errorf("expected connection reuse (1 dial) across %d requests, got %d new connections", n, dialCount)
 	}
 }
 
@@ -57,16 +60,17 @@ func TestProxyClient_ReusesConnectionsAcrossRequests(t *testing.T) {
 // setting (auth.ProxyURL="direct"), which still routes through buildProxyTransport
 // and returns a per-call transport.
 func TestProxyClient_ReusesConnectionsWithProxyConfigured(t *testing.T) {
-	var dials int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var dials atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	}))
 	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		if state == http.StateNew {
-			dials++
+			dials.Add(1)
 		}
 	}
+	srv.Start()
 	defer srv.Close()
 
 	// Guard the test's own premise: "direct" must resolve to a real (non-nil)
@@ -92,8 +96,9 @@ func TestProxyClient_ReusesConnectionsWithProxyConfigured(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	t.Logf("[proxy=direct] distinct server connections for %d sequential requests: %d", n, dials)
-	if dials > 1 {
-		t.Errorf("expected connection reuse (1 dial) across %d requests, got %d new connections (fresh transport per call)", n, dials)
+	dialCount := dials.Load()
+	t.Logf("[proxy=direct] distinct server connections for %d sequential requests: %d", n, dialCount)
+	if dialCount > 1 {
+		t.Errorf("expected connection reuse (1 dial) across %d requests, got %d new connections (fresh transport per call)", n, dialCount)
 	}
 }
