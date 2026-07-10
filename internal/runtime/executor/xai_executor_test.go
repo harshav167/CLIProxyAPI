@@ -260,6 +260,75 @@ func TestXAIExecutorComposerSessionIsolation(t *testing.T) {
 	}
 }
 
+func TestXAIPreservesPayloadPromptCacheKeyWhenExecutionSessionDiffers(t *testing.T) {
+	// Cursor injects a parent/shared synthetic prompt_cache_key (cli-proxy-*),
+	// then deriveCursorSessionID sets a different per-subagent
+	// ExecutionSessionMetadataKey from cursorConversationId. The XAI HTTP
+	// path must not overwrite body.prompt_cache_key with the execution
+	// session — that cold-starts every subagent on xAI sticky routing.
+	const parentPCK = "cli-proxy-parent-shared"
+	const execSession = "cursor-conv-subagent-a"
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","prompt_cache_key":"` + parentPCK + `","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: execSession,
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("prepareResponsesRequest() error = %v", err)
+	}
+
+	if got := prepared.sessionID; got != execSession {
+		t.Fatalf("sessionID = %q, want execution session %q", got, execSession)
+	}
+	if got := gjson.GetBytes(prepared.body, "prompt_cache_key").String(); got != parentPCK {
+		t.Fatalf("prompt_cache_key = %q, want parent-shared %q; body=%s", got, parentPCK, string(prepared.body))
+	}
+
+	httpReq, errRequest := http.NewRequest(http.MethodPost, "https://example.test/responses", bytes.NewReader(prepared.body))
+	if errRequest != nil {
+		t.Fatalf("NewRequest() error = %v", errRequest)
+	}
+	applyXAIHeaders(httpReq, auth, "xai-token", true, prepared.sessionID)
+	if got := httpReq.Header.Get("x-grok-conv-id"); got != execSession {
+		t.Fatalf("x-grok-conv-id = %q, want execution session %q", got, execSession)
+	}
+
+	// Second subagent: same parent pck, different execution session → same
+	// upstream cache key, different conv id.
+	const execSessionB = "cursor-conv-subagent-b"
+	preparedB, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","prompt_cache_key":"` + parentPCK + `","input":"subtask"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: execSessionB,
+		},
+	}, true)
+	if err != nil {
+		t.Fatalf("prepareResponsesRequest(B) error = %v", err)
+	}
+	if got := gjson.GetBytes(preparedB.body, "prompt_cache_key").String(); got != parentPCK {
+		t.Fatalf("subagent B prompt_cache_key = %q, want %q", got, parentPCK)
+	}
+	if got := preparedB.sessionID; got != execSessionB {
+		t.Fatalf("subagent B sessionID = %q, want %q", got, execSessionB)
+	}
+}
+
 func TestXAIExecutorCompactUsesCompactEndpoint(t *testing.T) {
 	validEncryptedContent := testValidGrokEncryptedContent()
 	var gotPath string
@@ -634,7 +703,7 @@ func TestXAIExecutorGrok45AliasPayloadOverrideSetsEffort(t *testing.T) {
 		Stream:       false,
 		Metadata: map[string]any{
 			cliproxyexecutor.ExecutionSessionMetadataKey: "alias-cache-1",
-			"requested_model":                            "grok-4.5-low",
+			"requested_model": "grok-4.5-low",
 		},
 	})
 	if err != nil {

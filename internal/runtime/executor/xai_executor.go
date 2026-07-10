@@ -873,9 +873,10 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	if errSession != nil {
 		return nil, errSession
 	}
-	if sessionID != "" {
-		body, _ = sjson.SetBytes(body, "prompt_cache_key", sessionID)
-	}
+	// sessionID drives x-grok-conv-id / local session only. Upstream
+	// prompt_cache_key is applied separately and never replaced by sessionID
+	// when a client/handler key is already present.
+	body = ensureXAIUpstreamPromptCacheKey(body, req, sessionID)
 
 	return &xaiPreparedRequest{
 		baseModel:       baseModel,
@@ -977,6 +978,35 @@ func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.O
 		return strings.TrimSpace(promptCacheKey.String())
 	}
 	return ""
+}
+
+// ensureXAIUpstreamPromptCacheKey sets body.prompt_cache_key for xAI sticky
+// routing without collapsing it into the local execution session.
+//
+// Priority: existing body key, then req.Payload key (handler-injected
+// parent/shared cli-proxy-* or client-supplied), then sessionID only when no
+// client/handler key exists (composer isolation / generated sessions).
+// Never overwrite a present key with sessionID — that cold-starts Cursor
+// subagents that share a parent pck but have different ExecutionSession IDs.
+func ensureXAIUpstreamPromptCacheKey(body []byte, req cliproxyexecutor.Request, sessionID string) []byte {
+	if pck := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); pck != "" {
+		return body
+	}
+	if pck := strings.TrimSpace(gjson.GetBytes(req.Payload, "prompt_cache_key").String()); pck != "" {
+		out, err := sjson.SetBytes(body, "prompt_cache_key", pck)
+		if err != nil {
+			return body
+		}
+		return out
+	}
+	if sessionID = strings.TrimSpace(sessionID); sessionID == "" {
+		return body
+	}
+	out, err := sjson.SetBytes(body, "prompt_cache_key", sessionID)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func xaiRequiresIsolatedConversation(model string) bool {
