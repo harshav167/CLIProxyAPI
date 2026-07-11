@@ -343,6 +343,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if sess != nil && sess.connGeneration != finalized.connGeneration {
 		finalized = finalizeCodexWebsocketRequest(e.cfg, auth, originalPayloadSource, body, sess, executionSessionID, wsHeaders, ginHeaders)
 		wsReqBody = finalized.body
+		identityState = finalized.identityState
 	}
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
@@ -618,6 +619,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if sess != nil && sess.connGeneration != finalized.connGeneration {
 		finalized = finalizeCodexWebsocketRequest(e.cfg, auth, userPayload, body, sess, executionSessionID, wsHeaders, ginHeaders)
 		wsReqBody = finalized.body
+		identityState = finalized.identityState
 	}
 	var upstreamHeaders http.Header
 	if respHS != nil {

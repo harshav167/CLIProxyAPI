@@ -139,13 +139,17 @@ func TestResponsesWebsocketPassthroughKeepsTranscriptReplayArmedUntilSuccess(t *
 	if len(payloads) != 4 {
 		t.Fatalf("upstream payload count = %d, want 4", len(payloads))
 	}
-	for _, index := range []int{2, 3} {
-		if gjson.GetBytes(payloads[index], "previous_response_id").Exists() {
-			t.Fatalf("replay attempt %d resumed passthrough before success: %s", index-1, payloads[index])
-		}
-		if got := len(gjson.GetBytes(payloads[index], "input").Array()); got != 3 {
-			t.Fatalf("replay attempt %d input length = %d, want full transcript: %s", index-1, got, payloads[index])
-		}
+	if gjson.GetBytes(payloads[2], "previous_response_id").Exists() {
+		t.Fatalf("forced replay retained stale previous_response_id: %s", payloads[2])
+	}
+	if got := len(gjson.GetBytes(payloads[2], "input").Array()); got != 3 {
+		t.Fatalf("forced replay input length = %d, want full transcript: %s", got, payloads[2])
+	}
+	if got := gjson.GetBytes(payloads[3], "previous_response_id").String(); got != "resp-1" {
+		t.Fatalf("request after failed replay previous_response_id = %q, want passthrough resp-1: %s", got, payloads[3])
+	}
+	if got := len(gjson.GetBytes(payloads[3], "input").Array()); got != 1 {
+		t.Fatalf("request after failed replay input length = %d, want incremental input: %s", got, payloads[3])
 	}
 }
 

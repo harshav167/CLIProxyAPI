@@ -457,10 +457,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if selectedAuth, ok := sessionAuthByID(lastAttemptedAuthID); ok && selectedAuth != nil {
 				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
 					pinnedAuthID = lastAttemptedAuthID
-				} else if pinnedAuthID != "" {
-					if pinnedAuth, ok := sessionAuthByID(pinnedAuthID); ok && pinnedAuth != nil && websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata) {
-						pinnedAuthID = lastAttemptedAuthID
-					}
 				}
 			}
 		}
@@ -473,8 +469,15 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			lastResponsePendingToolCallIDs = previousLastResponsePendingToolCallIDs
 			continue
 		}
-		if forcedTranscriptReplay && forwardErrMsg == nil && strings.TrimSpace(completedResponseID) != "" {
+		if forcedTranscriptReplay {
 			forceTranscriptReplayNextRequest = false
+			if forwardErrMsg != nil || strings.TrimSpace(completedResponseID) == "" {
+				lastRequest = previousLastRequest
+				lastResponseOutput = previousLastResponseOutput
+				lastResponseID = previousLastResponseID
+				lastResponsePendingToolCallIDs = previousLastResponsePendingToolCallIDs
+				continue
+			}
 		}
 		lastResponseOutput = completedOutput
 		lastResponseID = strings.TrimSpace(completedResponseID)
