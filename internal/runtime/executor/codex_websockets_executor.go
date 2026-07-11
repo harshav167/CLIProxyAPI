@@ -337,14 +337,15 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		AuthType:  authType,
 		AuthValue: authValue,
 	}
-	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
-
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, finalized.headers)
 	if sess != nil && sess.connGeneration != finalized.connGeneration {
 		finalized = finalizeCodexWebsocketRequest(e.cfg, auth, originalPayloadSource, body, sess, executionSessionID, wsHeaders, ginHeaders)
 		wsReqBody = finalized.body
 		identityState = finalized.identityState
 	}
+	wsReqLog.Headers = finalized.headers.Clone()
+	wsReqLog.Body = wsReqBody
+	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
 		if respHS != nil {
@@ -613,14 +614,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		AuthType:  authType,
 		AuthValue: authValue,
 	}
-	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
-
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, finalized.headers)
 	if sess != nil && sess.connGeneration != finalized.connGeneration {
 		finalized = finalizeCodexWebsocketRequest(e.cfg, auth, userPayload, body, sess, executionSessionID, wsHeaders, ginHeaders)
 		wsReqBody = finalized.body
 		identityState = finalized.identityState
 	}
+	wsReqLog.Headers = finalized.headers.Clone()
+	wsReqLog.Body = wsReqBody
+	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 	var upstreamHeaders http.Header
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()

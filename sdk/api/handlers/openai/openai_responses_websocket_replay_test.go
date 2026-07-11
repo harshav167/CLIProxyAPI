@@ -73,7 +73,7 @@ func (e *websocketReplayCaptureExecutor) ExecuteStream(_ context.Context, auth *
 	return &coreexecutor.StreamResult{Chunks: chunks}, nil
 }
 
-func TestResponsesWebsocketPassthroughKeepsTranscriptReplayArmedUntilSuccess(t *testing.T) {
+func TestResponsesWebsocketPassthroughDisarmsTranscriptReplayAfterFailedAttempt(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &websocketReplayCaptureExecutor{
 		done:           make(chan struct{}),
