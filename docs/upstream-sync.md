@@ -20,7 +20,8 @@ customizations sit on top:
 - `f5-*` Cursor Fable 5 aliases (bypass the ZDR routing gate) + embedded snapshot
 - Deeper observability (OTel → SigNoz, quota metrics, error-body transport logs)
 - Billing / cache-control behavior tuned to Claude Code's canonical layout
-- `alpine + CGO_ENABLED=0` Dockerfile with native cross-compile
+- CGO-enabled, glibc-compatible plugin runtime: Bookworm builder with Zig
+  cross-compilation and a distroless Debian production image
 
 A sync is successful only if **every** item above survives unchanged or
 expanded. Reverting one to resolve a conflict is a failure.
@@ -65,40 +66,52 @@ Commit (`chore: sync upstream/main (<N> commits incl. <themes>)`), update
 | `sdk/cliproxy/service.go` | our observability lifecycle vs upstream API-key/plugin lifecycle | Keep BOTH |
 | `cmd/server/main.go` | our redis env overrides vs upstream plugin bootstrap | Keep BOTH |
 | `internal/runtime/executor/*` | upstream executor/translator refactors vs our hooks | Re-apply our hook onto moved call site; verify `ApplyCursorFableAliasSnapshot` runs after `thinking.ApplyThinking`, before `applyCloaking` |
-| `Dockerfile` | upstream bookworm+CGO=1 vs our alpine+CGO=0 | Keep ours (see CGO trap) |
+| `Dockerfile` | upstream build/runtime changes vs our plugin-capable CGO + distroless policy | Preserve `CGO_ENABLED=1`, Zig cross-compilation, glibc compatibility, the distroless Debian production runtime, non-root execution, and `ENV TZ=Australia/Sydney` |
 
 When in doubt: prefer ours, or keep both if additive. Only take upstream's side
 for a pure bugfix that does not touch fork behavior.
 
-## The CGO=0 Dockerfile trap
+## Plugin-capable CGO build policy
 
-Upstream switches to `golang:1.26-bookworm` + `CGO_ENABLED=1`, implying the
-plugin host requires cgo. It does not for our build:
+The production build must keep `CGO_ENABLED=1`. Go's real `plugin` loader is
+CGO-only, and store-downloaded `.so` plugins require glibc at runtime. An Alpine
+or `CGO_ENABLED=0` build may compile through the unsupported-loader fallback,
+but it disables the plugin-store behavior production is required to preserve.
 
-- cgo loader is gated `//go:build cgo && (linux || darwin || freebsd)`
-  (`internal/pluginhost/loader_unix.go`, `host_callbacks_unix.go`)
-- `internal/pluginhost/loader_unsupported.go` is the no-op fallback for `CGO_ENABLED=0`
+The production Dockerfile therefore uses:
 
-Verify before reverting upstream's change:
+- `golang:1.26-bookworm` as the builder
+- Zig for reproducible Linux cross-compilation
+- `gcr.io/distroless/base-debian12:nonroot` as the runtime
+- glibc, libssl, CA certificates, and tzdata from the distroless base
+- no shell, package manager, curl, or in-container healthcheck
+- non-root uid 65532 and `ENV TZ=Australia/Sydney`
+
+Verify the ARM64 production binary with:
 
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/cv ./cmd/server && rm /tmp/cv
+CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+  CC="zig cc -target aarch64-linux-gnu" \
+  go build -o /tmp/cv ./cmd/server && rm /tmp/cv
 ```
 
-Keep `alpine + CGO_ENABLED=0` with `--platform=$BUILDPLATFORM` /
-`GOARCH=${TARGETARCH}` and `ENV TZ=Australia/Sydney`. We lose only runtime `.so`
-plugin loading (unused). Accepting upstream's change silently regresses amd64
-build time from ~15s to ~3min (QEMU emulation) for zero benefit.
+`Dockerfile.debug` is the shell-enabled Debian image for debugging only. Do not
+replace the production distroless runtime with it.
 
 ## Deploy gate
 
 1. Rebuild local container (`docker/docker-compose.local.yml`, host port **8312**);
    confirm health and that new models/aliases show in `/v1/models`.
 2. User tests in Cursor against `127.0.0.1:8312`.
-3. After sign-off: build `:prod` (amd64) → push to `ghcr.io/harshav167/cliproxyapi`
-   → tag `:upstream-sync-<sha8>` + `:prod` → pull on prod VM → restart → smoke-test
-   via the clanker tunnel.
-4. Back up the hand-edited prod config before changes; patch it in place. Never
+3. After sign-off: build and push an ARM64 image tagged
+   `:upstream-sync-<sha8>` and `:prod-arm64`. Update the multi-arch `:prod`
+   manifest only after it includes the ARM64 image. Never push `:latest`.
+4. Deploy only to the ARM Axion production VM through the
+   `cliproxy-prod-arm` MCP. In `/home/wade/cliproxy`, run
+   `docker compose pull cli-proxy-api-test && docker compose up -d cli-proxy-api-test`,
+   then smoke-test `GET /healthz` and the expected model aliases. Do not use the
+   decommissioned x86 VM or direct SSH.
+5. Back up the hand-edited prod config before changes; patch it in place. Never
    `scp` the local config over prod.
 
 ## Definition of done

@@ -106,9 +106,18 @@ func replayCodexStream(ctx context.Context, result *cliproxyexecutor.StreamResul
 	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
 }
 
-func isCodexWebsocketTransportBootstrapError(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+func isCodexWebsocketTransportBootstrapError(ctx context.Context, err error) bool {
+	if err == nil {
 		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	if isCodexWebsocketConnectionLimitBootstrapError(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true

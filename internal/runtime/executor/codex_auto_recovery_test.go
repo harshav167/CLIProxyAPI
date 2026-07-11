@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -48,27 +50,48 @@ func TestCodexAutoExecuteStreamPreviousResponseRetryTransportFailureFallsBackToH
 func TestCodexWebsocketTransportBootstrapErrorClassification(t *testing.T) {
 	tests := []struct {
 		name string
+		ctx  context.Context
 		err  error
 		want bool
 	}{
-		{name: "connection limit", err: errors.New(`{"error":{"code":"websocket_connection_limit_reached"}}`), want: true},
-		{name: "EOF", err: io.EOF, want: true},
-		{name: "websocket close", err: &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "lost"}, want: true},
-		{name: "handshake", err: errors.New("websocket: bad handshake"), want: true},
-		{name: "caller cancellation", err: context.Canceled, want: false},
-		{name: "caller deadline", err: context.DeadlineExceeded, want: false},
-		{name: "quota", err: errors.New(`{"error":{"code":"insufficient_quota"}}`), want: false},
-		{name: "context length", err: errors.New(`{"error":{"code":"context_length_exceeded"}}`), want: false},
-		{name: "invalid request", err: errors.New(`{"error":{"code":"invalid_request_error"}}`), want: false},
+		{name: "connection limit", ctx: context.Background(), err: errors.New(`{"error":{"code":"websocket_connection_limit_reached"}}`), want: true},
+		{name: "EOF", ctx: context.Background(), err: io.EOF, want: true},
+		{name: "websocket close", ctx: context.Background(), err: &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "lost"}, want: true},
+		{name: "handshake", ctx: context.Background(), err: errors.New("websocket: bad handshake"), want: true},
+		{name: "caller cancellation", ctx: canceledContext(), err: context.Canceled, want: false},
+		{name: "caller deadline", ctx: deadlineExceededContext(), err: context.DeadlineExceeded, want: false},
+		{name: "upstream timeout", ctx: context.Background(), err: timeoutError{}, want: true},
+		{name: "wrapped upstream deadline", ctx: context.Background(), err: fmt.Errorf("upstream read: %w", context.DeadlineExceeded), want: true},
+		{name: "quota", ctx: context.Background(), err: errors.New(`{"error":{"code":"insufficient_quota"}}`), want: false},
+		{name: "context length", ctx: context.Background(), err: errors.New(`{"error":{"code":"context_length_exceeded"}}`), want: false},
+		{name: "invalid request", ctx: context.Background(), err: errors.New(`{"error":{"code":"invalid_request_error"}}`), want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isCodexWebsocketTransportBootstrapError(tt.err); got != tt.want {
+			if got := isCodexWebsocketTransportBootstrapError(tt.ctx, tt.err); got != tt.want {
 				t.Fatalf("classification = %v, want %v for %v", got, tt.want, tt.err)
 			}
 		})
 	}
+}
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "upstream timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+func canceledContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+func deadlineExceededContext() context.Context {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	return ctx
 }
 
 func TestBootstrapCodexStreamReplaysFirstPayloadAndHeaders(t *testing.T) {

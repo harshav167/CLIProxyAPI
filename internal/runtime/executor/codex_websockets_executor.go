@@ -2844,7 +2844,7 @@ func (e *CodexAutoExecutor) bridgedExecuteStream(ctx context.Context, auth *clip
 			result, err = bootstrapCodexStream(ctx, result)
 		}
 		turn.finalize(e.connGeneration(sessionKey), retrySentDelta, currentInputCount(req.Payload))
-		if err != nil && !isCodexWebsocketTransportBootstrapError(err) {
+		if err != nil && !isCodexWebsocketTransportBootstrapError(ctx, err) {
 			bridge.Reset(sessionKey)
 			return nil, err, true
 		}
@@ -2856,7 +2856,7 @@ func (e *CodexAutoExecutor) bridgedExecuteStream(ctx context.Context, auth *clip
 			bridge.Reset(sessionKey)
 			return nil, nil, false
 		}
-		if err != nil && !isCodexWebsocketTransportBootstrapError(err) {
+		if err != nil && !isCodexWebsocketTransportBootstrapError(ctx, err) {
 			return nil, err, true
 		}
 		if err != nil && !isCodexWebsocketConnectionLimitBootstrapError(err) {
@@ -2877,7 +2877,7 @@ func (e *CodexAutoExecutor) bridgedExecuteStream(ctx context.Context, auth *clip
 		}
 		turn.finalize(e.connGeneration(sessionKey), retrySentDelta, currentInputCount(req.Payload))
 		if err != nil {
-			if !isCodexWebsocketTransportBootstrapError(err) {
+			if !isCodexWebsocketTransportBootstrapError(ctx, err) {
 				return nil, err, true
 			}
 			log.Warnf("codex http-ws bridge: fresh websocket retry failed session=%s, falling back to HTTP: %v", sessionKey, err)
