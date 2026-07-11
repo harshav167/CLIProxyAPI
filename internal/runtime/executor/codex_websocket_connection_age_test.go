@@ -63,12 +63,10 @@ func TestCodexWebsocketConnectionReuse(t *testing.T) {
 	sess := exec.getOrCreateSession("reuse")
 	t.Cleanup(func() { exec.closeExecutionSession(sess, "test_cleanup") })
 
-	prepareUpstreamConnState(sess, "auth-1", server.websocketURL())
 	first, _, err := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", server.websocketURL(), nil)
 	if err != nil {
 		t.Fatalf("first ensureUpstreamConn() error = %v", err)
 	}
-	prepareUpstreamConnState(sess, "auth-1", server.websocketURL())
 	second, _, err := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", server.websocketURL(), nil)
 	if err != nil {
 		t.Fatalf("second ensureUpstreamConn() error = %v", err)
@@ -88,12 +86,10 @@ func TestCodexWebsocketConnectionAuthChangeRedials(t *testing.T) {
 	sess := exec.getOrCreateSession("auth-change")
 	t.Cleanup(func() { exec.closeExecutionSession(sess, "test_cleanup") })
 
-	prepareUpstreamConnState(sess, "auth-1", server.websocketURL())
 	first, _, err := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", server.websocketURL(), nil)
 	if err != nil {
 		t.Fatalf("first ensureUpstreamConn() error = %v", err)
 	}
-	prepareUpstreamConnState(sess, "auth-2", server.websocketURL())
 	second, _, err := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-2", server.websocketURL(), nil)
 	if err != nil {
 		t.Fatalf("second ensureUpstreamConn() error = %v", err)
@@ -114,12 +110,10 @@ func TestCodexWebsocketConnectionURLChangeRedials(t *testing.T) {
 	sess := exec.getOrCreateSession("url-change")
 	t.Cleanup(func() { exec.closeExecutionSession(sess, "test_cleanup") })
 
-	prepareUpstreamConnState(sess, "auth-1", firstServer.websocketURL())
 	first, _, err := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", firstServer.websocketURL(), nil)
 	if err != nil {
 		t.Fatalf("first ensureUpstreamConn() error = %v", err)
 	}
-	prepareUpstreamConnState(sess, "auth-1", secondServer.websocketURL())
 	second, _, err := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", secondServer.websocketURL(), nil)
 	if err != nil {
 		t.Fatalf("second ensureUpstreamConn() error = %v", err)
@@ -142,7 +136,6 @@ func TestCodexWebsocketConnectionAgeRedials(t *testing.T) {
 	sess := exec.getOrCreateSession("aged")
 	t.Cleanup(func() { exec.closeExecutionSession(sess, "test_cleanup") })
 
-	prepareUpstreamConnState(sess, "auth-1", server.websocketURL())
 	first, _, err := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", server.websocketURL(), nil)
 	if err != nil {
 		t.Fatalf("first ensureUpstreamConn() error = %v", err)
@@ -156,7 +149,6 @@ func TestCodexWebsocketConnectionAgeRedials(t *testing.T) {
 	sess.warmedUpGen = firstGeneration
 	sess.connMu.Unlock()
 
-	prepareUpstreamConnState(sess, "auth-1", server.websocketURL())
 	second, _, err := exec.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", server.websocketURL(), nil)
 	if err != nil {
 		t.Fatalf("second ensureUpstreamConn() error = %v", err)

@@ -421,9 +421,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
 			updatedLastRequest = bytes.Clone(requestJSON)
 			lastRequest = updatedLastRequest
-			if forcedTranscriptReplay {
-				forceTranscriptReplayNextRequest = false
-			}
 		}
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
@@ -475,6 +472,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			lastResponseID = previousLastResponseID
 			lastResponsePendingToolCallIDs = previousLastResponsePendingToolCallIDs
 			continue
+		}
+		if forcedTranscriptReplay && forwardErrMsg == nil && strings.TrimSpace(completedResponseID) != "" {
+			forceTranscriptReplayNextRequest = false
 		}
 		lastResponseOutput = completedOutput
 		lastResponseID = strings.TrimSpace(completedResponseID)

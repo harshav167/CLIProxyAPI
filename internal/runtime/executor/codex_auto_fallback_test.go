@@ -167,11 +167,46 @@ func TestCodexAutoExecuteStreamPostStartErrorDoesNotRetryOrFallback(t *testing.T
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for post-start error")
 	}
+	select {
+	case chunk, ok := <-result.Chunks:
+		if ok {
+			t.Fatalf("unexpected third stream chunk: payload=%q error=%v", chunk.Payload, chunk.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for post-start stream closure")
+	}
 	if got := fixture.wsRequests.Load(); got != 1 {
 		t.Fatalf("websocket requests = %d, want 1", got)
 	}
 	if got := fixture.httpRequests.Load(); got != 0 {
 		t.Fatalf("HTTP requests = %d, want 0", got)
+	}
+}
+
+func TestWrapBridgedStreamForCaptureStopsWhenContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	input := make(chan cliproxyexecutor.StreamChunk)
+	exec := NewCodexAutoExecutor(&config.Config{})
+	result := exec.wrapBridgedStreamForCapture(
+		ctx,
+		"capture-cancel",
+		"gpt-5-codex",
+		"auth-cancel",
+		[]byte(`{"model":"gpt-5-codex","input":[]}`),
+		&cliproxyexecutor.StreamResult{Chunks: input},
+		bridgeTurnTelemetry{},
+	)
+
+	input <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"type":"response.output_text.delta","delta":"started"}`)}
+	cancel()
+
+	select {
+	case _, ok := <-result.Chunks:
+		if ok {
+			t.Fatal("wrapped stream remained open after cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for capture wrapper to stop")
 	}
 }
 

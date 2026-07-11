@@ -23,12 +23,13 @@ import (
 )
 
 type websocketReplayCaptureExecutor struct {
-	mu           sync.Mutex
-	payloads     [][]byte
-	authIDs      []string
-	failureEvent string
-	done         chan struct{}
-	doneOnce     sync.Once
+	mu             sync.Mutex
+	payloads       [][]byte
+	authIDs        []string
+	failureEvent   string
+	replayFailures int
+	done           chan struct{}
+	doneOnce       sync.Once
 }
 
 func (e *websocketReplayCaptureExecutor) Identifier() string { return "codex" }
@@ -59,12 +60,93 @@ func (e *websocketReplayCaptureExecutor) ExecuteStream(_ context.Context, auth *
 			chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}`)}
 		}
 	case 3:
-		chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"resp-3","output":[{"type":"message","id":"assistant-2","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}]}}`)}
+		if e.replayFailures > 0 {
+			e.replayFailures--
+			chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.failed","response":{"error":{"code":"server_error","message":"replay failed"}}}`)}
+		} else {
+			chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"type":"response.completed","response":{"id":"resp-3","output":[{"type":"message","id":"assistant-2","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}]}}`)}
+		}
 	default:
 		chunks <- coreexecutor.StreamChunk{Payload: []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","output":[]}}`, call))}
 	}
 	close(chunks)
 	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func TestResponsesWebsocketPassthroughKeepsTranscriptReplayArmedUntilSuccess(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &websocketReplayCaptureExecutor{
+		done:           make(chan struct{}),
+		failureEvent:   "response.failed",
+		replayFailures: 1,
+	}
+	manager := coreauth.NewManager(nil, &orderedWebsocketSelector{order: []string{"auth-replay-a", "auth-replay-a", "auth-replay-b", "auth-replay-b"}}, nil)
+	manager.RegisterExecutor(executor)
+	auths := []*coreauth.Auth{
+		{ID: "auth-replay-a", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "true"}},
+		{ID: "auth-replay-b", Provider: "codex", Status: coreauth.StatusActive, Attributes: map[string]string{"websockets": "true"}},
+	}
+	for _, auth := range auths {
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("Register auth %s: %v", auth.ID, err)
+		}
+	}
+	modelName := "test-replay-failure-model"
+	for _, auth := range auths {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: modelName}})
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		}
+	})
+
+	handler := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	router := gin.New()
+	router.GET("/v1/responses/ws", handler.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses/ws", nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	requests := [][]byte{
+		[]byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-1","role":"user","content":"first"}]}`, modelName)),
+		[]byte(`{"type":"response.create","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-2","role":"user","content":"second"}]}`),
+		[]byte(`{"type":"response.create","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-2","role":"user","content":"second"}]}`),
+		[]byte(`{"type":"response.create","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-2","role":"user","content":"second"}]}`),
+	}
+	for i, request := range requests {
+		if errWrite := conn.WriteMessage(websocket.TextMessage, request); errWrite != nil {
+			t.Fatalf("write request %d: %v", i+1, errWrite)
+		}
+		for {
+			_, response, errRead := conn.ReadMessage()
+			if errRead != nil {
+				t.Fatalf("read response %d: %v", i+1, errRead)
+			}
+			eventType := gjson.GetBytes(response, "type").String()
+			if eventType == "response.completed" || eventType == "response.failed" || eventType == "response.error" {
+				break
+			}
+		}
+	}
+
+	payloads := executor.Payloads()
+	if len(payloads) != 4 {
+		t.Fatalf("upstream payload count = %d, want 4", len(payloads))
+	}
+	for _, index := range []int{2, 3} {
+		if gjson.GetBytes(payloads[index], "previous_response_id").Exists() {
+			t.Fatalf("replay attempt %d resumed passthrough before success: %s", index-1, payloads[index])
+		}
+		if got := len(gjson.GetBytes(payloads[index], "input").Array()); got != 3 {
+			t.Fatalf("replay attempt %d input length = %d, want full transcript: %s", index-1, got, payloads[index])
+		}
+	}
 }
 
 func (e *websocketReplayCaptureExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {

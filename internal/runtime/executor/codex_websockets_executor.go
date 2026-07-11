@@ -149,9 +149,10 @@ type codexWebsocketReader struct {
 }
 
 type finalizedCodexWebsocketRequest struct {
-	headers       http.Header
-	body          []byte
-	identityState codexIdentityConfuseState
+	headers        http.Header
+	body           []byte
+	identityState  codexIdentityConfuseState
+	connGeneration uint64
 }
 
 func (s *codexWebsocketSession) setActive(conn *websocket.Conn, generation uint64) *codexWebsocketReader {
@@ -321,8 +322,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer sess.reqMu.Unlock()
 		wsHeaders.Set("session_id", executionSessionID)
 	}
-	prepareUpstreamConnState(sess, authID, wsURL)
-
 	ginHeaders := extractCodexClientMetadataHeaders(ctx)
 	finalized := finalizeCodexWebsocketRequest(e.cfg, auth, originalPayloadSource, body, sess, executionSessionID, wsHeaders, ginHeaders)
 	wsReqBody := finalized.body
@@ -341,6 +340,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, finalized.headers)
+	if sess != nil && sess.connGeneration != finalized.connGeneration {
+		finalized = finalizeCodexWebsocketRequest(e.cfg, auth, originalPayloadSource, body, sess, executionSessionID, wsHeaders, ginHeaders)
+		wsReqBody = finalized.body
+	}
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
 		if respHS != nil {
@@ -594,8 +597,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 		wsHeaders.Set("session_id", executionSessionID)
 	}
-	prepareUpstreamConnState(sess, authID, wsURL)
-
 	ginHeaders := extractCodexClientMetadataHeaders(ctx)
 	finalized := finalizeCodexWebsocketRequest(e.cfg, auth, userPayload, body, sess, executionSessionID, wsHeaders, ginHeaders)
 	wsReqBody := finalized.body
@@ -614,6 +615,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, finalized.headers)
+	if sess != nil && sess.connGeneration != finalized.connGeneration {
+		finalized = finalizeCodexWebsocketRequest(e.cfg, auth, userPayload, body, sess, executionSessionID, wsHeaders, ginHeaders)
+		wsReqBody = finalized.body
+	}
 	var upstreamHeaders http.Header
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
@@ -2014,39 +2019,35 @@ func (e *CodexWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-cha
 	return sess.upstreamDisconnectCh
 }
 
-func prepareUpstreamConnState(sess *codexWebsocketSession, authID, wsURL string) {
-	if sess == nil {
-		return
-	}
-	sess.connMu.Lock()
-	if sess.windowGen == 0 {
-		sess.windowGen = 1
-	}
-	conn := sess.conn
-	boundAuthID := sess.authID
-	boundWSURL := sess.wsURL
-	connCreatedAt := sess.connCreatedAt
-	sess.connMu.Unlock()
-
-	switch {
-	case conn == nil:
-		return
-	case boundAuthID != authID || boundWSURL != wsURL:
-		recycleUpstreamConn(sess, conn, "auth_or_url_changed", nil)
-	case !connCreatedAt.IsZero() && time.Since(connCreatedAt) >= codexWebsocketConnectionMaxAge:
-		recycleUpstreamConn(sess, conn, "connection_max_age", nil)
-	}
-}
-
 func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
 	if sess == nil {
 		return e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 	}
 
 	sess.connMu.Lock()
+	if sess.windowGen == 0 {
+		sess.windowGen = 1
+	}
 	conn := sess.conn
 	readerConn := sess.readerConn
+	boundAuthID := sess.authID
+	boundWSURL := sess.wsURL
+	connCreatedAt := sess.connCreatedAt
 	sess.connMu.Unlock()
+	if conn != nil {
+		switch {
+		case boundAuthID != authID || boundWSURL != wsURL:
+			recycleUpstreamConn(sess, conn, "auth_or_url_changed", nil)
+			refreshCodexWindowHeaderGeneration(headers, sess)
+			headers.Del("x-codex-turn-state")
+			conn = nil
+		case !connCreatedAt.IsZero() && time.Since(connCreatedAt) >= codexWebsocketConnectionMaxAge:
+			recycleUpstreamConn(sess, conn, "connection_max_age", nil)
+			refreshCodexWindowHeaderGeneration(headers, sess)
+			headers.Del("x-codex-turn-state")
+			conn = nil
+		}
+	}
 	if conn != nil {
 		if readerConn != conn {
 			sess.connMu.Lock()
@@ -2086,6 +2087,21 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	go e.pingUpstreamLoop(sess, conn, gen)
 	logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
 	return conn, resp, nil
+}
+
+func refreshCodexWindowHeaderGeneration(headers http.Header, sess *codexWebsocketSession) {
+	if headers == nil || sess == nil {
+		return
+	}
+	windowID := strings.TrimSpace(headers.Get("x-codex-window-id"))
+	prefix, _, ok := strings.Cut(windowID, ":")
+	if !ok || prefix == "" {
+		return
+	}
+	sess.connMu.Lock()
+	generation := sess.windowGen
+	sess.connMu.Unlock()
+	headers.Set("x-codex-window-id", fmt.Sprintf("%s:%d", prefix, generation))
 }
 
 func (e *CodexWebsocketsExecutor) pingUpstreamLoop(sess *codexWebsocketSession, conn *websocket.Conn, gen uint64) {
@@ -2512,6 +2528,12 @@ func finalizeCodexWebsocketRequest(
 	hdrs codexClientMetadataHeaders,
 ) finalizedCodexWebsocketRequest {
 	headers := baseHeaders.Clone()
+	var connGeneration uint64
+	if sess != nil {
+		sess.connMu.Lock()
+		connGeneration = sess.connGeneration
+		sess.connMu.Unlock()
+	}
 	_, finalizedBody := applyCurrentSessionMetadata(sess, executionSessionID, headers, body, hdrs)
 	sessionWindowID := strings.TrimSpace(gjson.GetBytes(finalizedBody, "client_metadata.x-codex-window-id").String())
 	finalizedBody, identityState := applyCodexIdentityConfuseBody(cfg, auth, userPayload, finalizedBody)
@@ -2528,9 +2550,10 @@ func finalizeCodexWebsocketRequest(
 		headers.Set("x-codex-window-id", windowID)
 	}
 	return finalizedCodexWebsocketRequest{
-		headers:       headers,
-		body:          finalizedBody,
-		identityState: identityState,
+		headers:        headers,
+		body:           finalizedBody,
+		identityState:  identityState,
+		connGeneration: connGeneration,
 	}
 }
 
@@ -2823,7 +2846,7 @@ func (e *CodexAutoExecutor) bridgedExecuteStream(ctx context.Context, auth *clip
 		}
 	}
 
-	if err != nil || turn.reconnectedDelta {
+	if err != nil {
 		if isUpgradeRequiredError(err) {
 			e.disableWS(sessionKey)
 			bridge.Reset(sessionKey)
@@ -2839,17 +2862,7 @@ func (e *CodexAutoExecutor) bridgedExecuteStream(ctx context.Context, auth *clip
 			return nil, nil, false
 		}
 
-		if turn.reconnectedDelta {
-			log.Infof("codex http-ws bridge: WS reconnected during delta session=%s (gen %d→%d), retrying full", sessionKey, turn.genBefore, turn.genAfter)
-		} else {
-			log.Infof("codex http-ws bridge: connection limit before output session=%s, retrying fresh websocket", sessionKey)
-		}
-		if result != nil && result.Chunks != nil {
-			go func(ch <-chan cliproxyexecutor.StreamChunk) {
-				for range ch {
-				}
-			}(result.Chunks)
-		}
+		log.Infof("codex http-ws bridge: connection limit before output session=%s, retrying fresh websocket", sessionKey)
 		bridge.Reset(sessionKey)
 		e.wsExec.closeExecutionSession(e.getWSSession(sessionKey), "bootstrap_retry")
 		turn = e.snapshotBridgeTurn(sessionKey, bridge)
@@ -2871,7 +2884,7 @@ func (e *CodexAutoExecutor) bridgedExecuteStream(ctx context.Context, auth *clip
 	}
 
 	telemetry := turn.telemetry(e.connGeneration(sessionKey))
-	result = e.wrapBridgedStreamForCapture(sessionKey, model, authID, req.Payload, result, telemetry)
+	result = e.wrapBridgedStreamForCapture(ctx, sessionKey, model, authID, req.Payload, result, telemetry)
 	return result, nil, true
 }
 
@@ -3105,28 +3118,35 @@ func (o *codexBridgeCaptureObserver) observeChunk(payload []byte) {
 	}
 }
 
-func (e *CodexAutoExecutor) wrapBridgedStreamForCapture(sessionKey, model, authID string, requestPayload []byte, result *cliproxyexecutor.StreamResult, telemetry bridgeTurnTelemetry) *cliproxyexecutor.StreamResult {
+func (e *CodexAutoExecutor) wrapBridgedStreamForCapture(ctx context.Context, sessionKey, model, authID string, requestPayload []byte, result *cliproxyexecutor.StreamResult, telemetry bridgeTurnTelemetry) *cliproxyexecutor.StreamResult {
 	if result != nil && result.Headers != nil {
 		primary := result.Headers.Get("x-codex-primary-used-percent")
 		secondary := result.Headers.Get("x-codex-secondary-primary-used-percent")
 		if primary != "" || secondary != "" {
 			log.Infof("codex http-ws bridge: quota session=%s primary_used=%s%% weekly_used=%s%%", sessionKey, primary, secondary)
 		}
-		// Emit the quota utilization gauge so the WS-bridged Codex path feeds the
-		// same cliproxy.quota.utilization series as the HTTP path. ctx is not in
-		// this function's signature; the gauge attributes carry full identity, so
-		// a background context is sufficient for the OTel SDK. authIndex is not in
-		// scope here; authID identifies the credential.
-		observability.RecordQuotaFromHeaders(context.Background(), e.Identifier(), "", authID, result.Headers)
+		observability.RecordQuotaFromHeaders(ctx, e.Identifier(), "", authID, result.Headers)
 	}
 
 	wrappedCh := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(wrappedCh)
 		observer := newCodexBridgeCaptureObserver(e, sessionKey, model, authID, requestPayload, telemetry)
-		for chunk := range result.Chunks {
-			wrappedCh <- chunk
-			observer.observeChunk(chunk.Payload)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case chunk, ok := <-result.Chunks:
+				if !ok {
+					return
+				}
+				select {
+				case wrappedCh <- chunk:
+					observer.observeChunk(chunk.Payload)
+				case <-ctx.Done():
+					return
+				}
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: wrappedCh}

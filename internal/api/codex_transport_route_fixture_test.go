@@ -3,11 +3,13 @@ package api
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,9 +20,12 @@ import (
 	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/tidwall/sjson"
 )
 
 type codexRouteUpstreamMode int
+
+var codexTransportRouteFixtureSequence atomic.Uint64
 
 const (
 	codexRouteUpstreamSuccess codexRouteUpstreamMode = iota
@@ -35,6 +40,7 @@ const (
 
 type codexTransportRouteFixture struct {
 	server       *Server
+	sessionID    string
 	wsRequests   atomic.Int32
 	httpRequests atomic.Int32
 	mu           sync.Mutex
@@ -44,6 +50,11 @@ type codexTransportRouteFixture struct {
 func newCodexTransportRouteFixture(t *testing.T, configYAML string, mode codexRouteUpstreamMode) *codexTransportRouteFixture {
 	t.Helper()
 	fixture := &codexTransportRouteFixture{}
+	fixture.sessionID = fmt.Sprintf(
+		"codex-route-%s-%d",
+		strings.NewReplacer("/", "-", " ", "-").Replace(t.Name()),
+		codexTransportRouteFixtureSequence.Add(1),
+	)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
@@ -119,6 +130,7 @@ func newCodexTransportRouteFixture(t *testing.T, configYAML string, mode codexRo
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 
 	fixture.server = NewServer(cfg, manager, sdkaccess.NewManager(), filepath.Join(tmpDir, "config.yaml"))
+	t.Cleanup(func() { manager.CloseExecutionSession(fixture.sessionID) })
 	return fixture
 }
 
@@ -130,6 +142,10 @@ func (f *codexTransportRouteFixture) recordUpstreamBody(payload []byte) {
 
 func (f *codexTransportRouteFixture) request(t *testing.T, path string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
+	body, err := sjson.SetBytes(body, "prompt_cache_key", f.sessionID)
+	if err != nil {
+		t.Fatalf("set fixture prompt cache key: %v", err)
+	}
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
