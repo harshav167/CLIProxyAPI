@@ -1,7 +1,7 @@
 // Package kimi implements thinking configuration for Kimi (Moonshot AI) models.
 //
-// Kimi K3 uses the OpenAI-compatible reasoning_effort field. K2.x models use
-// thinking.type to control thinking and reject reasoning_effort.
+// Kimi K3 uses thinking.type/effort/keep. K2.x models use thinking.type and
+// reject reasoning_effort.
 package kimi
 
 import (
@@ -16,7 +16,7 @@ import (
 // Applier implements thinking.ProviderApplier for Kimi models.
 //
 // Kimi-specific behavior:
-//   - K3: reasoning_effort="max"; thinking cannot be disabled.
+//   - K3: thinking is always enabled at low, high, or max effort.
 //   - K2.x: thinking.type="enabled" or "disabled".
 type Applier struct{}
 
@@ -54,7 +54,20 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 	wireThinking := classifyModelWireThinking(modelInfo.ID)
-	if wireThinking != modelWireThinkingConfigurable {
+	switch wireThinking {
+	case modelWireThinkingK3:
+		effort := kimiReasoningEffort(config)
+		switch effort {
+		case "low", "high", "max":
+		default:
+			effort = "max"
+		}
+		bodyWithEffort, err := sjson.SetBytes(validKimiBody(body), "thinking.effort", effort)
+		if err != nil {
+			return body, fmt.Errorf("kimi thinking: failed to set requested K3 effort: %w", err)
+		}
+		return EnforceModelWireThinking(bodyWithEffort, modelInfo.ID)
+	case modelWireThinkingAlwaysEnabled:
 		return EnforceModelWireThinking(body, modelInfo.ID)
 	}
 

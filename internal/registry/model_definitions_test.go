@@ -104,9 +104,11 @@ func TestGetKimiModelsIncludesLiveCodingCatalog(t *testing.T) {
 			thinking: func(support *ThinkingSupport) bool {
 				return support != nil &&
 					!support.ZeroAllowed &&
-					!support.DynamicAllowed &&
-					len(support.Levels) == 1 &&
-					support.Levels[0] == "max"
+					support.DynamicAllowed &&
+					len(support.Levels) == 3 &&
+					support.Levels[0] == "low" &&
+					support.Levels[1] == "high" &&
+					support.Levels[2] == "max"
 			},
 		},
 		"kimi-for-coding": {

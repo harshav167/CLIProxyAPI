@@ -131,6 +131,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// GLM-specific request rewrite — see helps.NormalizeGLMRequestBody for the
 	// thinking/reasoning_effort coupling and unsupported field stripping.
 	translated = helps.NormalizeGLMRequestBody(translated, e.Identifier(), baseModel)
+	if helps.IsKimiFamilyModel(baseModel) {
+		translated = normalizeKimiToolSchemaRefs(translated)
+	}
 	// Alibaba Token Plan explicit cache_control injection — converts the
 	// system+tools prefix and the previous-turn boundary from best-effort 20%
 	// implicit cache hits to deterministic 10% explicit cache hits. No-op for
@@ -342,6 +345,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// GLM-specific request rewrite — see helps.NormalizeGLMRequestBody for the
 	// thinking/reasoning_effort coupling and unsupported field stripping.
 	translated = helps.NormalizeGLMRequestBody(translated, e.Identifier(), baseModel)
+	if helps.IsKimiFamilyModel(baseModel) {
+		translated = normalizeKimiToolSchemaRefs(translated)
+	}
 	// Alibaba Token Plan explicit cache_control injection — converts the
 	// system+tools prefix and the previous-turn boundary from best-effort 20%
 	// implicit cache hits to deterministic 10% explicit cache hits. No-op for

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 
@@ -8,16 +9,25 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestKimiPostOverrideThinking_ConfiguresK3WithoutCallerSetting(t *testing.T) {
-	out, err := kimithinking.EnforceModelWireThinking([]byte(`{"messages":[]}`), "k3")
+func TestKimiPostOverrideThinking_ConfiguresK3WithCallerEffort(t *testing.T) {
+	out, err := kimithinking.EnforceModelWireThinking(
+		[]byte(`{"messages":[],"thinking":{"effort":"low"}}`),
+		"k3",
+	)
 	if err != nil {
 		t.Fatalf("EnforceModelWireThinking() error = %v", err)
 	}
-	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "max" {
-		t.Fatalf("reasoning_effort = %q, want max; body=%s", got, out)
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be absent; body=%s", out)
 	}
-	if gjson.GetBytes(out, "thinking").Exists() {
-		t.Fatalf("K3 thinking object should be absent; body=%s", out)
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled; body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.effort").String(); got != "low" {
+		t.Fatalf("thinking.effort = %q, want low; body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.keep").String(); got != "all" {
+		t.Fatalf("thinking.keep = %q, want all; body=%s", got, out)
 	}
 }
 
@@ -34,6 +44,54 @@ func TestKimiPostOverrideThinking_ForcesCodingAliasThinking(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
 		t.Fatalf("thinking.type = %q, want enabled; body=%s", got, out)
+	}
+}
+
+func TestApplyKimiHeadersMatchesCurrentKimiCodeCLI(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.kimi.com/coding/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+
+	applyKimiHeaders(req, "token", true)
+
+	want := map[string]string{
+		"User-Agent":                  "kimi-code-cli/0.26.0",
+		"X-Msh-Platform":              "kimi_code_cli",
+		"X-Msh-Version":               "0.26.0",
+		"X-Stainless-Retry-Count":     "0",
+		"X-Stainless-Lang":            "js",
+		"X-Stainless-Package-Version": "6.34.0",
+		"X-Stainless-Runtime":         "node",
+		"X-Stainless-Runtime-Version": "v24.18.0",
+		"Accept":                      "text/event-stream",
+	}
+	for name, expected := range want {
+		if got := req.Header.Get(name); got != expected {
+			t.Fatalf("%s = %q, want %q", name, got, expected)
+		}
+	}
+	if req.Header.Get("X-Stainless-Os") == "" {
+		t.Fatal("X-Stainless-Os should be set")
+	}
+	if req.Header.Get("X-Stainless-Arch") == "" {
+		t.Fatal("X-Stainless-Arch should be set")
+	}
+	if req.Header.Get("X-Msh-Os-Version") == "" {
+		t.Fatal("X-Msh-Os-Version should be set")
+	}
+}
+
+func TestApplyKimiHeadersUsesJSONAcceptForNonStream(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://api.kimi.com/coding/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+
+	applyKimiHeaders(req, "token", false)
+
+	if got := req.Header.Get("Accept"); got != "application/json" {
+		t.Fatalf("Accept = %q, want application/json", got)
 	}
 }
 

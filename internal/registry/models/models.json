@@ -2099,8 +2099,10 @@
       ],
       "thinking": {
         "zero_allowed": false,
-        "dynamic_allowed": false,
+        "dynamic_allowed": true,
         "levels": [
+          "low",
+          "high",
           "max"
         ]
       }

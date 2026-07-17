@@ -8,28 +8,34 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestApplyK3AlwaysUsesMaxReasoningEffort(t *testing.T) {
+func TestApplyK3UsesRequestedValidEffort(t *testing.T) {
 	applier := NewApplier()
 	model := &registry.ModelInfo{
 		ID: "k3",
 		Thinking: &registry.ThinkingSupport{
-			Levels: []string{"max"},
+			Levels: []string{"low", "high", "max"},
 		},
 	}
 
 	out, err := applier.Apply(
-		[]byte(`{"thinking":{"type":"disabled"},"reasoning_effort":"low"}`),
-		thinking.ThinkingConfig{Mode: thinking.ModeNone},
+		[]byte(`{"thinking":{"type":"disabled"},"reasoning_effort":"max"}`),
+		thinking.ThinkingConfig{Mode: thinking.ModeLevel, Level: thinking.LevelHigh},
 		model,
 	)
 	if err != nil {
 		t.Fatalf("Apply() error = %v", err)
 	}
-	if gjson.GetBytes(out, "thinking").Exists() {
-		t.Fatalf("K3 thinking object should be removed, got %s", out)
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("K3 reasoning_effort should be removed, got %s", out)
 	}
-	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "max" {
-		t.Fatalf("K3 reasoning_effort = %q, want max; body=%s", got, out)
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("K3 thinking.type = %q, want enabled; body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.effort").String(); got != "high" {
+		t.Fatalf("K3 thinking.effort = %q, want high; body=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.keep").String(); got != "all" {
+		t.Fatalf("K3 thinking.keep = %q, want all; body=%s", got, out)
 	}
 }
 

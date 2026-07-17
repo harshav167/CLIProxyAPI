@@ -106,6 +106,110 @@ func TestOpenAICompatExecutorPayloadOverrideWinsOverThinkingSuffix(t *testing.T)
 	}
 }
 
+func TestOpenAICompatExecutorNormalizesKimiToolSchemaRefs(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("zenmux", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{"model":"kimi-k3-free","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"UpdateCurrentStep","parameters":{"type":"object","properties":{"current_step":{"type":"string","minLength":1},"completed_subtitle":{"$ref":"#/properties/current_step","description":"Past tense"}}}}}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "kimi-k3-free",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if gjson.GetBytes(gotBody, `tools.0.function.parameters.properties.completed_subtitle.$ref`).Exists() {
+		t.Fatalf("Kimi schema $ref should be inlined; body=%s", gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "tools.0.function.parameters.properties.completed_subtitle.type").String(); got != "string" {
+		t.Fatalf("completed_subtitle.type = %q, want string; body=%s", got, gotBody)
+	}
+}
+
+func TestOpenAICompatExecutorLeavesNonKimiToolSchemaRefs(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("zenmux", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{"model":"custom-openai","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"UpdateCurrentStep","parameters":{"type":"object","properties":{"current_step":{"type":"string"},"completed_subtitle":{"$ref":"#/properties/current_step"}}}}}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "custom-openai",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, `tools.0.function.parameters.properties.completed_subtitle.$ref`).String(); got != "#/properties/current_step" {
+		t.Fatalf("non-Kimi schema $ref = %q, want unchanged; body=%s", got, gotBody)
+	}
+}
+
+func TestOpenAICompatExecutorStreamNormalizesKimiToolSchemaRefs(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("zenmux", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	payload := []byte(`{"model":"kimi-k3-free","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"UpdateCurrentStep","parameters":{"type":"object","properties":{"current_step":{"type":"string"},"completed_subtitle":{"$ref":"#/properties/current_step"}}}}}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "kimi-k3-free",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for range result.Chunks {
+	}
+	if gjson.GetBytes(gotBody, `tools.0.function.parameters.properties.completed_subtitle.$ref`).Exists() {
+		t.Fatalf("streaming Kimi schema $ref should be inlined; body=%s", gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "tools.0.function.parameters.properties.completed_subtitle.type").String(); got != "string" {
+		t.Fatalf("completed_subtitle.type = %q, want string; body=%s", got, gotBody)
+	}
+}
+
 func TestOpenAICompatExecutorImagesGenerationsPassthrough(t *testing.T) {
 	var gotPath string
 	var gotBody []byte
