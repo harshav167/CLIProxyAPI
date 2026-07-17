@@ -59,9 +59,13 @@ func TestApplyKimiHeadersMatchesCurrentKimiCodeCLI(t *testing.T) {
 		"User-Agent":                  "kimi-code-cli/0.26.0",
 		"X-Msh-Platform":              "kimi_code_cli",
 		"X-Msh-Version":               "0.26.0",
+		"X-Msh-Device-Model":          "macOS 27.0 arm64",
+		"X-Msh-Os-Version":            "27.0.0",
 		"X-Stainless-Retry-Count":     "0",
 		"X-Stainless-Lang":            "js",
 		"X-Stainless-Package-Version": "6.34.0",
+		"X-Stainless-Os":              "MacOS",
+		"X-Stainless-Arch":            "arm64",
 		"X-Stainless-Runtime":         "node",
 		"X-Stainless-Runtime-Version": "v24.18.0",
 		"Accept":                      "text/event-stream",
@@ -70,15 +74,6 @@ func TestApplyKimiHeadersMatchesCurrentKimiCodeCLI(t *testing.T) {
 		if got := req.Header.Get(name); got != expected {
 			t.Fatalf("%s = %q, want %q", name, got, expected)
 		}
-	}
-	if req.Header.Get("X-Stainless-Os") == "" {
-		t.Fatal("X-Stainless-Os should be set")
-	}
-	if req.Header.Get("X-Stainless-Arch") == "" {
-		t.Fatal("X-Stainless-Arch should be set")
-	}
-	if req.Header.Get("X-Msh-Os-Version") == "" {
-		t.Fatal("X-Msh-Os-Version should be set")
 	}
 }
 

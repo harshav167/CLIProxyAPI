@@ -901,6 +901,10 @@ const (
 	kimiCodeCLIVersion        = "0.26.0"
 	kimiCodeSDKPackageVersion = "6.34.0"
 	kimiCodeNodeVersion       = "v24.18.0"
+	kimiCodeDeviceModel       = "macOS 27.0 arm64"
+	kimiCodeOSVersion         = "27.0.0"
+	kimiCodeStainlessOS       = "MacOS"
+	kimiCodeStainlessArch     = "arm64"
 )
 
 // applyKimiHeaders sets required headers for Kimi API requests.
@@ -912,14 +916,14 @@ func applyKimiHeaders(r *http.Request, token string, stream bool) {
 	r.Header.Set("X-Msh-Platform", "kimi_code_cli")
 	r.Header.Set("X-Msh-Version", kimiCodeCLIVersion)
 	r.Header.Set("X-Msh-Device-Name", getKimiHostname())
-	r.Header.Set("X-Msh-Device-Model", getKimiDeviceModel())
-	r.Header.Set("X-Msh-Os-Version", getKimiOSVersion())
+	r.Header.Set("X-Msh-Device-Model", kimiCodeDeviceModel)
+	r.Header.Set("X-Msh-Os-Version", kimiCodeOSVersion)
 	r.Header.Set("X-Msh-Device-Id", getKimiDeviceID())
 	r.Header.Set("X-Stainless-Retry-Count", "0")
 	r.Header.Set("X-Stainless-Lang", "js")
 	r.Header.Set("X-Stainless-Package-Version", kimiCodeSDKPackageVersion)
-	r.Header.Set("X-Stainless-Os", getKimiStainlessOS())
-	r.Header.Set("X-Stainless-Arch", getKimiStainlessArch())
+	r.Header.Set("X-Stainless-Os", kimiCodeStainlessOS)
+	r.Header.Set("X-Stainless-Arch", kimiCodeStainlessArch)
 	r.Header.Set("X-Stainless-Runtime", "node")
 	r.Header.Set("X-Stainless-Runtime-Version", kimiCodeNodeVersion)
 	if stream {
@@ -983,46 +987,6 @@ func getKimiHostname() string {
 		return "unknown"
 	}
 	return hostname
-}
-
-// getKimiDeviceModel returns a device model string matching Kimi Code CLI format.
-func getKimiDeviceModel() string {
-	return fmt.Sprintf("%s %s %s", getKimiDeviceOSName(), getKimiOSVersion(), runtime.GOARCH)
-}
-
-func getKimiDeviceOSName() string {
-	if runtime.GOOS == "darwin" {
-		return "macOS"
-	}
-	return runtime.GOOS
-}
-
-func getKimiStainlessOS() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return "MacOS"
-	case "windows":
-		return "Windows"
-	case "linux":
-		return "Linux"
-	case "freebsd":
-		return "FreeBSD"
-	default:
-		return "Other::" + runtime.GOOS
-	}
-}
-
-func getKimiStainlessArch() string {
-	switch runtime.GOARCH {
-	case "amd64":
-		return "x64"
-	case "arm64":
-		return "arm64"
-	case "386":
-		return "x86"
-	default:
-		return "other::" + runtime.GOARCH
-	}
 }
 
 // getKimiDeviceID returns a stable device ID, matching kimi-cli storage location.
