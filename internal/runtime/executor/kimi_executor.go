@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	kimithinking "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -99,9 +100,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
 
-	// Strip kimi- prefix for upstream API
-	upstreamModel := stripKimiPrefix(baseModel)
-	body, err = sjson.SetBytes(body, "model", upstreamModel)
+	body, err = sjson.SetBytes(body, "model", strings.TrimSpace(baseModel))
 	if err != nil {
 		return resp, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
 	}
@@ -114,6 +113,10 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body, err = kimithinking.EnforceModelWireThinking(body, baseModel)
+	if err != nil {
+		return resp, err
+	}
 	body, err = normalizeKimiToolMessageLinks(body)
 	if err != nil {
 		return resp, err
@@ -210,9 +213,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
 
-	// Strip kimi- prefix for upstream API
-	upstreamModel := stripKimiPrefix(baseModel)
-	body, err = sjson.SetBytes(body, "model", upstreamModel)
+	body, err = sjson.SetBytes(body, "model", strings.TrimSpace(baseModel))
 	if err != nil {
 		return nil, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
 	}
@@ -229,6 +230,10 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body, err = kimithinking.EnforceModelWireThinking(body, baseModel)
+	if err != nil {
+		return nil, err
+	}
 	body, err = normalizeKimiToolMessageLinks(body)
 	if err != nil {
 		return nil, err
@@ -1020,13 +1025,4 @@ func kimiCreds(a *cliproxyauth.Auth) (token string) {
 		}
 	}
 	return ""
-}
-
-// stripKimiPrefix removes the "kimi-" prefix from model names for the upstream API.
-func stripKimiPrefix(model string) string {
-	model = strings.TrimSpace(model)
-	if strings.HasPrefix(strings.ToLower(model), "kimi-") {
-		return model[5:]
-	}
-	return model
 }

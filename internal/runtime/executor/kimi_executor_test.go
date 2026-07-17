@@ -4,8 +4,38 @@ import (
 	"strings"
 	"testing"
 
+	kimithinking "github.com/router-for-me/CLIProxyAPI/v7/internal/thinking/provider/kimi"
 	"github.com/tidwall/gjson"
 )
+
+func TestKimiPostOverrideThinking_ConfiguresK3WithoutCallerSetting(t *testing.T) {
+	out, err := kimithinking.EnforceModelWireThinking([]byte(`{"messages":[]}`), "k3")
+	if err != nil {
+		t.Fatalf("EnforceModelWireThinking() error = %v", err)
+	}
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "max" {
+		t.Fatalf("reasoning_effort = %q, want max; body=%s", got, out)
+	}
+	if gjson.GetBytes(out, "thinking").Exists() {
+		t.Fatalf("K3 thinking object should be absent; body=%s", out)
+	}
+}
+
+func TestKimiPostOverrideThinking_ForcesCodingAliasThinking(t *testing.T) {
+	out, err := kimithinking.EnforceModelWireThinking(
+		[]byte(`{"reasoning_effort":"high","thinking":{"type":"disabled"}}`),
+		"kimi-for-coding",
+	)
+	if err != nil {
+		t.Fatalf("EnforceModelWireThinking() error = %v", err)
+	}
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("K2.7 Coding reasoning_effort should be absent; body=%s", out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled; body=%s", got, out)
+	}
+}
 
 // TestNormalizeKimiToolSchemaRefs_InlinesSiblingRef reproduces the exact prod
 // failure: Cursor's UpdateCurrentStep tool has final_summary / completed_subtitle

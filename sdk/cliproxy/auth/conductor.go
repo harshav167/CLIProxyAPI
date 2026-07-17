@@ -3473,10 +3473,57 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		return 0, false
 	}
 	retryAfter := retryAfterFromError(err)
-	if retryAfter == nil || *retryAfter <= 0 || *retryAfter > maxWait {
+	if retryAfter != nil && *retryAfter > 0 && *retryAfter <= maxWait {
+		return *retryAfter, true
+	}
+	if !isKimiEngineOverloadedError(err, providers) {
 		return 0, false
 	}
-	return *retryAfter, true
+	return kimiEngineOverloadRetryDelay(attempt, maxWait), true
+}
+
+func isKimiEngineOverloadedError(err error, providers []string) bool {
+	if err == nil || statusCodeFromError(err) != http.StatusTooManyRequests {
+		return false
+	}
+	hasKimi := false
+	for _, provider := range providers {
+		if strings.EqualFold(strings.TrimSpace(provider), "kimi") {
+			hasKimi = true
+			break
+		}
+	}
+	if !hasKimi {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "engine_overloaded_error") ||
+		(strings.Contains(message, "engine") && strings.Contains(message, "overloaded"))
+}
+
+func kimiEngineOverloadRetryDelay(attempt int, maxWait time.Duration) time.Duration {
+	if maxWait <= 0 {
+		return 0
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	const baseDelay = 250 * time.Millisecond
+	const jitterWindow = 125 * time.Millisecond
+	shift := attempt
+	if shift > 10 {
+		shift = 10
+	}
+	delay := baseDelay * time.Duration(1<<shift)
+	jitterRange := jitterWindow
+	if maxWait < jitterRange {
+		jitterRange = maxWait
+	}
+	jitter := time.Duration(time.Now().UnixNano()%int64(jitterRange)) + 1
+	if delay >= maxWait || jitter >= maxWait-delay {
+		return maxWait
+	}
+	return delay + jitter
 }
 
 func waitForCooldown(ctx context.Context, wait time.Duration) error {

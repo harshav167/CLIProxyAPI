@@ -1,7 +1,7 @@
 // Package kimi implements thinking configuration for Kimi (Moonshot AI) models.
 //
-// Kimi models use the OpenAI-compatible reasoning_effort format for enabled thinking
-// levels, but use thinking.type=disabled when thinking is explicitly turned off.
+// Kimi K3 uses the OpenAI-compatible reasoning_effort field. K2.x models use
+// thinking.type to control thinking and reject reasoning_effort.
 package kimi
 
 import (
@@ -16,9 +16,8 @@ import (
 // Applier implements thinking.ProviderApplier for Kimi models.
 //
 // Kimi-specific behavior:
-//   - Enabled thinking: reasoning_effort (string levels)
-//   - Disabled thinking: thinking.type="disabled"
-//   - Supports budget-to-level conversion
+//   - K3: reasoning_effort="max"; thinking cannot be disabled.
+//   - K2.x: thinking.type="enabled" or "disabled".
 type Applier struct{}
 
 var _ thinking.ProviderApplier = (*Applier)(nil)
@@ -54,44 +53,52 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	if modelInfo.Thinking == nil {
 		return body, nil
 	}
+	wireThinking := classifyModelWireThinking(modelInfo.ID)
+	if wireThinking != modelWireThinkingConfigurable {
+		return EnforceModelWireThinking(body, modelInfo.ID)
+	}
 
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		body = []byte(`{}`)
 	}
 
-	var effort string
+	enabled := false
 	switch config.Mode {
 	case thinking.ModeLevel:
 		if config.Level == "" {
 			return body, nil
 		}
-		effort = string(config.Level)
+		enabled = config.Level != thinking.LevelNone
 	case thinking.ModeNone:
-		// Respect clamped fallback level for models that cannot disable thinking.
 		if config.Level != "" && config.Level != thinking.LevelNone {
-			effort = string(config.Level)
+			enabled = true
 			break
 		}
-		// Kimi requires explicit disabled thinking object.
 		return applyDisabledThinking(body)
 	case thinking.ModeBudget:
-		// Convert budget to level using threshold mapping
-		level, ok := thinking.ConvertBudgetToLevel(config.Budget)
-		if !ok {
-			return body, nil
-		}
-		effort = level
+		enabled = config.Budget != 0
 	case thinking.ModeAuto:
-		// Auto mode maps to "auto" effort
-		effort = string(thinking.LevelAuto)
+		enabled = true
 	default:
 		return body, nil
 	}
 
-	if effort == "" {
-		return body, nil
+	if enabled {
+		return applyReasoningEffort(body, kimiReasoningEffort(config))
 	}
-	return applyReasoningEffort(body, effort)
+	return applyDisabledThinking(body)
+}
+
+func kimiReasoningEffort(config thinking.ThinkingConfig) string {
+	if config.Level != "" && config.Level != thinking.LevelNone && config.Level != thinking.LevelAuto {
+		return string(config.Level)
+	}
+	if config.Mode == thinking.ModeBudget {
+		if level, ok := thinking.ConvertBudgetToLevel(config.Budget); ok {
+			return level
+		}
+	}
+	return string(thinking.LevelHigh)
 }
 
 // applyCompatibleKimi applies thinking config for user-defined Kimi models.

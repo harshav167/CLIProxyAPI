@@ -2080,124 +2080,75 @@
   ],
   "kimi": [
     {
-      "id": "kimi-k2",
+      "id": "k3",
       "object": "model",
-      "created": 1752192000,
+      "created": 1761264000,
       "owned_by": "moonshot",
       "type": "kimi",
-      "display_name": "Kimi K2",
-      "description": "Kimi K2 - Moonshot AI's flagship coding model",
-      "context_length": 131072,
-      "max_completion_tokens": 32768
-    },
-    {
-      "id": "kimi-k2-thinking",
-      "object": "model",
-      "created": 1762387200,
-      "owned_by": "moonshot",
-      "type": "kimi",
-      "display_name": "Kimi K2 Thinking",
-      "description": "Kimi K2 Thinking - Extended reasoning model",
-      "context_length": 131072,
-      "max_completion_tokens": 32768,
+      "display_name": "Kimi K3",
+      "description": "Kimi K3 - Flagship multimodal reasoning model available through Kimi Code",
+      "context_length": 1048576,
+      "max_completion_tokens": 1048576,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 1024,
-        "max": 32000,
-        "zero_allowed": true,
-        "dynamic_allowed": true,
+        "zero_allowed": false,
+        "dynamic_allowed": false,
         "levels": [
-          "low",
-          "medium",
-          "high"
+          "max"
         ]
       }
     },
     {
-      "id": "kimi-k2.5",
+      "id": "kimi-for-coding",
       "object": "model",
-      "created": 1769472000,
+      "created": 1761264000,
       "owned_by": "moonshot",
       "type": "kimi",
-      "display_name": "Kimi K2.5",
-      "description": "Kimi K2.5 - Native multimodal agentic model with text, image, and video input; supports thinking and non-thinking modes",
+      "display_name": "Kimi for Coding",
+      "description": "Stable Kimi Code alias for Kimi K2.7 Code",
       "context_length": 262144,
       "max_completion_tokens": 32768,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 1024,
-        "max": 32000,
-        "zero_allowed": true,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
-      }
-    },
-    {
-      "id": "kimi-k2.6",
-      "object": "model",
-      "created": 1776729600,
-      "owned_by": "moonshot",
-      "type": "kimi",
-      "display_name": "Kimi K2.6",
-      "description": "Kimi K2.6 - Native multimodal agentic model with stronger long-horizon agentic coding, long-context reasoning, and preserved thinking support",
-      "context_length": 262144,
-      "max_completion_tokens": 65536,
-      "thinking": {
-        "min": 1024,
-        "max": 32000,
-        "zero_allowed": true,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
-      }
-    },
-    {
-      "id": "kimi-k2.7-code",
-      "object": "model",
-      "created": 1780396800,
-      "owned_by": "moonshot",
-      "type": "kimi",
-      "display_name": "Kimi K2.7 Code",
-      "description": "Kimi K2.7 Code - Moonshot AI's latest coding-focused model",
-      "context_length": 262144,
-      "max_completion_tokens": 65536,
-      "thinking": {
-        "min": 1024,
-        "max": 32000,
         "zero_allowed": false,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
+        "dynamic_allowed": true
       }
     },
     {
-      "id": "kimi-k2.7-code-highspeed",
+      "id": "kimi-for-coding-highspeed",
       "object": "model",
-      "created": 1780396800,
+      "created": 1761264000,
       "owned_by": "moonshot",
       "type": "kimi",
-      "display_name": "Kimi K2.7 Code HighSpeed",
-      "description": "Kimi K2.7 Code HighSpeed - Same capabilities as Kimi K2.7 Code with higher output speed (~180 tokens/s)",
+      "display_name": "Kimi for Coding HighSpeed",
+      "description": "High-speed stable Kimi Code alias with the same capabilities as Kimi for Coding",
       "context_length": 262144,
-      "max_completion_tokens": 65536,
+      "max_completion_tokens": 32768,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 1024,
-        "max": 32000,
         "zero_allowed": false,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
+        "dynamic_allowed": true
       }
     }
   ],

@@ -92,6 +92,74 @@ func TestWithXAIBuiltinsIncludesGrok45(t *testing.T) {
 	}
 }
 
+func TestGetKimiModelsIncludesLiveCodingCatalog(t *testing.T) {
+	want := map[string]struct {
+		contextLength int
+		maxTokens     int
+		thinking      func(*ThinkingSupport) bool
+	}{
+		"k3": {
+			contextLength: 1_048_576,
+			maxTokens:     1_048_576,
+			thinking: func(support *ThinkingSupport) bool {
+				return support != nil &&
+					!support.ZeroAllowed &&
+					!support.DynamicAllowed &&
+					len(support.Levels) == 1 &&
+					support.Levels[0] == "max"
+			},
+		},
+		"kimi-for-coding": {
+			contextLength: 262_144,
+			maxTokens:     32_768,
+			thinking: func(support *ThinkingSupport) bool {
+				return support != nil &&
+					!support.ZeroAllowed &&
+					support.DynamicAllowed &&
+					len(support.Levels) == 0
+			},
+		},
+		"kimi-for-coding-highspeed": {
+			contextLength: 262_144,
+			maxTokens:     32_768,
+			thinking: func(support *ThinkingSupport) bool {
+				return support != nil &&
+					!support.ZeroAllowed &&
+					support.DynamicAllowed &&
+					len(support.Levels) == 0
+			},
+		},
+	}
+
+	models := GetKimiModels()
+	if len(models) != len(want) {
+		t.Fatalf("Kimi builtins = %d, want exactly live catalog %d: %+v", len(models), len(want), models)
+	}
+	for _, model := range models {
+		expected, ok := want[model.ID]
+		if !ok {
+			t.Fatalf("stale or unknown Kimi builtin %q", model.ID)
+		}
+		if model.ContextLength != expected.contextLength {
+			t.Fatalf("%s context_length = %d, want %d", model.ID, model.ContextLength, expected.contextLength)
+		}
+		if model.MaxCompletionTokens != expected.maxTokens {
+			t.Fatalf("%s max_completion_tokens = %d, want %d", model.ID, model.MaxCompletionTokens, expected.maxTokens)
+		}
+		if len(model.SupportedInputModalities) != 3 {
+			t.Fatalf("%s supported input modalities = %v, want TEXT/IMAGE/VIDEO", model.ID, model.SupportedInputModalities)
+		}
+		if !expected.thinking(model.Thinking) {
+			t.Fatalf("%s thinking metadata = %+v, want live wire capability", model.ID, model.Thinking)
+		}
+		delete(want, model.ID)
+	}
+
+	if len(want) != 0 {
+		t.Fatalf("missing live Kimi Coding models: %v", want)
+	}
+}
+
 func TestAntigravityWebSearchModelForRequiresRequestedModelCapability(t *testing.T) {
 	registryRef := GetGlobalRegistry()
 	registryRef.RegisterClient("test-antigravity-websearch-route", "antigravity", []*ModelInfo{
