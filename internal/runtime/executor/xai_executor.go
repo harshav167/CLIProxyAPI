@@ -876,7 +876,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	// sessionID drives x-grok-conv-id / local session only. Upstream
 	// prompt_cache_key is applied separately and never replaced by sessionID
 	// when a client/handler key is already present.
-	body = ensureXAIUpstreamPromptCacheKey(body, req, sessionID)
+	body = ensureXAIUpstreamPromptCacheKey(ctx, body, req, opts, sessionID)
 
 	return &xaiPreparedRequest{
 		baseModel:       baseModel,
@@ -951,27 +951,27 @@ func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, str
 }
 
 func xaiResolveComposerSessionID(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string) (string, error) {
-	if sessionID := xaiExecutionSessionID(req, opts); sessionID != "" {
+	if sessionID := xaiExplicitExecutionSessionID(req, opts); sessionID != "" {
 		return sessionID, nil
 	}
 	if !xaiRequiresIsolatedConversation(baseModel) {
 		return "", nil
 	}
-	cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, opts.Headers)
-	if errCache != nil {
-		return "", errCache
-	}
-	if ok {
-		return cached.ID, nil
+	if sessionID := helps.ExtractClaudeCodeSessionID(ctx, req.Payload, opts.Headers); sessionID != "" {
+		return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:xai:composer-session:"+sessionID)).String(), nil
 	}
 	return uuid.NewString(), nil
 }
 
-func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+func xaiExplicitExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
 	if value := xaiMetadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
 		return value
 	}
-	if value := xaiMetadataString(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
+	return xaiMetadataString(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
+}
+
+func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	if value := xaiExplicitExecutionSessionID(req, opts); value != "" {
 		return value
 	}
 	if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
@@ -984,11 +984,11 @@ func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.O
 // routing without collapsing it into the local execution session.
 //
 // Priority: existing body key, then req.Payload key (handler-injected
-// parent/shared cli-proxy-* or client-supplied), then sessionID only when no
-// client/handler key exists (composer isolation / generated sessions).
+// parent/shared cli-proxy-* or client-supplied), then the Claude launch cache
+// scope, then sessionID when no prompt-cache scope exists.
 // Never overwrite a present key with sessionID — that cold-starts Cursor
 // subagents that share a parent pck but have different ExecutionSession IDs.
-func ensureXAIUpstreamPromptCacheKey(body []byte, req cliproxyexecutor.Request, sessionID string) []byte {
+func ensureXAIUpstreamPromptCacheKey(ctx context.Context, body []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, sessionID string) []byte {
 	if pck := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); pck != "" {
 		return body
 	}
@@ -998,6 +998,12 @@ func ensureXAIUpstreamPromptCacheKey(body []byte, req cliproxyexecutor.Request, 
 			return body
 		}
 		return out
+	}
+	if cacheID, ok := helps.ClaudeCodePromptCacheID(ctx, req.Model, req.Payload, opts.Headers); ok {
+		out, err := sjson.SetBytes(body, "prompt_cache_key", cacheID)
+		if err == nil {
+			return out
+		}
 	}
 	if sessionID = strings.TrimSpace(sessionID); sessionID == "" {
 		return body

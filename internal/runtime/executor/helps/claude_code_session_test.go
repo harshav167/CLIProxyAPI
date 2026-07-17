@@ -2,8 +2,10 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -30,22 +32,98 @@ func TestExtractClaudeCodeSessionIDFromHeader(t *testing.T) {
 	}
 }
 
-func TestClaudeCodePromptCacheStableAcrossRequests(t *testing.T) {
+func TestExtractClaudeCodeCacheScopeIDPrefersDedicatedHeader(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	ginCtx.Request.Header.Set(ClaudeCodeCacheSessionHeader, "shared-cache-scope")
+	ginCtx.Request.Header.Set(ClaudeCodeSessionHeader, "child-session")
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	got := ExtractClaudeCodeCacheScopeID(ctx, []byte(`{"metadata":{"user_id":"{\"session_id\":\"payload-session\"}"}}`), nil)
+	if got != "shared-cache-scope" {
+		t.Fatalf("ExtractClaudeCodeCacheScopeID() = %q, want shared-cache-scope", got)
+	}
+}
+
+func TestExtractClaudeCodeCacheScopeIDFallsBackToSessionID(t *testing.T) {
+	headers := http.Header{}
+	headers.Set(ClaudeCodeSessionHeader, "session-fallback")
+
+	got := ExtractClaudeCodeCacheScopeID(context.Background(), []byte(`{"metadata":{"user_id":"{\"session_id\":\"payload-session\"}"}}`), headers)
+	if got != "session-fallback" {
+		t.Fatalf("ExtractClaudeCodeCacheScopeID() = %q, want session-fallback", got)
+	}
+}
+
+func TestClaudeCodePromptCacheIDStableAcrossRequests(t *testing.T) {
 	ctx := context.Background()
 	payload := []byte(`{"metadata":{"user_id":"{\"session_id\":\"cache-session-2\"}"}}`)
-	first, ok, err := ClaudeCodePromptCache(ctx, "grok-composer-2.5-fast", payload, nil)
-	if err != nil {
-		t.Fatalf("ClaudeCodePromptCache first error: %v", err)
+	first, ok := ClaudeCodePromptCacheID(ctx, "grok-composer-2.5-fast", payload, nil)
+	if !ok || first == "" {
+		t.Fatalf("ClaudeCodePromptCacheID first = %q, ok=%v, want cached id", first, ok)
 	}
-	if !ok || first.ID == "" {
-		t.Fatalf("ClaudeCodePromptCache first = %#v, ok=%v, want cached id", first, ok)
+	second, ok := ClaudeCodePromptCacheID(ctx, "grok-composer-2.5-fast", payload, nil)
+	if !ok || second != first {
+		t.Fatalf("second cache id = %q, want %q", second, first)
 	}
-	second, ok, err := ClaudeCodePromptCache(ctx, "grok-composer-2.5-fast", payload, nil)
-	if err != nil {
-		t.Fatalf("ClaudeCodePromptCache second error: %v", err)
+}
+
+func TestClaudeCodePromptCacheIDSharedAcrossChildSessions(t *testing.T) {
+	ctx := context.Background()
+	parentHeaders := http.Header{}
+	parentHeaders.Set(ClaudeCodeCacheSessionHeader, "root-cache-scope")
+	parentHeaders.Set(ClaudeCodeSessionHeader, "parent-session")
+	childHeaders := http.Header{}
+	childHeaders.Set(ClaudeCodeCacheSessionHeader, "root-cache-scope")
+	childHeaders.Set(ClaudeCodeSessionHeader, "workflow-child-session")
+
+	parent, ok := ClaudeCodePromptCacheID(ctx, "gpt-5.6-sol", []byte(`{"metadata":{"user_id":"{\"session_id\":\"parent-session\"}"}}`), parentHeaders)
+	if !ok || parent == "" {
+		t.Fatalf("ClaudeCodePromptCacheID parent = %q, ok=%v, want cached id", parent, ok)
 	}
-	if !ok || second.ID != first.ID {
-		t.Fatalf("second cache id = %q, want %q", second.ID, first.ID)
+	child, ok := ClaudeCodePromptCacheID(ctx, "gpt-5.6-sol", []byte(`{"metadata":{"user_id":"{\"session_id\":\"workflow-child-session\"}"}}`), childHeaders)
+	if !ok || child != parent {
+		t.Fatalf("child cache id = %q, want parent cache id %q", child, parent)
+	}
+}
+
+func TestClaudeCodePromptCacheIDConcurrentRequestsUseOneID(t *testing.T) {
+	const requestCount = 32
+	headers := http.Header{}
+	headers.Set(ClaudeCodeCacheSessionHeader, "concurrent-cache-scope")
+
+	ids := make(chan string, requestCount)
+	errs := make(chan error, requestCount)
+	var wg sync.WaitGroup
+	for range requestCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cacheID, ok := ClaudeCodePromptCacheID(context.Background(), "gpt-5.6-sol", nil, headers)
+			if !ok || cacheID == "" {
+				errs <- fmt.Errorf("ClaudeCodePromptCacheID() = %q, ok=%v, want cached id", cacheID, ok)
+				return
+			}
+			ids <- cacheID
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	close(errs)
+
+	for err := range errs {
+		t.Fatal(err)
+	}
+	var want string
+	for id := range ids {
+		if want == "" {
+			want = id
+			continue
+		}
+		if id != want {
+			t.Fatalf("concurrent cache id = %q, want %q", id, want)
+		}
 	}
 }
 

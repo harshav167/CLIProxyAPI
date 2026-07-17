@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -192,10 +193,10 @@ func TestXAIExecutorComposerSessionIsolation(t *testing.T) {
 			payload: []byte(`{"model":"grok-build-0.1","input":"hello"}`),
 		},
 		{
-			name:        "explicit_prompt_cache_key_is_preserved",
-			model:       "grok-composer-2.5-fast",
-			payload:     []byte(`{"model":"grok-composer-2.5-fast","prompt_cache_key":"client-session","input":"hello"}`),
-			wantSession: "client-session",
+			name:          "prompt_cache_key_does_not_become_conversation",
+			model:         "grok-composer-2.5-fast",
+			payload:       []byte(`{"model":"grok-composer-2.5-fast","prompt_cache_key":"client-cache","input":"hello"}`),
+			wantGenerated: true,
 		},
 	}
 
@@ -225,8 +226,12 @@ func TestXAIExecutorComposerSessionIsolation(t *testing.T) {
 				if _, errParse := uuid.Parse(gotSession); errParse != nil {
 					t.Fatalf("generated sessionID = %q, want UUID; body=%s", gotSession, string(prepared.body))
 				}
-				if gotPromptCacheKey != gotSession {
-					t.Fatalf("prompt_cache_key = %q, want sessionID %q; body=%s", gotPromptCacheKey, gotSession, string(prepared.body))
+				wantPromptCacheKey := gotSession
+				if clientKey := gjson.GetBytes(tt.payload, "prompt_cache_key").String(); clientKey != "" {
+					wantPromptCacheKey = clientKey
+				}
+				if gotPromptCacheKey != wantPromptCacheKey {
+					t.Fatalf("prompt_cache_key = %q, want %q; body=%s", gotPromptCacheKey, wantPromptCacheKey, string(prepared.body))
 				}
 				if gotGrokConvID != gotSession {
 					t.Fatalf("x-grok-conv-id = %q, want sessionID %q", gotGrokConvID, gotSession)
@@ -1619,14 +1624,58 @@ func TestXAIExecutorComposerReusesClaudeCodeSession(t *testing.T) {
 	if secondKey != firstKey {
 		t.Fatalf("same Claude Code session produced different prompt_cache_key: first=%q second=%q", firstKey, secondKey)
 	}
+	if first.sessionID == "" || second.sessionID != first.sessionID {
+		t.Fatalf("same Claude Code session produced different composer sessions: first=%q second=%q", first.sessionID, second.sessionID)
+	}
 
 	httpReq, errRequest := http.NewRequest(http.MethodPost, "https://example.test/responses", bytes.NewReader(first.body))
 	if errRequest != nil {
 		t.Fatalf("NewRequest() error = %v", errRequest)
 	}
 	applyXAIHeaders(httpReq, auth, "xai-token", true, first.sessionID)
-	if got := httpReq.Header.Get("x-grok-conv-id"); got != firstKey {
-		t.Fatalf("x-grok-conv-id = %q, want %q", got, firstKey)
+	if got := httpReq.Header.Get("x-grok-conv-id"); got != first.sessionID {
+		t.Fatalf("x-grok-conv-id = %q, want isolated session %q", got, first.sessionID)
+	}
+}
+
+func TestXAIExecutorComposerIgnoresSharedClaudeCacheScopeForConversationID(t *testing.T) {
+	exec := NewXAIExecutor(&config.Config{})
+	parentHeaders := http.Header{}
+	parentHeaders.Set(helps.ClaudeCodeCacheSessionHeader, "shared-launch-cache")
+	parentHeaders.Set(helps.ClaudeCodeSessionHeader, "claude-parent")
+	childHeaders := http.Header{}
+	childHeaders.Set(helps.ClaudeCodeCacheSessionHeader, "shared-launch-cache")
+	childHeaders.Set(helps.ClaudeCodeSessionHeader, "claude-subagent")
+
+	parent, err := exec.prepareResponsesRequest(
+		context.Background(),
+		cliproxyexecutor.Request{Model: "grok-composer-2.5-fast", Payload: []byte(`{"model":"grok-composer-2.5-fast","input":"parent"}`)},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: true, Headers: parentHeaders},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("prepare parent request error: %v", err)
+	}
+	child, err := exec.prepareResponsesRequest(
+		context.Background(),
+		cliproxyexecutor.Request{Model: "grok-composer-2.5-fast", Payload: []byte(`{"model":"grok-composer-2.5-fast","input":"child"}`)},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, Stream: true, Headers: childHeaders},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("prepare child request error: %v", err)
+	}
+
+	parentCacheKey := gjson.GetBytes(parent.body, "prompt_cache_key").String()
+	childCacheKey := gjson.GetBytes(child.body, "prompt_cache_key").String()
+	if parentCacheKey == "" || childCacheKey != parentCacheKey {
+		t.Fatalf("shared cache scope keys = (%q, %q), want one non-empty key", parentCacheKey, childCacheKey)
+	}
+	if parent.sessionID == "" || child.sessionID == "" {
+		t.Fatalf("composer sessions = (%q, %q), want non-empty", parent.sessionID, child.sessionID)
+	}
+	if parent.sessionID == child.sessionID {
+		t.Fatalf("shared cache scope merged isolated composer conversations: %q", parent.sessionID)
 	}
 }
 

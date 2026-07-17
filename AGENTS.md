@@ -160,6 +160,7 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
   3. `normalizeXAIFunctionCallArguments` — fixes 400 "expected JSON object for tool arguments" when prior turn's interrupted streaming left `function_call.arguments` as `""` or non-JSON. Coerces missing / empty / non-object args to `"{}"`.
   4. `stampXAIInputMessageType` — adds `type: "message"` to bare role-bearing items that droid emits without a type (xAI's `ModelInput` enum rejects untyped variants; OpenAI tolerates them).
 - HTTP path preserves `previous_response_id` when present, forces `store: true`, and drops `instructions` when continuing (xAI rejects the pair). Do NOT delete `previous_response_id` — that broke the documented stateful Responses contract.
+- Composer cache and conversation identities are deliberately separate: `prompt_cache_key` uses the shared `X-Claude-Code-Cache-Session-Id` scope so main chat and subagents reuse prompt-cache routing, while `x-grok-conv-id` uses the isolated execution session so Composer conversation state never crosses agents.
 - Payload overrides use `protocol: xai` (provider identity). Translation still reuses Codex-shaped Responses helpers internally; that must NOT leak into config as `protocol: codex`.
 - `internal/runtime/executor/xai_reasoning_replay.go` — local encrypted-reasoning replay for Claude **and** Cursor chat (`openai` / `openai-response`) because chat-completions cannot round-trip Grok `encrypted_content` blobs; injects cached items on the next turn keyed by `prompt_cache_key` / execution session.
 - Grok 4.5: builtin registry entry (500k context, effort low/medium/high, cannot disable); `coerceXAIReasoningEffort` maps `none`/`minimal`→`low`; oauth aliases `grok-4.5` / `grok-4.5-{low,medium,high}` / `grok-latest` + payload effort overrides.
@@ -276,7 +277,7 @@ Full playbook (conflict table, CGO trap, deploy gate): **`.agents/skills/upstrea
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **CLIProxyAPI** (18607 symbols, 72829 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **CLIProxyAPI** (19083 symbols, 75151 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
