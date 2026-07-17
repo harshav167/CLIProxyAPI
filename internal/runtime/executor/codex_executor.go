@@ -784,6 +784,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.StripCodexFullTranscriptServerMessageIDs(body)
 	body = normalizeCodexParallelToolCallsForTools(body)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
 	if errReplay != nil {
@@ -947,6 +948,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.StripCodexFullTranscriptServerMessageIDs(body)
 	body = normalizeCodexParallelToolCallsForTools(body)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
@@ -1058,6 +1060,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
+	body = helps.StripCodexFullTranscriptServerMessageIDs(body)
 	body = normalizeCodexParallelToolCallsForTools(body)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
 	if errReplay != nil {
@@ -1366,12 +1369,9 @@ type codexIdentityReplacement struct {
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte) (*http.Request, []byte, codexIdentityConfuseState, error) {
 	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, nil)
-		if errCache != nil {
-			return nil, nil, codexIdentityConfuseState{}, errCache
-		}
+		cacheID, ok := helps.ClaudeCodePromptCacheID(ctx, req.Model, req.Payload, nil)
 		if ok {
-			cache = cached
+			cache.ID = cacheID
 		}
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
 		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")

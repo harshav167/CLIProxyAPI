@@ -1475,12 +1475,9 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 
 	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, nil)
-		if errCache != nil {
-			return nil, nil, errCache
-		}
+		cacheID, ok := helps.ClaudeCodePromptCacheID(ctx, req.Model, req.Payload, nil)
 		if ok {
-			cache = cached
+			cache.ID = cacheID
 		}
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
 		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
@@ -2542,6 +2539,7 @@ func finalizeCodexWebsocketRequest(
 	sessionWindowID := strings.TrimSpace(gjson.GetBytes(finalizedBody, "client_metadata.x-codex-window-id").String())
 	finalizedBody, identityState := applyCodexIdentityConfuseBody(cfg, auth, userPayload, finalizedBody)
 	applyCodexIdentityConfuseHeaders(headers, &identityState)
+	finalizedBody = helps.StripCodexFullTranscriptServerMessageIDs(finalizedBody)
 
 	windowID := strings.TrimSpace(gjson.GetBytes(finalizedBody, "client_metadata.x-codex-window-id").String())
 	if identityState.enabled && identityState.promptCacheKey != "" && sessionWindowID != "" {
