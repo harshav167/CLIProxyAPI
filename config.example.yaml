@@ -230,7 +230,7 @@ ws-auth: true
 nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
-#   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
+#   keepalive-seconds: 15   # Generic streams: default 0 (disabled). Claude /v1/messages bootstrap: default 15s when unset.
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
@@ -441,8 +441,12 @@ nonstream-keepalive-interval: 0
 #     - name: "gpt-5.6-luna"
 #       alias: "gpt-5.6-luna"
 #   kimi:
-#     - name: "kimi-k2.5"
-#       alias: "k2.5"
+#     - name: "k3"
+#       alias: "kimi-k3"
+#     - name: "kimi-for-coding"
+#       alias: "kimi-code"
+#     - name: "kimi-for-coding-highspeed"
+#       alias: "kimi-code-fast"
 #   xai:
 #     - name: "grok-4.5"
 #       alias: "grok-latest"
@@ -469,7 +473,7 @@ nonstream-keepalive-interval: 0
 #   codex:
 #     - "gpt-5-codex-mini"
 #   kimi:
-#     - "kimi-k2-thinking"
+#     - "kimi-for-coding-highspeed"
 #   xai:
 #     - "grok-3-mini"
 

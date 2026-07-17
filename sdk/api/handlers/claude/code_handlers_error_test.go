@@ -1,13 +1,18 @@
 package claude
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -90,5 +95,179 @@ func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
 	}
 	if gotErr != wantErr {
 		t.Fatalf("pending error = %p, want %p", gotErr, wantErr)
+	}
+}
+
+func TestAwaitClaudeStreamBootstrapWritesHeartbeatBeforeSlowFirstChunk(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	handler := &ClaudeCodeAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+			Streaming: sdkconfig.StreamingConfig{KeepAliveSeconds: 1},
+		}, nil),
+	}
+	data := make(chan []byte, 1)
+	errs := make(chan *interfaces.ErrorMessage)
+	go func() {
+		time.Sleep(1100 * time.Millisecond)
+		data <- []byte("event: message_start\ndata: {}\n\n")
+	}()
+
+	chunk, errMsg, committed := handler.awaitClaudeStreamBootstrap(c, recorder, data, errs, nil, false)
+	if errMsg != nil {
+		t.Fatalf("bootstrap error = %v", errMsg.Error)
+	}
+	if !committed {
+		t.Fatal("bootstrap did not commit SSE headers after heartbeat")
+	}
+	if !strings.Contains(recorder.Body.String(), ": keep-alive\n\n") {
+		t.Fatalf("bootstrap body = %q, want keep-alive heartbeat", recorder.Body.String())
+	}
+	if string(chunk) != "event: message_start\ndata: {}\n\n" {
+		t.Fatalf("first chunk = %q", chunk)
+	}
+}
+
+func TestClaudeBootstrapKeepAliveDefaultsToFifteenSeconds(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil),
+	}
+	if got := handler.claudeBootstrapKeepAliveInterval(); got != 15*time.Second {
+		t.Fatalf("bootstrap keep-alive interval = %v, want 15s", got)
+	}
+}
+
+func TestAwaitClaudeStreamExecutionWritesHeartbeatWhileExecutionBlocks(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	handler := &ClaudeCodeAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+			Streaming: sdkconfig.StreamingConfig{KeepAliveSeconds: 1},
+		}, nil),
+	}
+	heartbeatWritten := make(chan struct{}, 1)
+	executionRelease := make(chan struct{})
+	executionDone := make(chan struct{})
+	var result claudeStreamExecutionResult
+	var committed, canceled bool
+	writer := &heartbeatSignalWriter{ResponseWriter: c.Writer, heartbeatWritten: heartbeatWritten}
+	c.Writer = writer
+	go func() {
+		defer close(executionDone)
+		result, committed, canceled = handler.awaitClaudeStreamExecution(c, writer, func() claudeStreamExecutionResult {
+			<-executionRelease
+			return claudeStreamExecutionResult{Data: make(chan []byte), Errs: make(chan *interfaces.ErrorMessage)}
+		})
+	}()
+
+	select {
+	case <-heartbeatWritten:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for bootstrap heartbeat")
+	}
+	close(executionRelease)
+	<-executionDone
+
+	if canceled {
+		t.Fatal("blocked execution was canceled")
+	}
+	if !committed {
+		t.Fatal("default heartbeat did not commit SSE response")
+	}
+	if result.Data == nil || result.Errs == nil {
+		t.Fatal("execution result was not returned")
+	}
+	if !strings.Contains(recorder.Body.String(), ": keep-alive\n\n") {
+		t.Fatalf("execution body = %q, want default heartbeat", recorder.Body.String())
+	}
+}
+
+type heartbeatSignalWriter struct {
+	gin.ResponseWriter
+	heartbeatWritten chan<- struct{}
+}
+
+func (w *heartbeatSignalWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if bytes.Contains(p, []byte(": keep-alive\n\n")) {
+		select {
+		case w.heartbeatWritten <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+func TestAwaitClaudeStreamBootstrapReturnsImmediateErrorWithoutCommitting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	handler := &ClaudeCodeAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+			Streaming: sdkconfig.StreamingConfig{KeepAliveSeconds: 1},
+		}, nil),
+	}
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	wantErr := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("upstream unavailable")}
+	errs <- wantErr
+
+	chunk, errMsg, committed := handler.awaitClaudeStreamBootstrap(c, recorder, data, errs, nil, false)
+	if len(chunk) != 0 {
+		t.Fatalf("bootstrap chunk = %q, want empty", chunk)
+	}
+	if errMsg != wantErr {
+		t.Fatalf("bootstrap error = %p, want %p", errMsg, wantErr)
+	}
+	if committed {
+		t.Fatal("immediate upstream error committed SSE response")
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("bootstrap body = %q, want empty", recorder.Body.String())
+	}
+}
+
+func TestAwaitClaudeStreamBootstrapReturnsPostHeartbeatErrorAsCommitted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	handler := &ClaudeCodeAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+			Streaming: sdkconfig.StreamingConfig{KeepAliveSeconds: 1},
+		}, nil),
+	}
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	wantErr := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("slow upstream failed")}
+	go func() {
+		time.Sleep(1100 * time.Millisecond)
+		errs <- wantErr
+	}()
+
+	chunk, errMsg, committed := handler.awaitClaudeStreamBootstrap(c, recorder, data, errs, nil, false)
+	if len(chunk) != 0 {
+		t.Fatalf("bootstrap chunk = %q, want empty", chunk)
+	}
+	if errMsg != wantErr {
+		t.Fatalf("bootstrap error = %p, want %p", errMsg, wantErr)
+	}
+	if !committed {
+		t.Fatal("post-heartbeat error reported response as uncommitted")
+	}
+	handler.writeClaudeStreamTerminalError(c, errMsg)
+	if !strings.Contains(recorder.Body.String(), ": keep-alive\n\n") {
+		t.Fatalf("bootstrap body = %q, want keep-alive", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "event: error\n") || !strings.Contains(recorder.Body.String(), "slow upstream failed") {
+		t.Fatalf("bootstrap body = %q, want Claude SSE error", recorder.Body.String())
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want committed 200", recorder.Code)
 	}
 }
