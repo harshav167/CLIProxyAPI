@@ -145,11 +145,11 @@ func TestResponsesWebsocketPassthroughDisarmsTranscriptReplayAfterFailedAttempt(
 	if got := len(gjson.GetBytes(payloads[2], "input").Array()); got != 3 {
 		t.Fatalf("forced replay input length = %d, want full transcript: %s", got, payloads[2])
 	}
-	if got := gjson.GetBytes(payloads[3], "previous_response_id").String(); got != "resp-1" {
-		t.Fatalf("request after failed replay previous_response_id = %q, want passthrough resp-1: %s", got, payloads[3])
+	if gjson.GetBytes(payloads[3], "previous_response_id").Exists() {
+		t.Fatalf("request after failed replay retained stale previous_response_id: %s", payloads[3])
 	}
-	if got := len(gjson.GetBytes(payloads[3], "input").Array()); got != 1 {
-		t.Fatalf("request after failed replay input length = %d, want incremental input: %s", got, payloads[3])
+	if got := len(gjson.GetBytes(payloads[3], "input").Array()); got != 3 {
+		t.Fatalf("request after failed replay input length = %d, want restored full transcript: %s", got, payloads[3])
 	}
 }
 
@@ -199,6 +199,52 @@ func TestCanonicalizeResponsesWebsocketShadowInput(t *testing.T) {
 				t.Fatalf("shadow text = %q", got)
 			}
 		})
+	}
+}
+
+func TestNormalizeResponsesWebsocketPassthroughKeepsAcceptedRequestWhenShadowFails(t *testing.T) {
+	requestJSON, updatedLastRequest, errMsg := normalizeResponsesWebsocketPassthroughWithShadowState(
+		[]byte(`{"type":"response.append","model":"gpt-5.5","input":"accepted upstream input"}`),
+		"gpt-5.5",
+		nil,
+		nil,
+		"",
+		nil,
+	)
+	if errMsg != nil {
+		t.Fatalf("passthrough request rejected by shadow normalization: %v", errMsg.Error)
+	}
+	if got := gjson.GetBytes(requestJSON, "input").String(); got != "accepted upstream input" {
+		t.Fatalf("passthrough input = %q, want accepted upstream input", got)
+	}
+	if updatedLastRequest == nil {
+		t.Fatal("shadow failure discarded accepted turn from transcript state")
+	}
+	if got := gjson.GetBytes(updatedLastRequest, "input.0.content.0.text").String(); got != "accepted upstream input" {
+		t.Fatalf("fallback shadow input = %q, want accepted upstream input; state=%s", got, updatedLastRequest)
+	}
+}
+
+func TestFallbackResponsesWebsocketShadowStateAppendsStringInput(t *testing.T) {
+	lastRequest := []byte(`{
+		"type":"response.create",
+		"model":"gpt-5.5",
+		"stream":true,
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"first turn"}]}]
+	}`)
+	updated := fallbackResponsesWebsocketShadowState(
+		[]byte(`{"type":"response.append","model":"gpt-5.5","input":"second turn"}`),
+		lastRequest,
+	)
+	input := gjson.GetBytes(updated, "input")
+	if got := len(input.Array()); got != 2 {
+		t.Fatalf("fallback input length = %d, want 2; state=%s", got, updated)
+	}
+	if got := input.Get("0.content.0.text").String(); got != "first turn" {
+		t.Fatalf("first fallback turn = %q, want first turn", got)
+	}
+	if got := input.Get("1.content.0.text").String(); got != "second turn" {
+		t.Fatalf("second fallback turn = %q, want second turn", got)
 	}
 }
 

@@ -341,19 +341,14 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
 		if useUpstreamWebsocketPassthrough {
-			requestJSON, errMsg = normalizeResponsesWebsocketPassthroughRequest(payload, requestModelName)
-			if errMsg == nil {
-				shadowJSON := canonicalizeResponsesWebsocketShadowInput(requestJSON)
-				_, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithIncrementalState(
-					shadowJSON,
-					lastRequest,
-					lastResponseOutput,
-					lastResponseID,
-					lastResponsePendingToolCallIDs,
-					false,
-					false,
-				)
-			}
+			requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketPassthroughWithShadowState(
+				payload,
+				requestModelName,
+				lastRequest,
+				lastResponseOutput,
+				lastResponseID,
+				lastResponsePendingToolCallIDs,
+			)
 		} else {
 			requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithIncrementalState(
 				payload,
@@ -469,9 +464,16 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			lastResponsePendingToolCallIDs = previousLastResponsePendingToolCallIDs
 			continue
 		}
+		if forwardErrMsg != nil {
+			lastRequest = previousLastRequest
+			lastResponseOutput = previousLastResponseOutput
+			lastResponseID = previousLastResponseID
+			lastResponsePendingToolCallIDs = previousLastResponsePendingToolCallIDs
+			continue
+		}
 		if forcedTranscriptReplay {
 			forceTranscriptReplayNextRequest = false
-			if forwardErrMsg != nil || strings.TrimSpace(completedResponseID) == "" {
+			if strings.TrimSpace(completedResponseID) == "" {
 				lastRequest = previousLastRequest
 				lastResponseOutput = previousLastResponseOutput
 				lastResponseID = previousLastResponseID
@@ -1061,6 +1063,58 @@ func normalizeResponsesWebsocketPassthroughRequest(rawJSON []byte, modelName str
 	return normalized, nil
 }
 
+func normalizeResponsesWebsocketPassthroughWithShadowState(rawJSON []byte, modelName string, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string) ([]byte, []byte, *interfaces.ErrorMessage) {
+	requestJSON, errMsg := normalizeResponsesWebsocketPassthroughRequest(rawJSON, modelName)
+	if errMsg != nil {
+		return nil, lastRequest, errMsg
+	}
+	shadowJSON := canonicalizeResponsesWebsocketShadowInput(requestJSON)
+	_, updatedLastRequest, shadowErrMsg := normalizeResponsesWebsocketRequestWithIncrementalState(
+		shadowJSON,
+		lastRequest,
+		lastResponseOutput,
+		lastResponseID,
+		lastResponsePendingToolCallIDs,
+		false,
+		false,
+	)
+	if shadowErrMsg != nil {
+		log.Warnf("responses websocket: passthrough shadow normalization skipped: %v", shadowErrMsg.Error)
+		fallbackLastRequest := fallbackResponsesWebsocketShadowState(requestJSON, lastRequest)
+		return requestJSON, fallbackLastRequest, nil
+	}
+	return requestJSON, updatedLastRequest, nil
+}
+
+func fallbackResponsesWebsocketShadowState(requestJSON []byte, lastRequest []byte) []byte {
+	requestType := strings.TrimSpace(gjson.GetBytes(requestJSON, "type").String())
+	canonicalRequest := canonicalizeResponsesWebsocketShadowInput(requestJSON)
+	input := gjson.GetBytes(canonicalRequest, "input")
+	if requestType == wsRequestTypeCreate || len(lastRequest) == 0 || !input.Exists() || !input.IsArray() {
+		fallback, _, errMsg := normalizeResponseCreateRequest(canonicalRequest)
+		if errMsg == nil {
+			return fallback
+		}
+		return bytes.Clone(lastRequest)
+	}
+
+	existingInput := gjson.GetBytes(lastRequest, "input")
+	mergedInput, errMerge := mergeJSONArrayRaw(existingInput.Raw, input.Raw)
+	if errMerge != nil {
+		return bytes.Clone(lastRequest)
+	}
+	fallback := bytes.Clone(lastRequest)
+	fallback, errSet := sjson.SetRawBytes(fallback, "input", []byte(mergedInput))
+	if errSet != nil {
+		return bytes.Clone(lastRequest)
+	}
+	if modelName := strings.TrimSpace(gjson.GetBytes(requestJSON, "model").String()); modelName != "" {
+		fallback, _ = sjson.SetBytes(fallback, "model", modelName)
+	}
+	fallback, _ = sjson.SetBytes(fallback, "stream", true)
+	return fallback
+}
+
 func canonicalizeResponsesWebsocketShadowInput(rawJSON []byte) []byte {
 	input := gjson.GetBytes(rawJSON, "input")
 	if input.Type != gjson.String {
@@ -1434,7 +1488,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					if h != nil {
 						h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
 					}
-				} else if eventType == wsEventTypeError {
+				} else if event.Failure {
 					payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
 					if h != nil {
 						h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)

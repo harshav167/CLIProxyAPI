@@ -97,9 +97,16 @@ func TestForwardResponsesWebsocketFailureTerminalPreservedOnce(t *testing.T) {
 					serverErrCh <- errForward
 					return
 				}
-				if errMsg != nil {
-					serverErrCh <- fmt.Errorf("unexpected synthetic error: %v", errMsg.Error)
-					return
+				if eventType == "response.incomplete" {
+					if errMsg != nil {
+						serverErrCh <- fmt.Errorf("unexpected incomplete error: %v", errMsg.Error)
+						return
+					}
+				} else {
+					if errMsg == nil || errMsg.Error == nil {
+						serverErrCh <- fmt.Errorf("%s returned nil error", eventType)
+						return
+					}
 				}
 				serverErrCh <- nil
 			}))
