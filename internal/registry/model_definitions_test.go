@@ -1,6 +1,9 @@
 package registry
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestWithXAIBuiltinsIncludesVideoPreviewModel(t *testing.T) {
 	models := WithXAIBuiltins(nil)
@@ -159,6 +162,52 @@ func TestGetKimiModelsIncludesLiveCodingCatalog(t *testing.T) {
 
 	if len(want) != 0 {
 		t.Fatalf("missing live Kimi Coding models: %v", want)
+	}
+}
+
+func TestGetAntigravityModelsIncludesCurrentGeminiMultimodalCatalog(t *testing.T) {
+	want := map[string]struct {
+		contextLength int
+		maxTokens     int
+		thinkingMin   int
+		thinkingMax   int
+		dynamic       bool
+	}{
+		"gemini-3-flash":             {contextLength: 1_048_576, maxTokens: 65_536, thinkingMin: 32, thinkingMax: 65_536, dynamic: true},
+		"gemini-3-flash-agent":       {contextLength: 1_048_576, maxTokens: 65_536, thinkingMin: 32, thinkingMax: 10_000},
+		"gemini-pro-agent":           {contextLength: 1_048_576, maxTokens: 65_535, thinkingMin: 128, thinkingMax: 10_001},
+		"gemini-3.1-pro-low":         {contextLength: 1_048_576, maxTokens: 65_535, thinkingMin: 128, thinkingMax: 1_001},
+		"gemini-3.5-flash-low":       {contextLength: 1_048_576, maxTokens: 65_536, thinkingMin: 32, thinkingMax: 4_000},
+		"gemini-3.5-flash-extra-low": {contextLength: 1_048_576, maxTokens: 65_536, thinkingMin: 32, thinkingMax: 1_000},
+		"gemini-3.6-flash-tiered":    {contextLength: 1_048_576, maxTokens: 65_536, thinkingMin: 32, thinkingMax: 65_536, dynamic: true},
+	}
+
+	for _, model := range GetAntigravityModels() {
+		expected, ok := want[model.ID]
+		if !ok {
+			continue
+		}
+		if model.ContextLength != expected.contextLength || model.MaxCompletionTokens != expected.maxTokens {
+			t.Fatalf("%s token limits = %d/%d, want %d/%d", model.ID, model.ContextLength, model.MaxCompletionTokens, expected.contextLength, expected.maxTokens)
+		}
+		if got := strings.Join(model.SupportedInputModalities, ","); got != "TEXT,IMAGE,VIDEO" {
+			t.Fatalf("%s input modalities = %q, want TEXT,IMAGE,VIDEO", model.ID, got)
+		}
+		if got := strings.Join(model.SupportedOutputModalities, ","); got != "TEXT" {
+			t.Fatalf("%s output modalities = %q, want TEXT", model.ID, got)
+		}
+		if model.Thinking == nil ||
+			model.Thinking.Min != expected.thinkingMin ||
+			model.Thinking.Max != expected.thinkingMax ||
+			model.Thinking.DynamicAllowed != expected.dynamic ||
+			len(model.Thinking.Levels) != 0 {
+			t.Fatalf("%s thinking metadata = %+v, want min=%d max=%d dynamic=%v without synthetic levels", model.ID, model.Thinking, expected.thinkingMin, expected.thinkingMax, expected.dynamic)
+		}
+		delete(want, model.ID)
+	}
+
+	if len(want) != 0 {
+		t.Fatalf("missing current Antigravity Gemini models: %v", want)
 	}
 }
 

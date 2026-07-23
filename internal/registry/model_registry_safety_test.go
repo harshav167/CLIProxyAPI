@@ -135,6 +135,70 @@ func TestGetAvailableModelsReturnsClonedSupportedParameters(t *testing.T) {
 	}
 }
 
+func TestGetAvailableModelsIncludesClonedModalitiesForOpenAI(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "openai", []*ModelInfo{{
+		ID:                        "multimodal-model",
+		SupportedInputModalities:  []string{"TEXT", "IMAGE", "VIDEO"},
+		SupportedOutputModalities: []string{"TEXT"},
+	}})
+
+	first := r.GetAvailableModels("openai")
+	if len(first) != 1 {
+		t.Fatalf("expected one model, got %d", len(first))
+	}
+	inputs, ok := first[0]["supportedInputModalities"].([]string)
+	if !ok || len(inputs) != 3 || inputs[2] != "VIDEO" {
+		t.Fatalf("expected TEXT/IMAGE/VIDEO input modalities, got %#v", first[0]["supportedInputModalities"])
+	}
+	outputs, ok := first[0]["supportedOutputModalities"].([]string)
+	if !ok || len(outputs) != 1 || outputs[0] != "TEXT" {
+		t.Fatalf("expected TEXT output modality, got %#v", first[0]["supportedOutputModalities"])
+	}
+
+	inputs[0] = "mutated"
+	outputs[0] = "mutated"
+	second := r.GetAvailableModels("openai")
+	if got := second[0]["supportedInputModalities"].([]string)[0]; got != "TEXT" {
+		t.Fatalf("expected cloned input modalities, got %q", got)
+	}
+	if got := second[0]["supportedOutputModalities"].([]string)[0]; got != "TEXT" {
+		t.Fatalf("expected cloned output modalities, got %q", got)
+	}
+}
+
+func TestGetAvailableModelsIncludesClonedModalitiesForAntigravity(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "antigravity", []*ModelInfo{{
+		ID:                        "multimodal-antigravity-model",
+		SupportedInputModalities:  []string{"TEXT", "IMAGE", "VIDEO"},
+		SupportedOutputModalities: []string{"TEXT"},
+	}})
+
+	first := r.GetAvailableModels("antigravity")
+	if len(first) != 1 {
+		t.Fatalf("expected one model, got %d", len(first))
+	}
+	inputs, ok := first[0]["supportedInputModalities"].([]string)
+	if !ok || len(inputs) != 3 || inputs[2] != "VIDEO" {
+		t.Fatalf("expected TEXT/IMAGE/VIDEO input modalities, got %#v", first[0]["supportedInputModalities"])
+	}
+	outputs, ok := first[0]["supportedOutputModalities"].([]string)
+	if !ok || len(outputs) != 1 || outputs[0] != "TEXT" {
+		t.Fatalf("expected TEXT output modality, got %#v", first[0]["supportedOutputModalities"])
+	}
+
+	inputs[0] = "mutated"
+	outputs[0] = "mutated"
+	second := r.GetAvailableModels("antigravity")
+	if got := second[0]["supportedInputModalities"].([]string)[0]; got != "TEXT" {
+		t.Fatalf("expected cloned input modalities, got %q", got)
+	}
+	if got := second[0]["supportedOutputModalities"].([]string)[0]; got != "TEXT" {
+		t.Fatalf("expected cloned output modalities, got %q", got)
+	}
+}
+
 func TestGetAvailableModelsIncludesThinkingMetadataForOpenAIAndClaudeCompatibleHandlers(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("client-openai", "openai", []*ModelInfo{{
@@ -177,6 +241,33 @@ func TestGetAvailableModelsIncludesThinkingMetadataForOpenAIAndClaudeCompatibleH
 	thinkingLevels, ok := thinkingMap["levels"].([]string)
 	if !ok || len(thinkingLevels) != 3 || thinkingLevels[2] != "high" {
 		t.Fatalf("expected thinking levels in openai model, got %#v", thinkingMap["levels"])
+	}
+
+	var openAIAntigravityModel map[string]any
+	for _, model := range openAIModels {
+		if id, _ := model["id"].(string); id == "ag-test" {
+			openAIAntigravityModel = model
+			break
+		}
+	}
+	if openAIAntigravityModel == nil {
+		t.Fatal("expected antigravity model in openai registry output")
+	}
+	openAIThinking, ok := openAIAntigravityModel["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected budget-based thinking map in openai output, got %#v", openAIAntigravityModel["thinking"])
+	}
+	if got, ok := openAIThinking["min"].(int); !ok || got != 1024 {
+		t.Fatalf("expected thinking.min=1024, got %#v", openAIThinking["min"])
+	}
+	if got, ok := openAIThinking["max"].(int); !ok || got != 32000 {
+		t.Fatalf("expected thinking.max=32000, got %#v", openAIThinking["max"])
+	}
+	if got, ok := openAIThinking["zero_allowed"].(bool); !ok || !got {
+		t.Fatalf("expected thinking.zero_allowed=true, got %#v", openAIThinking["zero_allowed"])
+	}
+	if got, ok := openAIThinking["dynamic_allowed"].(bool); !ok || !got {
+		t.Fatalf("expected thinking.dynamic_allowed=true, got %#v", openAIThinking["dynamic_allowed"])
 	}
 
 	claudeModels := r.GetAvailableModels("antigravity")

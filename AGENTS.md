@@ -92,6 +92,21 @@ Both push through `https://kaecilius.ecorp.cc/v1/{traces,logs,metrics}`.
 
 If the user ever has to re-explain that SigNoz is the source of truth, that is a process failure. Update this section the moment any infrastructure detail changes.
 
+## Production client access — public Clanker endpoint
+
+- Public production base URL: `https://clanker.ecorp.cc`
+- Test API key: `droid` (case-sensitive; uppercase `DROID` is invalid)
+- Client smoke tests run directly from the local Mac against the public URL, for example:
+
+  ```bash
+  curl https://clanker.ecorp.cc/v1/models \
+    -H "Authorization: Bearer droid"
+  ```
+
+- Do not use the prod VM MCP, Docker, localhost, or host port `8312` for ordinary client/API tests. The prod VM MCP is only for inspecting or managing the host itself.
+- `clanker` by itself is an observability instance label (`cliproxy.instance=clanker`), not a DNS hostname. Never probe `http://clanker`.
+- The public URL terminates through the production ingress and reaches the `cli-proxy-api-test` service described below.
+
 ## Prod VM access — `cliproxy-prod-arm` MCP ONLY (2026-07-06)
 
 **The ONLY sanctioned way to inspect or manage the prod VM (`wade@proxy`, `australia-southeast1-c`, ARM Axion) is the `cliproxy-prod-arm` MCP server** (`project-0-CLIProxyAPI-cliproxy-prod-arm`, a Desktop-Commander-style server running ON the prod VM). Use its tools:
@@ -122,6 +137,12 @@ Cursor renders an OpenAI chat-completions stream's **`choices[].delta.reasoning_
 ### Image/vision through Cursor (verified 2026-06-27)
 - Cursor pre-processes images itself (needs a real OpenAI API key configured) and DOES send `image_url` + `data:image` base64 in the downstream chat-completions body. Proven on prod: downstream had the JPEG, upstream to z.ai had the identical bytes, our proxy passes it through untouched (`NormalizeGLMRequestBody` never touches image content).
 - Whether a given model "sees" the image depends on the BACKEND deployment, not our proxy: z.ai's coding-plan GLM-5.2 accepts the image (200, ~48K prompt tokens) but the model replies "I can't see it" (text-only deployment); GMI's `zai-org/GLM-5.2-FP8` build is multimodal and describes it. z.ai's real vision model is `glm-5v-turbo` on the GENERAL endpoint (`/api/paas/v4`), not the coding endpoint.
+
+### Kimi K3 video input (verified 2026-07-19)
+- K3 accepts OpenAI chat-completions `video_url` content with an inline `data:video/mp4;base64,...` URL. The Kimi executor preserves the complete data URL and sends it to `https://api.kimi.com/coding/v1/chat/completions`; no video-specific translator is required.
+- Kimi's video preprocessing exposes sampled visual frames only. It does not expose the MP4 audio track to K3, even when the file contains valid AAC audio. Audio transcription requires a separate speech-to-text path.
+- `internal/registry/models/models.json` declares K3 input modalities as `TEXT`, `IMAGE`, and `VIDEO`. `internal/registry/model_registry.go` must preserve `supportedInputModalities` and `supportedOutputModalities` on OpenAI `/v1/models`.
+- Slow non-streaming multimodal requests behind Cloudflare need `nonstream-keepalive-interval` enabled. Use 15 seconds in production so `StartNonStreamingKeepAlive` flushes response bytes before Cloudflare's origin timeout. Streaming K3 video calls do not have this idle-response problem once SSE begins.
 
 ## GLM / Z.AI provider config (prod `openai-compatibility`)
 
@@ -214,8 +235,48 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
 
 ### Build / packaging
 - `Dockerfile` — `ENV TZ=Australia/Sydney`. **Production runtime is `gcr.io/distroless/base-debian12:nonroot`** (glibc + libssl + ca-certificates + tzdata baked in, NO shell / apt / curl / coreutils — minimal attack surface, runs as non-root uid 65532, ~25 MB base). Builder is still `golang:1.26-bookworm` + `CGO_ENABLED=1` + `zig cc` cross-compilation (unchanged). The real Go `plugin` loader is CGO-only (`runtime/plugin` fails to compile with `CGO_ENABLED=0`), and store-downloaded `.so` plugins need glibc at runtime (musl in alpine cannot load them); distroless base-debian12 ships glibc so the store's `.so` plugins load natively. **No `time/tzdata` import needed** — distroless base already ships `tzdata`, so `ENV TZ=Australia/Sydney` works with zero apt installs. Healthcheck: distroless has no curl/shell, so the in-container `curl /healthz` healthcheck is dropped; rely on the `cpa-usage-keeper` sidecar + compose restart policy + an external HTTP probe of `GET /healthz` (the endpoint exists at `internal/api/server.go:424`). `Dockerfile.debug` keeps the OLD `debian:bookworm-slim` + shell + curl runtime for debugging situations where you need `docker exec -it <ctr> sh` — build/tag it as `:prod-arm64-debug` only when needed; prod runs the distroless Dockerfile. **Prod is ARM** — build/verify with `CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="zig cc -target aarch64-linux-gnu" go build ./cmd/server` (the prior `GOARCH=amd64` verification line was for the decommissioned x86 prod). Image tag scheme: `:prod-arm64` (single-arch arm64, what prod pulls), `:prod-amd64` (single-arch amd64, for local intel Mac / CI testing), `:prod` (multi-arch manifest of both) — never push `:latest`. Verified 2026-07-06: distroless amd64 image builds clean via `wade-remote` buildx builder, binary execs directly (no shell), `/bin/sh` absent, image history shows only glibc+libssl+cacerts base layers + the 66.7 MB binary + 26.7 KB config.
-- Image tags on `ghcr.io/harshav167/cliproxyapi`: `:prod` is the rolling production tag (manually retagged after each deploy), `:f5-and-grok-fixes-<sha>`, `:upstream-sync-<sha>` and `:glm-cache-<sha>` are content-addressed pins. DO NOT push `:latest`. Prod is now **ARM** — the `:prod` tag must point at a `linux/arm64` image built for the Axion host. (Prior x86 prod digests — e.g. `sha256:905499680e0b0103ad324b7c3ff2de09ae1db71273f234019f236df4594dc769` from `:upstream-sync-d6a3780d` on 2026-07-03 — were `linux/amd64` and are NOT valid for the current prod host. Refresh this line with the current ARM `:prod` digest after the next deploy.)
-- Prod deploy target: **ARM Axion high-CPU/high-throughput GCP VM** `wade@proxy`, zone `australia-southeast1-c`, project `mediprepai`. Access ONLY via the `cliproxy-prod-arm` MCP — no direct SSH (see "Prod VM access"). The cliproxy service is `cli-proxy-api-test` in `/home/wade/cliproxy/compose.yaml`, running `ghcr.io/harshav167/cliproxyapi:prod-arm64` (host ports 80 + 8312 → container 8317), labeled `cliproxy.instance=clanker`, started with `--local-model`. Deploy: `docker compose pull cli-proxy-api-test && docker compose up -d cli-proxy-api-test`. The old x86 prod target (`wade@production` in `asia-southeast1-a`) is DECOMMISSIONED — do not deploy there.
+- Image tags on `ghcr.io/harshav167/cliproxyapi`: `:prod` is the rolling production tag (manually retagged after each deploy), `:f5-and-grok-fixes-<sha>`, `:upstream-sync-<sha>` and `:glm-cache-<sha>` are content-addressed pins. DO NOT push `:latest`. Prod is **ARM** — the `:prod` tag must point at a `linux/arm64` image built for the Axion host. Current deployed `:prod-arm64` digest as of 2026-07-19: `sha256:1d307b73f803e95427ff9325c81712657181c3daf6d641f5b97e36836de925d3` (immutable tag `k3-video-fix-20260719`; built from the uncommitted verified working tree at `8e79db43`). Prior x86 prod digests are NOT valid for the current prod host.
+- Prod deploy target: **ARM Axion high-CPU/high-throughput GCP VM** `wade@proxy`, zone `australia-southeast1-c`, project `mediprepai`. The cliproxy service is `cli-proxy-api-test` in `/home/wade/cliproxy/compose.yaml`, running `ghcr.io/harshav167/cliproxyapi:prod-arm64` (host ports 80 + 8312 → container 8317), labeled `cliproxy.instance=clanker`, started with `--local-model`. The old x86 prod target (`wade@production` in `asia-southeast1-a`) is DECOMMISSIONED — never deploy there.
+
+#### Production deploy — exact procedure
+
+Production host operations MUST use the project MCP server `project-0-CLIProxyAPI-cliproxy-prod-arm` (usually displayed as `cliproxy-prod-arm`). This MCP already executes on the ARM prod host. **Do not run `gcloud compute ssh`, direct `ssh`, or target `wade@production`.**
+
+1. Verify the local commit before building:
+
+   ```bash
+   gofmt -l internal/ sdk/
+   go build -o /tmp/build ./cmd/server && rm /tmp/build
+   go test ./...
+   ```
+
+2. Build and push the ARM image locally. Production pulls `:prod-arm64`; also update the rolling `:prod` tag and immutable commit tag:
+
+   ```bash
+   SHA=$(git rev-parse --short=8 HEAD)
+   docker buildx build --platform linux/arm64 -f Dockerfile \
+     -t ghcr.io/harshav167/cliproxyapi:prod-arm64 \
+     -t ghcr.io/harshav167/cliproxyapi:prod \
+     -t "ghcr.io/harshav167/cliproxyapi:upstream-sync-${SHA}" \
+     --push .
+   docker buildx imagetools inspect ghcr.io/harshav167/cliproxyapi:prod-arm64
+   ```
+
+3. On `cliproxy-prod-arm`, call `start_process` with:
+
+   ```bash
+   cd /home/wade/cliproxy && \
+   docker compose pull cli-proxy-api-test && \
+   docker compose up -d cli-proxy-api-test && \
+   docker compose ps cli-proxy-api-test && \
+   docker compose logs --tail=80 cli-proxy-api-test
+   ```
+
+   If the MCP returns a PID because the command is still running, use its `read_process_output` tool until the process finishes. Do not substitute local Shell or SSH.
+
+4. Verify the recreated container is `Up`, the image is `ghcr.io/harshav167/cliproxyapi:prod-arm64`, plugins load, the log says `API server started successfully on: :8317`, and the client/config summary appears without startup errors. Use an external host probe such as `curl -fsS http://127.0.0.1:8312/healthz` from `cliproxy-prod-arm` when available; the distroless container itself has no shell or curl.
+
+5. Report the commit, immutable tag, registry digest, container status, startup log summary, and any smoke-probe result. Update the digest note above after a successful deploy.
 
 ### Docs / governance
 - `AGENTS.md` (this file) — fork-only. Upstream doesn't have it.

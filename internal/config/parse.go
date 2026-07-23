@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
@@ -49,12 +48,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		cfg.ErrorLogsMaxFiles = 10
 	}
 
-	if cfg.RedisUsageQueueRetentionSeconds <= 0 {
-		cfg.RedisUsageQueueRetentionSeconds = 60
-	} else if cfg.RedisUsageQueueRetentionSeconds > 3600 {
-		log.WithField("value", cfg.RedisUsageQueueRetentionSeconds).Warn("redis-usage-queue-retention-seconds too large; clamping to 3600")
-		cfg.RedisUsageQueueRetentionSeconds = 3600
-	}
+	normalizeRedisUsageQueueRetention(&cfg)
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0

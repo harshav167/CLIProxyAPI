@@ -387,6 +387,50 @@ func TestFixCLIToolResponse_PreservesFunctionResponseParts(t *testing.T) {
 	}
 }
 
+func TestFixCLIToolResponse_PreservesVideoFunctionResponseParts(t *testing.T) {
+	input := `{
+		"model": "gemini-3.6-flash-tiered",
+		"request": {
+			"contents": [
+				{
+					"role": "model",
+					"parts": [
+						{"functionCall": {"name": "view_file", "args": {}}}
+					]
+				},
+				{
+					"role": "function",
+					"parts": [
+						{
+							"functionResponse": {
+								"id": "tool-video",
+								"name": "view_file",
+								"response": {"result": ""},
+								"parts": [
+									{"inlineData": {"mimeType": "video/mp4", "data": "AAAAIGZ0eXBpc29t"}}
+								]
+							}
+						}
+					]
+				}
+			]
+		}
+	}`
+
+	result, err := fixCLIToolResponse(input)
+	if err != nil {
+		t.Fatalf("fixCLIToolResponse failed: %v", err)
+	}
+
+	inlineData := gjson.Get(result, "request.contents.1.parts.0.functionResponse.parts.0.inlineData")
+	if got := inlineData.Get("mimeType").String(); got != "video/mp4" {
+		t.Fatalf("video mime type = %q, want video/mp4", got)
+	}
+	if got := inlineData.Get("data").String(); got != "AAAAIGZ0eXBpc29t" {
+		t.Fatalf("video data = %q, want preserved base64", got)
+	}
+}
+
 func TestFixCLIToolResponse_BackfillsEmptyFunctionResponseName(t *testing.T) {
 	// Empty functionResponse names are backfilled from the corresponding functionCall.
 	input := `{

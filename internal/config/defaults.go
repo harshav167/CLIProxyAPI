@@ -1,5 +1,26 @@
 package config
 
+import (
+	log "github.com/sirupsen/logrus"
+)
+
+// MaxRedisUsageQueueRetentionSeconds is 7 days. Shared by parse + load paths.
+const MaxRedisUsageQueueRetentionSeconds = 7 * 24 * 3600
+
+func normalizeRedisUsageQueueRetention(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	if cfg.RedisUsageQueueRetentionSeconds <= 0 {
+		cfg.RedisUsageQueueRetentionSeconds = 60
+		return
+	}
+	if cfg.RedisUsageQueueRetentionSeconds > MaxRedisUsageQueueRetentionSeconds {
+		log.WithField("value", cfg.RedisUsageQueueRetentionSeconds).Warn("redis-usage-queue-retention-seconds too large; clamping to 604800 (7 days)")
+		cfg.RedisUsageQueueRetentionSeconds = MaxRedisUsageQueueRetentionSeconds
+	}
+}
+
 func newConfigWithDefaults() Config {
 	var cfg Config
 	cfg.Host = ""

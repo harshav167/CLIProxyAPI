@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -20,11 +21,25 @@ const (
 )
 
 type antigravityFetchAvailableModelsResponse struct {
-	WebSearchModelIDs []string `json:"webSearchModelIds"`
+	WebSearchModelIDs []string                           `json:"webSearchModelIds"`
+	Models            map[string]antigravityFetchedModel `json:"models"`
+}
+
+type antigravityFetchedModel struct {
+	DisplayName        string          `json:"displayName"`
+	SupportsImages     bool            `json:"supportsImages"`
+	SupportsThinking   bool            `json:"supportsThinking"`
+	ThinkingBudget     int             `json:"thinkingBudget"`
+	MinThinkingBudget  int             `json:"minThinkingBudget"`
+	MaxTokens          int             `json:"maxTokens"`
+	MaxOutputTokens    int             `json:"maxOutputTokens"`
+	SupportsVideo      bool            `json:"supportsVideo"`
+	SupportedMIMETypes map[string]bool `json:"supportedMimeTypes"`
 }
 
 type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
+	Models            map[string]*ModelInfo
 }
 
 func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Context, auth *coreauth.Auth) antigravityModelCapabilityHints {
@@ -42,8 +57,9 @@ func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Contex
 		client.Transport = transport
 	}
 
+	requestBody := antigravityModelsRequestBody(auth)
 	for _, baseURL := range antigravityModelBaseURLs(auth) {
-		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+antigravityModelsPath, strings.NewReader(`{}`))
+		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+antigravityModelsPath, strings.NewReader(requestBody))
 		if errReq != nil {
 			continue
 		}
@@ -67,11 +83,27 @@ func (s *Service) fetchAntigravityModelCapabilityHintsForAuth(ctx context.Contex
 			continue
 		}
 		hints := parseAntigravityModelCapabilityHints(body)
-		if len(hints.WebSearchModelIDs) > 0 {
+		if len(hints.WebSearchModelIDs) > 0 || len(hints.Models) > 0 {
 			return hints
 		}
 	}
 	return antigravityModelCapabilityHints{}
+}
+
+func antigravityModelsRequestBody(auth *coreauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return `{}`
+	}
+	projectID, _ := auth.Metadata["project_id"].(string)
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return `{}`
+	}
+	body, err := json.Marshal(map[string]string{"project": projectID})
+	if err != nil {
+		return `{}`
+	}
+	return string(body)
 }
 
 func (s *Service) antigravityModelFetchProxyURL(auth *coreauth.Auth) string {
@@ -125,14 +157,18 @@ func parseAntigravityModelCapabilityHints(body []byte) antigravityModelCapabilit
 			webSearchModels[modelID] = struct{}{}
 		}
 	}
-	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels}
+	models := make(map[string]*ModelInfo, len(parsed.Models))
+	for modelID, fetched := range parsed.Models {
+		modelID = normalizeAntigravityFetchedModelID(modelID)
+		if modelID == "" {
+			continue
+		}
+		models[modelID] = antigravityFetchedModelInfo(modelID, fetched)
+	}
+	return antigravityModelCapabilityHints{WebSearchModelIDs: webSearchModels, Models: models}
 }
 
 func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
-	if len(models) == 0 || len(hints.WebSearchModelIDs) == 0 {
-		return models
-	}
-
 	for _, model := range models {
 		if model == nil {
 			continue
@@ -141,8 +177,77 @@ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigra
 		if _, ok := hints.WebSearchModelIDs[modelID]; ok {
 			model.SupportsWebSearch = true
 		}
+		if fetched := hints.Models[modelID]; fetched != nil {
+			mergeAntigravityFetchedModel(model, fetched)
+		}
 	}
 	return models
+}
+
+func antigravityFetchedModelInfo(modelID string, fetched antigravityFetchedModel) *ModelInfo {
+	model := &ModelInfo{
+		ID:                        modelID,
+		Object:                    "model",
+		OwnedBy:                   "antigravity",
+		Type:                      "antigravity",
+		DisplayName:               strings.TrimSpace(fetched.DisplayName),
+		Name:                      modelID,
+		Description:               strings.TrimSpace(fetched.DisplayName),
+		ContextLength:             fetched.MaxTokens,
+		MaxCompletionTokens:       fetched.MaxOutputTokens,
+		SupportedInputModalities:  []string{"TEXT"},
+		SupportedOutputModalities: []string{"TEXT"},
+	}
+	if fetched.SupportsImages || antigravitySupportsMIMEPrefix(fetched.SupportedMIMETypes, "image/") {
+		model.SupportedInputModalities = append(model.SupportedInputModalities, "IMAGE")
+	}
+	if fetched.SupportsVideo || antigravitySupportsMIMEPrefix(fetched.SupportedMIMETypes, "video/") {
+		model.SupportedInputModalities = append(model.SupportedInputModalities, "VIDEO")
+	}
+	if fetched.SupportsThinking {
+		model.Thinking = &registry.ThinkingSupport{
+			Min:            fetched.MinThinkingBudget,
+			Max:            fetched.ThinkingBudget,
+			DynamicAllowed: fetched.ThinkingBudget == -1,
+		}
+		if model.Thinking.DynamicAllowed {
+			model.Thinking.Max = fetched.MaxOutputTokens
+		}
+	}
+	return model
+}
+
+func mergeAntigravityFetchedModel(model, fetched *ModelInfo) {
+	if fetched.DisplayName != "" {
+		model.DisplayName = fetched.DisplayName
+		model.Description = fetched.Description
+	}
+	if model.ContextLength == 0 && fetched.ContextLength > 0 {
+		model.ContextLength = fetched.ContextLength
+	}
+	if model.MaxCompletionTokens == 0 && fetched.MaxCompletionTokens > 0 {
+		model.MaxCompletionTokens = fetched.MaxCompletionTokens
+	}
+	if len(fetched.SupportedInputModalities) > 1 {
+		model.SupportedInputModalities = append([]string(nil), fetched.SupportedInputModalities...)
+	}
+	if len(fetched.SupportedOutputModalities) > 0 {
+		model.SupportedOutputModalities = append([]string(nil), fetched.SupportedOutputModalities...)
+	}
+	if fetched.Thinking != nil && (model.Thinking == nil || len(model.Thinking.Levels) == 0) {
+		thinking := *fetched.Thinking
+		thinking.Levels = append([]string(nil), fetched.Thinking.Levels...)
+		model.Thinking = &thinking
+	}
+}
+
+func antigravitySupportsMIMEPrefix(mimeTypes map[string]bool, prefix string) bool {
+	for mimeType, supported := range mimeTypes {
+		if supported && strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeAntigravityFetchedModelID(modelID string) string {

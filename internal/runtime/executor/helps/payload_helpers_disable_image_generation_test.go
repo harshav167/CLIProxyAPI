@@ -234,6 +234,33 @@ func TestApplyPayloadConfigWithRequest_FromProtocolGateUsesSourceProtocol(t *tes
 	}
 }
 
+func TestApplyPayloadConfigWithRequest_AntigravityTieredIncludeThoughtsOverrideUsesRequestRoot(t *testing.T) {
+	cfg := &config.Config{
+		Payload: config.PayloadConfig{
+			Override: []config.PayloadRule{
+				{
+					Models: []config.PayloadModelRule{{
+						Name:     "gemini-3.6-flash-tiered",
+						Protocol: "antigravity",
+					}},
+					Params: map[string]any{
+						"generationConfig.thinkingConfig.includeThoughts": true,
+					},
+				},
+			},
+		},
+	}
+	payload := []byte(`{"request":{"generationConfig":{"thinkingConfig":{"includeThoughts":false,"thinkingBudget":1000}}}}`)
+
+	out := ApplyPayloadConfigWithRequest(cfg, "gemini-3.6-flash-tiered", "antigravity", "openai", "request", payload, nil, "gemini-3.6-flash", "", nil)
+	if !gjson.GetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts").Bool() {
+		t.Fatalf("expected includeThoughts=true, payload=%s", string(out))
+	}
+	if got := gjson.GetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget").Int(); got != 1000 {
+		t.Fatalf("thinkingBudget = %d, want existing budget 1000; payload=%s", got, string(out))
+	}
+}
+
 func TestApplyPayloadConfigWithRequest_PayloadConditionsNarrowRule(t *testing.T) {
 	cfg := &config.Config{
 		Payload: config.PayloadConfig{

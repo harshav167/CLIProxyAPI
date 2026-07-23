@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-func TestEnqueueBroadcastsToUsageSubscribersAndSkipsQueue(t *testing.T) {
+func TestEnqueueBroadcastsToUsageSubscribersAndPersistsQueue(t *testing.T) {
 	withEnabledQueue(t, func() {
 		first, unsubscribeFirst := SubscribeUsage()
 		defer unsubscribeFirst()
@@ -20,15 +20,16 @@ func TestEnqueueBroadcastsToUsageSubscribersAndSkipsQueue(t *testing.T) {
 		requireUsageSubscriberPayload(t, first, "usage-record")
 		requireUsageSubscriberPayload(t, second, "usage-record")
 
-		if items := PopOldest(1); len(items) != 0 {
-			t.Fatalf("PopOldest() items = %q, want empty after subscriber broadcast", items)
+		items := PopOldest(1)
+		if len(items) != 1 || string(items[0]) != "usage-record" {
+			t.Fatalf("PopOldest() items = %q, want persisted record while subscribers are live", items)
 		}
 
 		unsubscribeFirst()
 		unsubscribeSecond()
 
 		Enqueue([]byte("queued-record"))
-		items := PopOldest(1)
+		items = PopOldest(1)
 		if len(items) != 1 || string(items[0]) != "queued-record" {
 			t.Fatalf("PopOldest() items = %q, want queued record after unsubscribe", items)
 		}
@@ -48,26 +49,10 @@ func TestEnqueuePersistsWhenSubscriberBufferFull(t *testing.T) {
 		for i := 0; i < usageSubscriberBuffer; i++ {
 			Enqueue([]byte("fill"))
 		}
-
-		// Drain everything currently buffered so we can isolate the overflow
-		// record below. The buffer now holds usageSubscriberBuffer "fill"
-		// records (deliveries succeeded, so none hit the backend yet).
-		for i := 0; i < usageSubscriberBuffer; i++ {
-			select {
-			case <-subscriber:
-			case <-time.After(time.Second):
-				t.Fatalf("timeout draining buffered fill record %d", i)
-			}
-		}
-
-		// Re-fill the buffer to capacity, then enqueue one more. The overflow
-		// record cannot be delivered (buffer full) and must be persisted to the
-		// backend rather than dropped.
-		for i := 0; i < usageSubscriberBuffer; i++ {
-			Enqueue([]byte("fill2"))
-		}
 		Enqueue([]byte("overflow-record"))
 
+		// Dual-write always persists; overflow must be present even when the
+		// subscriber channel could not accept the fan-out.
 		items := PopOldest(usageSubscriberBuffer + 1)
 		found := false
 		for _, item := range items {

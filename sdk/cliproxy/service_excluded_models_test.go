@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	internalregistry "github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/tidwall/gjson"
 )
 
 func TestRegisterModelsForAuth_UsesPreMergedExcludedModelsAttribute(t *testing.T) {
@@ -145,6 +147,13 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 		if got := r.Header.Get("Authorization"); got != "Bearer token" {
 			t.Fatalf("Authorization = %q, want bearer token", got)
 		}
+		requestBody, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read request body: %v", errRead)
+		}
+		if got := gjson.GetBytes(requestBody, "project").String(); got != "test-project" {
+			t.Fatalf("project = %q, want test-project", got)
+		}
 		sawFetch = true
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
@@ -156,6 +165,21 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 					},
 					"fetched-only-search-model": {
 						"displayName": "Fetched Only Search Model"
+					},
+					"gemini-3.6-flash-tiered": {
+						"displayName": "Gemini 3.6 Flash",
+						"supportsImages": true,
+						"supportsThinking": true,
+						"thinkingBudget": -1,
+						"minThinkingBudget": 32,
+						"maxTokens": 1048576,
+						"maxOutputTokens": 65536,
+						"supportsVideo": true,
+						"supportedMimeTypes": {
+							"image/png": true,
+							"video/mp4": true,
+							"audio/webm;codecs=opus": true
+						}
 					}
 				},
 				"webSearchModelIds": ["gemini-3.1-flash-lite", "fetched-only-search-model"]
@@ -173,6 +197,7 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 		},
 		Metadata: map[string]any{
 			"access_token": "token",
+			"project_id":   "test-project",
 		},
 	}
 
@@ -196,7 +221,7 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 		}
 	}
 
-	var webSearchModel, agentModel, staticOnlyModel, fetchedOnlyModel *internalregistry.ModelInfo
+	var webSearchModel, agentModel, staticOnlyModel, tieredModel *internalregistry.ModelInfo
 	for _, model := range models {
 		if model == nil {
 			continue
@@ -208,8 +233,8 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 			agentModel = model
 		case "gpt-oss-120b-medium":
 			staticOnlyModel = model
-		case "fetched-only-search-model":
-			fetchedOnlyModel = model
+		case "gemini-3.6-flash-tiered":
+			tieredModel = model
 		}
 	}
 	if webSearchModel == nil {
@@ -234,7 +259,27 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 	if staticOnlyModel == nil {
 		t.Fatal("expected static-only Antigravity model to remain registered")
 	}
-	if fetchedOnlyModel != nil {
-		t.Fatalf("fetched-only model should not be registered: %#v", fetchedOnlyModel)
+	for _, model := range models {
+		if model != nil && model.ID == "fetched-only-search-model" {
+			t.Fatalf("fetched-only internal model should not be registered: %#v", model)
+		}
+	}
+	if tieredModel == nil {
+		t.Fatal("expected gemini-3.6-flash-tiered to be registered")
+	}
+	if tieredModel.DisplayName != "Gemini 3.6 Flash" {
+		t.Fatalf("tiered model display name = %q, want Gemini 3.6 Flash", tieredModel.DisplayName)
+	}
+	if tieredModel.ContextLength != 1_048_576 || tieredModel.MaxCompletionTokens != 65_536 {
+		t.Fatalf("tiered token limits = %d/%d, want 1048576/65536", tieredModel.ContextLength, tieredModel.MaxCompletionTokens)
+	}
+	if tieredModel.Thinking == nil || tieredModel.Thinking.Min != 32 || !tieredModel.Thinking.DynamicAllowed {
+		t.Fatalf("tiered thinking metadata = %+v, want min 32 and dynamic", tieredModel.Thinking)
+	}
+	if got := strings.Join(tieredModel.SupportedInputModalities, ","); got != "TEXT,IMAGE,VIDEO" {
+		t.Fatalf("tiered input modalities = %q, want TEXT,IMAGE,VIDEO", got)
+	}
+	if got := strings.Join(tieredModel.SupportedOutputModalities, ","); got != "TEXT" {
+		t.Fatalf("tiered output modalities = %q, want TEXT", got)
 	}
 }

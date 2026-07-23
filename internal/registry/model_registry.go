@@ -1160,15 +1160,26 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		if len(model.SupportedEndpoints) > 0 {
 			result["supported_endpoints"] = append([]string(nil), model.SupportedEndpoints...)
 		}
+		if len(model.SupportedInputModalities) > 0 {
+			result["supportedInputModalities"] = append([]string(nil), model.SupportedInputModalities...)
+		}
+		if len(model.SupportedOutputModalities) > 0 {
+			result["supportedOutputModalities"] = append([]string(nil), model.SupportedOutputModalities...)
+		}
 		// Expose reasoning-effort metadata so OpenAI-family clients can discover
 		// thinking support directly from the registry surface.
 		if model.Thinking != nil {
+			thinking := map[string]any{
+				"min":             model.Thinking.Min,
+				"max":             model.Thinking.Max,
+				"zero_allowed":    model.Thinking.ZeroAllowed,
+				"dynamic_allowed": model.Thinking.DynamicAllowed,
+			}
 			if len(model.Thinking.Levels) > 0 {
-				result["thinking"] = map[string]any{
-					"levels": append([]string(nil), model.Thinking.Levels...),
-				}
+				thinking["levels"] = append([]string(nil), model.Thinking.Levels...)
 				result["reasoning_effort_levels"] = append([]string(nil), model.Thinking.Levels...)
 			}
+			result["thinking"] = thinking
 		}
 		return result
 
@@ -1216,6 +1227,12 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		}
 		if model.MaxCompletionTokens > 0 {
 			result["max_completion_tokens"] = model.MaxCompletionTokens
+		}
+		if len(model.SupportedInputModalities) > 0 {
+			result["supportedInputModalities"] = append([]string(nil), model.SupportedInputModalities...)
+		}
+		if len(model.SupportedOutputModalities) > 0 {
+			result["supportedOutputModalities"] = append([]string(nil), model.SupportedOutputModalities...)
 		}
 		return result
 

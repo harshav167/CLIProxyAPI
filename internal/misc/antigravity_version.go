@@ -145,7 +145,7 @@ func antigravityCLIUserAgentDetails() string {
 			}
 		}
 	}
-	return fmt.Sprintf("(%s; os_type=%s; arch=%s)", antigravityCLIClientName, osType, arch)
+	return fmt.Sprintf("(%s; os_type=%s; arch=%s; auth_method=consumer)", antigravityCLIClientName, osType, arch)
 }
 
 func isAntigravityFamilyUserAgent(lower string) bool {

@@ -26,8 +26,10 @@ const (
 	redisListSuffix       = ":queue"
 	redisDialTimeout      = 5 * time.Second
 	redisPingTimeout      = 5 * time.Second
-	maxPruneIterations    = 64
-	tsPrefixLen           = 8
+	// Bound prune work per enqueue so a large expired tail cannot stall
+	// the request path; remaining expired entries are cleared on later calls.
+	maxPruneIterations = 4096
+	tsPrefixLen        = 8
 )
 
 var pruneTailScript = redis.NewScript(`

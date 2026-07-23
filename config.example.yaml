@@ -97,9 +97,9 @@ error-logs-max-files: 10
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
-# How long (in seconds) usage queue items are retained in memory for the Management API.
-# The local Redis RESP usage output is disabled.
-# Default: 60. Max: 3600.
+# How long (in seconds) usage queue items are retained for the Management API /
+# RESP FIFO (in-memory or external Redis/Valkey via redis-queue).
+# Default: 60. Max: 604800 (7 days).
 redis-usage-queue-retention-seconds: 60
 
 # Optional external Redis/Valkey backend for the usage queue. When `enabled` is
@@ -226,8 +226,9 @@ codex:
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 
-# When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
-nonstream-keepalive-interval: 0
+# Emit blank lines while waiting for non-streaming responses so reverse proxies
+# such as Cloudflare do not terminate slow multimodal or reasoning requests.
+nonstream-keepalive-interval: 15
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
 #   keepalive-seconds: 15   # Generic streams: default 0 (disabled). Claude /v1/messages bootstrap: default 15s when unset.
@@ -428,6 +429,9 @@ nonstream-keepalive-interval: 0
 #       alias: "gemini-3.1-pro-preview"   # client-visible id (Gemini 3.1 Pro Preview)
 #       fork: true
 #       force-mapping: true
+#     - name: "gemini-3.6-flash-tiered"   # live tiered Flash model; image and video input
+#       alias: "gemini-3.6-flash"
+#       fork: true
 #   claude:
 #     - name: "claude-sonnet-4-5-20250929"
 #       alias: "cs4.5"
@@ -503,6 +507,11 @@ nonstream-keepalive-interval: 0
 #       params: # JSON path (gjson/sjson syntax) -> raw JSON value (strings are used as-is, must be valid JSON)
 #         "generationConfig.responseJsonSchema": "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}}}"
 #   override: # Override rules always set parameters, overwriting any existing values.
+#     - models:
+#         - name: "gemini-3.6-flash-tiered"
+#           protocol: "antigravity"
+#       params:
+#         "generationConfig.thinkingConfig.includeThoughts": true
 #     - models:
 #         - name: "gpt-5.4-fast"
 #           protocol: "codex"

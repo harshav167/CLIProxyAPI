@@ -425,15 +425,9 @@
         "batchGenerateContent"
       ],
       "thinking": {
-        "min": 128,
-        "max": 32768,
-        "dynamic_allowed": true,
-        "levels": [
-          "minimal",
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 32,
+        "max": 65536,
+        "dynamic_allowed": true
       }
     },
     {
@@ -511,15 +505,8 @@
         "batchGenerateContent"
       ],
       "thinking": {
-        "min": 128,
-        "max": 32768,
-        "dynamic_allowed": true,
-        "levels": [
-          "minimal",
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 32,
+        "max": 10000
       }
     }
   ],
@@ -667,15 +654,9 @@
         "batchGenerateContent"
       ],
       "thinking": {
-        "min": 128,
-        "max": 32768,
-        "dynamic_allowed": true,
-        "levels": [
-          "minimal",
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 32,
+        "max": 65536,
+        "dynamic_allowed": true
       }
     },
     {
@@ -754,15 +735,8 @@
         "batchGenerateContent"
       ],
       "thinking": {
-        "min": 128,
-        "max": 32768,
-        "dynamic_allowed": true,
-        "levels": [
-          "minimal",
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 32,
+        "max": 10000
       }
     },
     {
@@ -2199,16 +2173,18 @@
       "description": "Gemini 3 Flash",
       "context_length": 1048576,
       "max_completion_tokens": 65536,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 128,
-        "max": 32768,
-        "dynamic_allowed": true,
-        "levels": [
-          "minimal",
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 32,
+        "max": 65536,
+        "dynamic_allowed": true
       }
     },
     {
@@ -2221,16 +2197,17 @@
       "description": "Gemini 3.5 Flash (High)",
       "context_length": 1048576,
       "max_completion_tokens": 65536,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 128,
-        "max": 32768,
-        "dynamic_allowed": true,
-        "levels": [
-          "minimal",
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 32,
+        "max": 10000
       }
     },
     {
@@ -2261,15 +2238,17 @@
       "description": "Gemini 3.1 Pro (High)",
       "context_length": 1048576,
       "max_completion_tokens": 65535,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 1,
-        "max": 65535,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 128,
+        "max": 10001
       }
     },
     {
@@ -2282,15 +2261,17 @@
       "description": "Gemini 3.1 Pro (Low)",
       "context_length": 1048576,
       "max_completion_tokens": 65535,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 1,
-        "max": 65535,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 128,
+        "max": 1001
       }
     },
     {
@@ -2336,16 +2317,18 @@
       "name": "gemini-3.5-flash-low",
       "description": "Gemini 3.5 Flash (Medium)",
       "context_length": 1048576,
-      "max_completion_tokens": 65535,
+      "max_completion_tokens": 65536,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 1,
-        "max": 65535,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 32,
+        "max": 4000
       }
     },
     {
@@ -2357,16 +2340,42 @@
       "name": "gemini-3.5-flash-extra-low",
       "description": "Gemini 3.5 Flash (Low)",
       "context_length": 1048576,
-      "max_completion_tokens": 65535,
+      "max_completion_tokens": 65536,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
       "thinking": {
-        "min": 1,
-        "max": 65535,
-        "dynamic_allowed": true,
-        "levels": [
-          "low",
-          "medium",
-          "high"
-        ]
+        "min": 32,
+        "max": 1000
+      }
+    },
+    {
+      "id": "gemini-3.6-flash-tiered",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Gemini 3.6 Flash",
+      "name": "gemini-3.6-flash-tiered",
+      "description": "Gemini 3.6 Flash",
+      "context_length": 1048576,
+      "max_completion_tokens": 65536,
+      "supportedInputModalities": [
+        "TEXT",
+        "IMAGE",
+        "VIDEO"
+      ],
+      "supportedOutputModalities": [
+        "TEXT"
+      ],
+      "thinking": {
+        "min": 32,
+        "max": 65536,
+        "dynamic_allowed": true
       }
     }
   ],

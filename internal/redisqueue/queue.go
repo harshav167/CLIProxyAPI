@@ -8,9 +8,11 @@ import (
 
 const (
 	defaultRetentionSeconds int64 = 60
-	maxRetentionSeconds     int64 = 3600
-	usageSubscriberBuffer         = 256
-	errorSubscriberBuffer         = 256
+	// maxRetentionSeconds is 7 days. External Redis/Valkey backends need this
+	// headroom; in-memory still works but can grow large under heavy traffic.
+	maxRetentionSeconds   int64 = 7 * 24 * 3600
+	usageSubscriberBuffer       = 256
+	errorSubscriberBuffer       = 256
 
 	usageSupportRefreshPayload = `{"support_refresh":true}`
 	usageRefreshPayload        = `{"refresh":true}`
@@ -94,14 +96,10 @@ func Enqueue(payload []byte) {
 	if len(payload) == 0 {
 		return
 	}
-	// Live SUBSCRIBE fanout and poll-based LPOP are alternative transports, so
-	// we only short-circuit the backend enqueue when the payload was actually
-	// delivered to at least one live subscriber. When there are no subscribers,
-	// or every subscriber's buffer was full (and thus dropped), the record
-	// would otherwise be lost — fall through and persist it to the backend.
-	if publishToUsageSubscribers(payload) {
-		return
-	}
+	// Fan-out to live SUBSCRIBE clients and always persist to the backend.
+	// Persistence must not depend on whether a subscriber is attached — otherwise
+	// a long-lived consumer (e.g. usage-keeper) empties the durable Redis FIFO.
+	_ = publishToUsageSubscribers(payload)
 	getBackend().Enqueue(payload)
 }
 
