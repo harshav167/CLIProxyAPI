@@ -105,3 +105,62 @@ func TestClaudeModelsJSONInvariants(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeOpus5CatalogContract(t *testing.T) {
+	var opus5 *ModelInfo
+	for _, model := range GetClaudeModels() {
+		if model != nil && model.ID == "claude-opus-5" {
+			opus5 = model
+			break
+		}
+	}
+	if opus5 == nil {
+		t.Fatal("claude-opus-5 missing from embedded Claude model catalog")
+	}
+	if opus5.ContextLength != 1_000_000 {
+		t.Fatalf("claude-opus-5 context_length = %d, want 1000000", opus5.ContextLength)
+	}
+	if opus5.MaxCompletionTokens != 64_000 {
+		t.Fatalf("claude-opus-5 max_completion_tokens = %d, want captured 64000", opus5.MaxCompletionTokens)
+	}
+	if opus5.Thinking == nil {
+		t.Fatal("claude-opus-5 thinking metadata is nil")
+	}
+	if opus5.Thinking.Min != 1_024 || opus5.Thinking.Max != 64_000 || !opus5.Thinking.ZeroAllowed {
+		t.Fatalf("claude-opus-5 thinking metadata = %+v, want min=1024 max=64000 zero_allowed=true", opus5.Thinking)
+	}
+	wantLevels := []string{"low", "medium", "high", "xhigh", "max"}
+	if len(opus5.Thinking.Levels) != len(wantLevels) {
+		t.Fatalf("claude-opus-5 thinking levels = %v, want %v", opus5.Thinking.Levels, wantLevels)
+	}
+	for i, want := range wantLevels {
+		if opus5.Thinking.Levels[i] != want {
+			t.Fatalf("claude-opus-5 thinking level[%d] = %q, want %q", i, opus5.Thinking.Levels[i], want)
+		}
+	}
+}
+
+func TestIsAdaptiveClaudeOpusModel(t *testing.T) {
+	for _, model := range []string{
+		"claude-opus-4-7",
+		"claude-opus-4-7-thinking-low",
+		"claude-opus-4-8",
+		"claude-opus-4-8-thinking-max",
+		"claude-opus-5",
+		"claude-opus-5-thinking-high",
+	} {
+		if !IsAdaptiveClaudeOpusModel(model) {
+			t.Errorf("IsAdaptiveClaudeOpusModel(%q) = false, want true", model)
+		}
+	}
+	for _, model := range []string{
+		"claude-opus-50",
+		"claude-opus-5-preview",
+		"claude-sonnet-5",
+		"mythos",
+	} {
+		if IsAdaptiveClaudeOpusModel(model) {
+			t.Errorf("IsAdaptiveClaudeOpusModel(%q) = true, want false", model)
+		}
+	}
+}

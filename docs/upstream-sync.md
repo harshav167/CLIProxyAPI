@@ -15,9 +15,8 @@ This is fork-only governance. Upstream does not have this file.
 The fork is a **behavior superset** of upstream. Upstream is a moving base; our
 customizations sit on top:
 
-- Cursor system-prompt rewrite (identity + integrity contract) for Claude/GPT/Fable
+- Cursor system-prompt rewrite (identity + integrity contract) for Claude/GPT
 - xAI / Grok Composer request normalizers (422 / 400 fixes)
-- `f5-*` Cursor Fable 5 aliases (bypass the ZDR routing gate) + embedded snapshot
 - Deeper observability (OTel → SigNoz, quota metrics, error-body transport logs)
 - Billing / cache-control behavior tuned to Claude Code's canonical layout
 - CGO-enabled, glibc-compatible plugin runtime: Bookworm builder with Zig
@@ -65,7 +64,7 @@ Commit (`chore: sync upstream/main (<N> commits incl. <themes>)`), update
 | `internal/api/server.go`, `handlers/management/handler.go` | observability vs pluginhost wiring/setters | Keep BOTH |
 | `sdk/cliproxy/service.go` | our observability lifecycle vs upstream API-key/plugin lifecycle | Keep BOTH |
 | `cmd/server/main.go` | our redis env overrides vs upstream plugin bootstrap | Keep BOTH |
-| `internal/runtime/executor/*` | upstream executor/translator refactors vs our hooks | Re-apply our hook onto moved call site; verify `ApplyCursorFableAliasSnapshot` runs after `thinking.ApplyThinking`, before `applyCloaking` |
+| `internal/runtime/executor/*` | upstream executor/translator refactors vs our hooks | Preserve Cursor prompt rewriting, cache control/diagnostics, and provider normalizers at their established request-phase positions |
 | `Dockerfile` | upstream build/runtime changes vs our plugin-capable CGO + distroless policy | Preserve `CGO_ENABLED=1`, Zig cross-compilation, glibc compatibility, the distroless Debian production runtime, non-root execution, and `ENV TZ=Australia/Sydney` |
 
 When in doubt: prefer ours, or keep both if additive. Only take upstream's side

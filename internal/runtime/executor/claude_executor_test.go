@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -141,17 +142,7 @@ func TestApplyClaudeHeaders_PreservesPromptCachingBetaAndAddsContext1M(t *testin
 	}
 }
 
-func TestApplyClaudeHeaders_ForcePreservesClaudeCodeOpus48Betas(t *testing.T) {
-	// Regression test for the 3 betas confirmed in the 2026-05-29 Proxyman
-	// captures of claude-cli/2.1.156 hitting api.anthropic.com against
-	// claude-opus-4-8 (Opus 4.8). They MUST be force-preserved even when a
-	// client supplies a narrower Anthropic-Beta override; otherwise:
-	//   - thinking-token-count-2026-05-13 → usage.output_tokens_details.thinking_tokens
-	//     stops being reported (Opus 4.8 flow 46 in our capture surfaced 58 thinking
-	//     tokens via this beta).
-	//   - mid-conversation-system-2026-04-07 → Anthropic intermittently rejects
-	//     mid-conversation system inserts that Cursor BYOK + Claude Code both send.
-	//   - extended-cache-ttl-2025-04-11 → explicit ttl:"1h" cache_control enablement.
+func TestApplyClaudeHeaders_PreservesRequiredOpus5Betas(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 
 	// Simulate a narrow client override that omits all three new betas.
@@ -171,11 +162,18 @@ func TestApplyClaudeHeaders_ForcePreservesClaudeCodeOpus48Betas(t *testing.T) {
 	betas := req.Header.Get("Anthropic-Beta")
 	for _, want := range []string{
 		"thinking-token-count-2026-05-13",
-		"mid-conversation-system-2026-04-07",
+		"context-management-2025-06-27",
+		"prompt-caching-scope-2026-01-05",
 		"extended-cache-ttl-2025-04-11",
+		"cache-diagnosis-2026-04-07",
 	} {
 		if !strings.Contains(betas, want) {
 			t.Errorf("Anthropic-Beta = %q, want %q force-preserved", betas, want)
+		}
+	}
+	for _, obsolete := range []string{"mid-conversation-system-2026-04-07"} {
+		if strings.Contains(betas, obsolete) {
+			t.Errorf("Anthropic-Beta = %q, obsolete GA gate %q should be omitted", betas, obsolete)
 		}
 	}
 }
@@ -245,9 +243,7 @@ func TestApplyClaudeHeaders_IgnoresClientInboundAnthropicBetaHeader(t *testing.T
 		"thinking-token-count-2026-05-13",
 		"context-management-2025-06-27",
 		"prompt-caching-scope-2026-01-05",
-		"mid-conversation-system-2026-04-07",
 		"effort-2025-11-24",
-		"extended-cache-ttl-2025-04-11",
 		"cache-diagnosis-2026-04-07",
 		"structured-outputs-2025-12-15",
 		"fast-mode-2026-02-01",
@@ -287,10 +283,7 @@ func TestApplyClaudeHeaders_DropsAdvisorToolBetaForFork(t *testing.T) {
 	}
 }
 
-func TestApplyClaudeHeaders_DefaultBetaSetIncludesOpus48Betas(t *testing.T) {
-	// Belt-and-suspenders: with NO client Anthropic-Beta header at all, the
-	// default base set must already include the 3 Opus 4.8 betas. This is the
-	// path Cursor BYOK and other clients with no Anthropic-Beta hit.
+func TestApplyClaudeHeaders_DefaultBetaSetIncludesOpus5Policy(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 
 	req := newClaudeHeaderTestRequest(t, http.Header{})
@@ -306,16 +299,20 @@ func TestApplyClaudeHeaders_DefaultBetaSetIncludesOpus48Betas(t *testing.T) {
 	betas := req.Header.Get("Anthropic-Beta")
 	for _, want := range []string{
 		"thinking-token-count-2026-05-13",
-		"mid-conversation-system-2026-04-07",
-		"extended-cache-ttl-2025-04-11",
-		// Pre-existing default betas must still be present so we don't regress.
+		"context-management-2025-06-27",
 		"prompt-caching-scope-2026-01-05",
+		"extended-cache-ttl-2025-04-11",
 		"cache-diagnosis-2026-04-07",
 		"context-1m-2025-08-07",
 		"effort-2025-11-24",
 	} {
 		if !strings.Contains(betas, want) {
 			t.Errorf("default Anthropic-Beta = %q, want %q present", betas, want)
+		}
+	}
+	for _, obsolete := range []string{"mid-conversation-system-2026-04-07"} {
+		if strings.Contains(betas, obsolete) {
+			t.Errorf("default Anthropic-Beta = %q, obsolete GA gate %q should be omitted", betas, obsolete)
 		}
 	}
 }
@@ -1134,6 +1131,52 @@ func TestClaudeExecutor_ExecuteStripsOpenAIEncryptedThinkingBeforeUpstream(t *te
 	}
 	if got := content[0].Get("text").String(); got != "Answer" {
 		t.Fatalf("remaining content text = %q, want Answer", got)
+	}
+}
+
+func TestClaudeExecutor_ExecuteChainsCacheDiagnosticsByExecutionSession(t *testing.T) {
+	var seenBodies [][]byte
+	responseID := "msg_first"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBodies = append(seenBodies, bytes.Clone(body))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":%q,"type":"message","model":"claude-opus-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`, responseID)
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "cursor-session-" + uuid.NewString(),
+		},
+	}
+	payload := []byte(`{
+		"model":"claude-opus-5",
+		"thinking":{"type":"adaptive"},
+		"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+	}`)
+
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "claude-opus-5", Payload: payload}, opts); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	responseID = "msg_second"
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "claude-opus-5", Payload: payload}, opts); err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if len(seenBodies) != 2 {
+		t.Fatalf("captured request count = %d, want 2", len(seenBodies))
+	}
+	if got := gjson.GetBytes(seenBodies[0], "diagnostics.previous_message_id"); !got.Exists() || got.Type != gjson.Null {
+		t.Fatalf("first previous_message_id = %s, want explicit null; body=%s", got.Raw, seenBodies[0])
+	}
+	if got := gjson.GetBytes(seenBodies[1], "diagnostics.previous_message_id").String(); got != "msg_first" {
+		t.Fatalf("second previous_message_id = %q, want msg_first; body=%s", got, seenBodies[1])
 	}
 }
 

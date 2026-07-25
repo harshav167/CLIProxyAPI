@@ -341,6 +341,14 @@ func deriveCursorSessionID(rawJSON []byte, salt string) string {
 		sum := sha256.Sum256([]byte("cursor-conv-session\x00" + salt + "\x00" + user + "\x00" + model + "\x00" + convID))
 		return "cursor-conv-" + hex.EncodeToString(sum[:12])
 	}
+	if metadataUserID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.user_id").String()); metadataUserID != "" {
+		model := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+		if model == "" {
+			return ""
+		}
+		sum := sha256.Sum256([]byte("cursor-metadata-user\x00" + salt + "\x00" + model + "\x00" + metadataUserID))
+		return "cursor-metadata-user-" + hex.EncodeToString(sum[:12])
+	}
 	user := strings.TrimSpace(gjson.GetBytes(rawJSON, "user").String())
 	if user == "" {
 		return ""

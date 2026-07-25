@@ -204,7 +204,7 @@ Executors are stateless provider clients keyed by provider. Common executor resp
 Important examples:
 
 - `openai_compat_executor.go`: OpenAI-compatible HTTP execution, images endpoints, GLM normalization, Alibaba explicit cache control, Kimi reasoning normalization, openai-compatible stream normalization.
-- `claude_executor.go`: Claude Messages API execution, Cursor/Fable prompt handling, Claude OAuth tool renaming, Claude cache control, signature sanitization, web-search-domain sanitization.
+- `claude_executor.go`: Claude Messages API execution, Cursor prompt handling, Claude OAuth tool renaming, Claude cache control and diagnostics, signature sanitization, web-search-domain sanitization.
 - `codex_executor.go` and `codex_websockets_executor.go`: Codex responses/websocket execution, continuation fold, liveness deadlines.
 - `xai_executor.go`: xAI/Grok request sanitization and tool handling.
 - `antigravity_executor.go`, `gemini_executor.go`, `gemini_vertex_executor.go`, `aistudio_executor.go`, `kimi_executor.go`: other upstream provider families.
@@ -214,7 +214,7 @@ Important examples:
 This is the provider compatibility toolbox. It contains focused helpers and tests for:
 
 - prompt/cache control (`claude_cache_control.go`, `claude_cursor_system_prompt.go`, `cursor_system_prompt.go`),
-- Cursor Fable alias snapshot (`cursor_fable_alias.go`, `cursor_fable_snapshot/`),
+- Claude cache diagnostics (`claude_cache_diagnostics.go`),
 - GLM request normalization (`glm_normalizer.go`),
 - OpenAI-compatible stream normalization (`openai_compat_stream_normalizer.go`),
 - Codex continue-thinking helpers (`codex_continue_thinking.go`),
@@ -456,15 +456,6 @@ These are architecture constraints, not incidental features. They are documented
 
 Cursor prompt rewrite and Claude system-block rebuild are fork behavior and must not be lost during upstream sync.
 
-### Cursor Fable alias invariants
-
-- `internal/runtime/executor/helps/cursor_fable_alias.go`
-- `internal/runtime/executor/helps/cursor_fable_snapshot/`
-- hook in `internal/runtime/executor/claude_executor.go`
-- config aliases in Docker/prod config
-
-The snapshot is the contract for `f5-*` aliases and must stay embedded rather than replaced by live capture.
-
 ### xAI/Grok composer fixes
 
 - `internal/runtime/executor/xai_executor.go`
@@ -578,7 +569,7 @@ Fork features often depend on exact placement in executor flows: after translati
 
 - Keep `AGENTS.md`, `MIGRATION-LEDGER.md`, `.agents/skills/upstream-sync/SKILL.md`, and `docs/upstream-sync.md` as mandatory sync references.
 - Before resolving merge conflicts, enumerate fork-only files and verify they remain present after merge.
-- Add lightweight smoke tests around Cursor/Fable, GLM, xAI, Codex continue-thinking, and stream normalization paths.
+- Add lightweight smoke tests around Cursor/Claude, GLM, xAI, Codex continue-thinking, and stream normalization paths.
 
 ### P1 — Make request phase order explicit
 

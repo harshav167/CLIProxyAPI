@@ -35,7 +35,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ClaudeExecutor is a stateless executor for Anthropic Claude over the messages API.
+// ClaudeExecutor executes Anthropic Claude requests over the messages API.
+// Cache-diagnostics state is stored in the shared bounded-TTL helper store.
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type ClaudeExecutor struct {
 	cfg *config.Config
@@ -45,6 +46,7 @@ type preparedClaudeRequest struct {
 	baseModel                string
 	apiKey                   string
 	baseURL                  string
+	executionSessionID       string
 	from                     sdktranslator.Format
 	to                       sdktranslator.Format
 	bodyForTranslation       []byte
@@ -191,8 +193,9 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 
 func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (preparedClaudeRequest, error) {
 	prepared := preparedClaudeRequest{
-		baseModel: thinking.ParseSuffix(req.Model).ModelName,
-		to:        sdktranslator.FromString("claude"),
+		baseModel:          thinking.ParseSuffix(req.Model).ModelName,
+		executionSessionID: helps.ExecutionSessionIDFromOptions(opts),
+		to:                 sdktranslator.FromString("claude"),
 	}
 	prepared.apiKey, prepared.baseURL = claudeCreds(auth)
 	if prepared.baseURL == "" {
@@ -227,16 +230,6 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = rebuildMidSystemMessagesToTopLevel(body)
 	}
-
-	// Cursor Fable 5 alias path: when Cursor sends a non-claude-prefixed alias
-	// (f5-*), it skips its ZDR routing gate but also sends a generic custom-model
-	// system prompt + tool set instead of the rich Cursor→Anthropic shape it
-	// uses for real claude-* models. Swap both with a captured snapshot of a
-	// real prod Cursor→Anthropic claude-* request so the upstream Fable 5 call
-	// still sees Cursor's native tools and Cursor's Claude-flavour system
-	// blocks. The model field has already been resolved to the backing
-	// claude-fable-5 model upstream of here, so we key off the inbound req.Model.
-	body = helps.ApplyCursorFableAliasSnapshot(body, req.Model)
 
 	body, err = applyCloaking(ctx, e.cfg, auth, body, prepared.baseModel, prepared.apiKey)
 	if err != nil {
@@ -284,6 +277,7 @@ func (e *ClaudeExecutor) prepareMessagesRequest(ctx context.Context, auth *clipr
 	if e.cfg != nil && e.cfg.ClaudeCursorGlobalCacheScope {
 		body = helps.StripClaudeCacheControlsBeforeGlobalAnchor(body)
 	}
+	body = helps.PrepareClaudeCacheDiagnostics(body, prepared.executionSessionID)
 	body = stripUnsupportedAnthropicFields(body)
 
 	prepared.extraBetas, body = extractAndRemoveBetas(body)
@@ -427,6 +421,11 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 	}
 	data = restoreClaudeOAuthToolNamesFromResponse(data, claudeToolPrefix, auth.ToolPrefixDisabled(), prepared.oauthToolNamesReverseMap)
+	messageID := helps.ClaudeMessageIDFromResponse(data)
+	if upstreamStream {
+		messageID = helps.ClaudeMessageIDFromSSE(data)
+	}
+	helps.RecordClaudeCacheDiagnosticsMessageID(prepared.executionSessionID, messageID)
 	var param any
 	out := sdktranslator.TranslateNonStream(
 		ctx,
@@ -543,6 +542,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+				helps.RecordClaudeCacheDiagnosticsMessageID(prepared.executionSessionID, helps.ClaudeMessageIDFromResponse(line))
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 					reporter.Publish(ctx, detail)
 					logClaudeUsageFromLine(prepared.baseModel, line)
@@ -585,6 +585,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
+			helps.RecordClaudeCacheDiagnosticsMessageID(prepared.executionSessionID, helps.ClaudeMessageIDFromResponse(line))
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 				logClaudeUsageFromLine(prepared.baseModel, line)
@@ -1106,9 +1107,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 
 	// We are talking to Anthropic via Claude Code OAuth (or fall back to API key
 	// against the Anthropic base URL). Either way the most reliable behavior is
-	// to send the canonical Claude Code beta set — the literal string a real
-	// claude-cli/2.1.156 ships on every /v1/messages call (verified 2026-05-29
-	// via Proxyman captures against api.anthropic.com on claude-opus-4-8).
+	// to send a curated Claude Code-compatible beta set. The current policy is
+	// grounded in claude-cli/2.1.220 Opus 5 captures, with obsolete GA gates and
+	// strategically excluded product betas removed.
 	//
 	// Why we ignore the client's inbound Anthropic-Beta header entirely:
 	//   - Cursor BYOK Claude traffic sends `Anthropic-Beta: max-effort-2026-01-24`
@@ -1140,16 +1141,20 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	// without understanding it risks unintended server-side behavior. Revisit
 	// if/when we explicitly want that feature.
 	//
-	// We keep context-management-2025-06-27 even though we don't yet inject
-	// the matching context_management.edits[] field. The beta header alone
-	// is a server-side no-op — it just gates the schema. Keeping it on costs
-	// nothing and lets us turn on server-side clear_thinking/clear_tool_uses
-	// edits later without a header dance.
+	// context-management-2025-06-27 gates the clear_thinking edit injected for
+	// adaptive Opus aliases. cache-diagnosis-2026-04-07 is paired with the
+	// executor's per-execution-session previous_message_id replay.
+	//
+	// extended-cache-ttl-2025-04-11 remains required for Anthropic to account
+	// explicit ttl:"1h" breakpoints in the one-hour cache bucket. Production
+	// responses silently reported those writes as ephemeral_5m when the gate was
+	// omitted. mid-conversation-system-2026-04-07 remains omitted because that
+	// behavior is generally available.
 	//
 	// Extras kept from upstream's curated cross-client safe set: structured-outputs-2025-12-15,
 	// fast-mode-2026-02-01, token-efficient-tools-2026-03-28. These don't appear
 	// in Claude Code but are additive Anthropic features; harmless to send.
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,structured-outputs-2025-12-15,fast-mode-2026-02-01,token-efficient-tools-2026-03-28"
+	baseBetas := "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07,structured-outputs-2025-12-15,fast-mode-2026-02-01,token-efficient-tools-2026-03-28"
 	_ = ginHeaders // client Anthropic-Beta header intentionally ignored; see comment above
 
 	hasClaude1MHeader := false

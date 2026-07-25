@@ -24,7 +24,7 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 
 ## Cursor Request Shape
 
-- Cursor does **not** send Anthropic Messages format to the proxy on ingress, even when the user picked a native Claude/Fable model in Cursor. Cursor sends an **OpenAI chat-completions style** request body to cliproxy, and cliproxy's Claude path translates it later.
+- Cursor does **not** send Anthropic Messages format to the proxy on ingress, even when the user picked a native Claude model in Cursor. Cursor sends an **OpenAI chat-completions style** request body to cliproxy, and cliproxy's Claude path translates it later.
 - If you need the exact raw Cursor `system` prompt or native tool array, inspect the proxy's **request/response logs**, not ProxyMan captures from Claude Code:
   - local container: `docker/logs/cliproxy/`
   - prod VM: `~/cliproxy/logs/` on the ARM Axion prod VM (see Production deploy target below)
@@ -170,7 +170,7 @@ Per z.ai spec: `reasoning_effort` only takes effect when `thinking.type: enabled
 This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me/CLIProxyAPI`) does not have. Every upstream sync MUST keep these intact. List updated 2026-06-13; refresh whenever a fork-only feature is added.
 
 ### Cursor system-prompt rewrite (Claude path)
-- `internal/runtime/executor/helps/cursor_system_prompt.go` — identity-line + integrity-contract rewrite shared by GPT-5.4 / Codex / Opus / Fable. Touch carefully; the integrity contract has been redlined by the user.
+- `internal/runtime/executor/helps/cursor_system_prompt.go` — identity-line + integrity-contract rewrite shared by GPT-5.4 / Codex / Opus. Touch carefully; the integrity contract has been redlined by the user.
 - `internal/runtime/executor/helps/claude_cursor_system_prompt.go` — Cursor → Claude system-block rebuild: billing header + identity block + cache_control anchoring. Mirrors the canonical Claude Code 2.1.156 Opus 4.8 layout (verified 2026-05-29).
 - `internal/runtime/executor/helps/cursor_system_prompt_test.go` / `claude_cursor_system_prompt_test.go` — assertions for the canonical layout. Update tests when prompt redline changes.
 
@@ -187,13 +187,6 @@ This fork (`harshav167/CLIProxyAPI`) adds behaviour the upstream (`router-for-me
 - Grok 4.5: builtin registry entry (500k context, effort low/medium/high, cannot disable); `coerceXAIReasoningEffort` maps `none`/`minimal`→`low`; oauth aliases `grok-4.5` / `grok-4.5-{low,medium,high}` / `grok-latest` + payload effort overrides.
 - `internal/runtime/executor/xai_executor.go::normalizeXAITool` — drops `apply_patch` from `tools` entirely (xAI refuses to register it). Pairs with the orphan rewrite above.
 - `internal/runtime/executor/xai_executor_test.go` — covers normalisers, include/store/previous_response_id, Grok 4.5 coercion, and Cursor-source replay enablement.
-
-### Cursor Fable 5 alias (`f5-*` family, bypasses Cursor ZDR routing gate)
-- `internal/runtime/executor/helps/cursor_fable_alias.go` — `ApplyCursorFableAliasSnapshot` swaps `system` and `tools` transactionally when inbound model matches `f5-*`. Both `sjson` writes succeed-or-rollback; if either fails the original payload is returned and the failure is logged.
-- `internal/runtime/executor/helps/cursor_fable_snapshot/` — embedded Go asset (`//go:embed`) containing the captured Cursor → Anthropic Opus 4.7 thinking-max system blocks (identity swapped to "Claude Fable 5") + the 19 native Cursor tools (`Shell`, `Read`, `Grep`, `StrReplace`, `Task`, `TodoWrite`, …). DO NOT replace this with a live capture; the embedded version is the contract.
-- `internal/runtime/executor/claude_executor.go` — hook point: the line immediately after `thinking.ApplyThinking` and before `applyCloaking`. Calls `helps.ApplyCursorFableAliasSnapshot(body, req.Model)`. Hook MUST run before `applyCloaking` so the rest of the Cursor pipeline sees the swapped body.
-- `docker/config/cliproxy-config.yaml` — five `overrides:` (each `protocol: claude`) and five `oauth-model-alias: claude:` entries map `f5-low` / `f5-medium` / `f5-high` / `f5-xhigh` / `f5-max` to `claude-fable-5` with the matching effort level. Same config is mirrored on the prod VM (ARM Axion, `wade@proxy`) — back up before editing, file is hand-edited in place.
-- If a user asks whether `f5-*` is sending the "right" prompt/tools, verify in the request logs above. The expected behavior is: inbound model `f5-*` → snapshot injects Cursor-native Anthropic-model `system` + 19 native tools → normal Claude rewrite pipeline continues.
 
 ### Codex workspace / billing reality
 - ChatGPT web workspaces and OpenAI API/Codex orgs are **different systems**. The UUID shown in `chatgpt.com` workspace pickers is **not** the same identifier as the `org-...` value on `platform.openai.com`.

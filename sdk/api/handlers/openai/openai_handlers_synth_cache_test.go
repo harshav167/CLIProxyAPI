@@ -272,6 +272,42 @@ func TestDeriveCursorSessionIDPrefersCursorConversationId(t *testing.T) {
 	}
 }
 
+func TestDeriveCursorSessionIDFallsBackToMetadataUserID(t *testing.T) {
+	bodyA1 := []byte(`{"model":"claude-opus-5-thinking-high","metadata":{"user_id":"user_01KS79"},"messages":[{"role":"user","content":"turn one"}]}`)
+	bodyA2 := []byte(`{"model":"claude-opus-5-thinking-high","metadata":{"user_id":"user_01KS79"},"messages":[{"role":"user","content":"turn one"},{"role":"assistant","content":"reply"},{"role":"user","content":"turn two"}]}`)
+	bodyOtherModel := []byte(`{"model":"claude-opus-5-thinking-max","metadata":{"user_id":"user_01KS79"},"messages":[{"role":"user","content":"turn one"}]}`)
+
+	sessionA1 := deriveCursorSessionID(bodyA1, "tenant-a")
+	sessionA2 := deriveCursorSessionID(bodyA2, "tenant-a")
+	sessionOtherTenant := deriveCursorSessionID(bodyA1, "tenant-b")
+	sessionOtherModel := deriveCursorSessionID(bodyOtherModel, "tenant-a")
+
+	if sessionA1 == "" || !strings.HasPrefix(sessionA1, "cursor-metadata-user-") {
+		t.Fatalf("expected metadata.user_id-derived session, got %q", sessionA1)
+	}
+	if sessionA1 != sessionA2 {
+		t.Fatalf("same metadata.user_id must produce stable execution session: %q vs %q", sessionA1, sessionA2)
+	}
+	if sessionA1 == sessionOtherTenant {
+		t.Fatalf("different principals must not share metadata.user_id session: %q", sessionA1)
+	}
+	if sessionA1 == sessionOtherModel {
+		t.Fatalf("different models must not share metadata.user_id session: %q", sessionA1)
+	}
+}
+
+func TestDeriveCursorSessionIDPrefersExplicitAnchorsOverMetadataUserID(t *testing.T) {
+	withPromptCacheKey := []byte(`{"model":"claude-opus-5-thinking-high","prompt_cache_key":"client-owned-key","metadata":{"cursorConversationId":"conv-1","user_id":"user-1"},"messages":[{"role":"user","content":"turn one"}]}`)
+	withConversationID := []byte(`{"model":"claude-opus-5-thinking-high","metadata":{"cursorConversationId":"conv-1","user_id":"user-1"},"messages":[{"role":"user","content":"turn one"}]}`)
+
+	if got := deriveCursorSessionID(withPromptCacheKey, "tenant-a"); !strings.HasPrefix(got, "cursor-pck-") {
+		t.Fatalf("prompt_cache_key must retain precedence, got %q", got)
+	}
+	if got := deriveCursorSessionID(withConversationID, "tenant-a"); !strings.HasPrefix(got, "cursor-conv-") {
+		t.Fatalf("cursorConversationId must retain precedence, got %q", got)
+	}
+}
+
 func TestDeriveCursorSessionIDIsolatesByPrincipalSalt(t *testing.T) {
 	// Same client-controlled inputs, different tenant principal salt → MUST
 	// produce different execution sessions (no cross-tenant WS/connection

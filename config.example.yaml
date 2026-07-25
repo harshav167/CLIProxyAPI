@@ -435,6 +435,10 @@ nonstream-keepalive-interval: 15
 #   claude:
 #     - name: "claude-sonnet-4-5-20250929"
 #       alias: "cs4.5"
+#     - name: "claude-opus-5"
+#       alias: "claude-opus-5-thinking-low"
+#       fork: true
+#     # Repeat for thinking-medium/high/xhigh/max.
 #   codex:
 #     - name: "gpt-5"
 #       alias: "g5"
@@ -519,6 +523,15 @@ nonstream-keepalive-interval: 15
 #           protocol: "codex"
 #       params:
 #         service_tier: priority
+#     # Cursor sends distinct Opus 5 model IDs for each adaptive thinking level.
+#     - models:
+#         - name: "claude-opus-5-thinking-low"
+#           protocol: "claude"
+#       params:
+#         max_tokens: 64000
+#         "output_config.effort": "low"
+#         "thinking.type": "adaptive"
+#     # Repeat for thinking-medium/high/xhigh/max with the matching effort.
 #     # Grok 4.5 effort aliases: match protocol "xai" (provider identity).
 #     # XAI reuses Codex-shaped Responses translation internally, but payload
 #     # rules must NOT use protocol: codex.

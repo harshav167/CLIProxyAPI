@@ -309,24 +309,34 @@ func TestConvertOpenAIRequestToClaude_OpusThinkingAliasesUseClaudeCodeParityShap
 		"stream": true
 	}`
 
-	low := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-low", []byte(inputJSON), true))
-	medium := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-medium", []byte(inputJSON), true))
-	high := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-high", []byte(inputJSON), true))
-	xhigh := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-xhigh", []byte(inputJSON), true))
-	max := gjson.ParseBytes(ConvertOpenAIRequestToClaude("claude-opus-4-7-thinking-max", []byte(inputJSON), true))
+	for _, candidate := range []string{"claude-opus-4-7", "claude-opus-4-8", "claude-opus-5"} {
+		t.Run(candidate, func(t *testing.T) {
+			assertClaudeCodeAdaptiveThinkingAliases(t, candidate, inputJSON)
+		})
+	}
+}
+
+func assertClaudeCodeAdaptiveThinkingAliases(t *testing.T, modelFamily, inputJSON string) {
+	t.Helper()
+
+	low := gjson.ParseBytes(ConvertOpenAIRequestToClaude(modelFamily+"-thinking-low", []byte(inputJSON), true))
+	medium := gjson.ParseBytes(ConvertOpenAIRequestToClaude(modelFamily+"-thinking-medium", []byte(inputJSON), true))
+	high := gjson.ParseBytes(ConvertOpenAIRequestToClaude(modelFamily+"-thinking-high", []byte(inputJSON), true))
+	xhigh := gjson.ParseBytes(ConvertOpenAIRequestToClaude(modelFamily+"-thinking-xhigh", []byte(inputJSON), true))
+	max := gjson.ParseBytes(ConvertOpenAIRequestToClaude(modelFamily+"-thinking-max", []byte(inputJSON), true))
 
 	for name, resultJSON := range map[string]gjson.Result{"low": low, "medium": medium, "high": high, "xhigh": xhigh, "max": max} {
 		if got := resultJSON.Get("thinking.type").String(); got != "adaptive" {
 			t.Fatalf("%s thinking.type = %q, want adaptive; body=%s", name, got, resultJSON.Raw)
 		}
 		if got := resultJSON.Get("thinking.display"); got.Exists() {
-			t.Fatalf("%s thinking.display should be omitted for Opus 4.7 adaptive thinking, got %s; body=%s", name, got.Raw, resultJSON.Raw)
+			t.Fatalf("%s thinking.display should be omitted for adaptive Opus thinking, got %s; body=%s", name, got.Raw, resultJSON.Raw)
 		}
 		if got := resultJSON.Get("max_tokens").Int(); got != 64000 {
 			t.Fatalf("%s max_tokens = %d, want 64000; body=%s", name, got, resultJSON.Raw)
 		}
 		if got := resultJSON.Get("thinking.budget_tokens"); got.Exists() {
-			t.Fatalf("%s thinking.budget_tokens should be omitted for Opus 4.7 adaptive thinking, got %s; body=%s", name, got.Raw, resultJSON.Raw)
+			t.Fatalf("%s thinking.budget_tokens should be omitted for adaptive Opus thinking, got %s; body=%s", name, got.Raw, resultJSON.Raw)
 		}
 		if got := resultJSON.Get("context_management.edits.0.type").String(); got != "clear_thinking_20251015" {
 			t.Fatalf("%s context_management edit type = %q, want clear_thinking_20251015; body=%s", name, got, resultJSON.Raw)
@@ -334,8 +344,8 @@ func TestConvertOpenAIRequestToClaude_OpusThinkingAliasesUseClaudeCodeParityShap
 		if got := resultJSON.Get("context_management.edits.0.keep").String(); got != "all" {
 			t.Fatalf("%s context_management edit keep = %q, want all; body=%s", name, got, resultJSON.Raw)
 		}
-		if got := resultJSON.Get("diagnostics.previous_message_id"); !got.Exists() || got.Type != gjson.Null {
-			t.Fatalf("%s diagnostics.previous_message_id = %s, want explicit null; body=%s", name, got.Raw, resultJSON.Raw)
+		if got := resultJSON.Get("diagnostics"); got.Exists() {
+			t.Fatalf("%s translator must leave diagnostics to the executor session store, got %s; body=%s", name, got.Raw, resultJSON.Raw)
 		}
 	}
 	if got := low.Get("output_config.effort").String(); got != "low" {

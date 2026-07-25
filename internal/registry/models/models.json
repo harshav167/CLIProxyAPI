@@ -120,18 +120,18 @@
       }
     },
     {
-      "id": "claude-sonnet-5",
+      "id": "claude-opus-5",
       "object": "model",
-      "created": 1782777600,
+      "created": 1784937600,
       "owned_by": "anthropic",
       "type": "claude",
-      "display_name": "Claude Sonnet 5",
-      "description": "Anthropic's agentic Sonnet model for coding, tool use, and enterprise workflows",
+      "display_name": "Claude Opus 5",
+      "description": "Anthropic's most capable model for demanding reasoning and long-horizon agentic work",
       "context_length": 1000000,
-      "max_completion_tokens": 128000,
+      "max_completion_tokens": 64000,
       "thinking": {
         "min": 1024,
-        "max": 128000,
+        "max": 64000,
         "zero_allowed": true,
         "levels": [
           "low",
@@ -143,13 +143,13 @@
       }
     },
     {
-      "id": "claude-fable-5",
+      "id": "claude-sonnet-5",
       "object": "model",
-      "created": 1781049600,
+      "created": 1782777600,
       "owned_by": "anthropic",
       "type": "claude",
-      "display_name": "Claude Fable 5",
-      "description": "Anthropic's most capable widely released model, for the most demanding reasoning and long-horizon agentic work",
+      "display_name": "Claude Sonnet 5",
+      "description": "Anthropic's agentic Sonnet model for coding, tool use, and enterprise workflows",
       "context_length": 1000000,
       "max_completion_tokens": 128000,
       "thinking": {

@@ -442,7 +442,7 @@ func InjectClaudeMessagesCacheControl(payload []byte) []byte {
 		contentCount := int(content.Get("#").Int())
 		if contentCount > 0 {
 			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, contentCount-1)
-			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral", "scope": "global"})
+			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral", "scope": "global", "ttl": "1h"})
 			if err != nil {
 				log.Warnf("failed to inject cache_control into messages: %v", err)
 				return payload
@@ -458,6 +458,7 @@ func InjectClaudeMessagesCacheControl(payload []byte) []byte {
 				"cache_control": map[string]string{
 					"type":  "ephemeral",
 					"scope": "global",
+					"ttl":   "1h",
 				},
 			},
 		}
@@ -496,7 +497,7 @@ func InjectClaudeToolsCacheControl(payload []byte) []byte {
 	}
 
 	lastToolPath := fmt.Sprintf("tools.%d.cache_control", toolCount-1)
-	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral", "scope": "global"})
+	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral", "scope": "global", "ttl": "1h"})
 	if err != nil {
 		log.Warnf("failed to inject cache_control into tools array: %v", err)
 		return payload
@@ -530,7 +531,7 @@ func InjectClaudeSystemCacheControl(payload []byte) []byte {
 		}
 
 		lastSystemPath := fmt.Sprintf("system.%d.cache_control", count-1)
-		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral", "scope": "global"})
+		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral", "scope": "global", "ttl": "1h"})
 		if err != nil {
 			log.Warnf("failed to inject cache_control into system array: %v", err)
 			return payload
@@ -545,6 +546,7 @@ func InjectClaudeSystemCacheControl(payload []byte) []byte {
 				"cache_control": map[string]string{
 					"type":  "ephemeral",
 					"scope": "global",
+					"ttl":   "1h",
 				},
 			},
 		}

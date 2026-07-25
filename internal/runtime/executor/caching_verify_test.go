@@ -8,6 +8,20 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func assertOneHourGlobalCacheControl(t *testing.T, output []byte, path string) {
+	t.Helper()
+	cacheControl := gjson.GetBytes(output, path)
+	if cacheControl.Get("type").String() != "ephemeral" {
+		t.Fatalf("%s type = %q, want ephemeral", path, cacheControl.Get("type").String())
+	}
+	if cacheControl.Get("scope").String() != "global" {
+		t.Fatalf("%s scope = %q, want global", path, cacheControl.Get("scope").String())
+	}
+	if cacheControl.Get("ttl").String() != "1h" {
+		t.Fatalf("%s ttl = %q, want 1h", path, cacheControl.Get("ttl").String())
+	}
+}
+
 func TestEnsureCacheControl(t *testing.T) {
 	// Test case 1: System prompt as string
 	t.Run("String System Prompt", func(t *testing.T) {
@@ -18,6 +32,7 @@ func TestEnsureCacheControl(t *testing.T) {
 		if res.String() != "ephemeral" {
 			t.Errorf("cache_control not found in system string. Output: %s", string(output))
 		}
+		assertOneHourGlobalCacheControl(t, output, "system.0.cache_control")
 	})
 
 	// Test case 2: System prompt as array
@@ -35,6 +50,7 @@ func TestEnsureCacheControl(t *testing.T) {
 		if res1.String() != "ephemeral" {
 			t.Errorf("cache_control not found on last system element. Output: %s", string(output))
 		}
+		assertOneHourGlobalCacheControl(t, output, "system.1.cache_control")
 	})
 
 	// Test case 3: Tools are cached
@@ -60,12 +76,14 @@ func TestEnsureCacheControl(t *testing.T) {
 		if tool1Cache.String() != "ephemeral" {
 			t.Errorf("cache_control not found on last tool. Output: %s", string(output))
 		}
+		assertOneHourGlobalCacheControl(t, output, "tools.1.cache_control")
 
 		// System should also have cache_control
 		systemCache := gjson.GetBytes(output, "system.0.cache_control.type")
 		if systemCache.String() != "ephemeral" {
 			t.Errorf("cache_control not found in system. Output: %s", string(output))
 		}
+		assertOneHourGlobalCacheControl(t, output, "system.0.cache_control")
 	})
 
 	// Test case 4: Tools and system are INDEPENDENT breakpoints
@@ -185,6 +203,7 @@ func TestEnsureCacheControl(t *testing.T) {
 		if cacheType.String() != "ephemeral" {
 			t.Errorf("cache_control not found on second-to-last user turn. Output: %s", string(output))
 		}
+		assertOneHourGlobalCacheControl(t, output, "messages.2.content.0.cache_control")
 
 		lastUserCache := gjson.GetBytes(output, "messages.4.content.0.cache_control")
 		if lastUserCache.Exists() {
@@ -214,6 +233,19 @@ func TestEnsureCacheControl(t *testing.T) {
 			t.Errorf("existing cache_control should be preserved. Output: %s", string(output))
 		}
 	})
+}
+
+func TestEnsureClaudeUserPromptCacheAnchorUsesOneHourTTL(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)
+	output := helps.EnsureClaudeUserPromptCacheAnchor(input)
+
+	cacheControl := gjson.GetBytes(output, "messages.0.content.0.cache_control")
+	if cacheControl.Get("type").String() != "ephemeral" {
+		t.Fatalf("cache_control type = %q, want ephemeral", cacheControl.Get("type").String())
+	}
+	if cacheControl.Get("ttl").String() != "1h" {
+		t.Fatalf("cache_control ttl = %q, want 1h", cacheControl.Get("ttl").String())
+	}
 }
 
 // TestCacheControlOrder verifies the correct order: tools -> system -> messages

@@ -141,6 +141,18 @@ func TestResolveClaudeDeviceProfileRequiredHomeReadWithoutCandidate(t *testing.T
 	}
 }
 
+func TestClaudeDeviceProfileDefaultsMatchCapturedOpus5Client(t *testing.T) {
+	if defaultClaudeFingerprintUserAgent != "claude-cli/2.1.220 (external, cli)" {
+		t.Fatalf("default User-Agent = %q, want captured Claude Code 2.1.220", defaultClaudeFingerprintUserAgent)
+	}
+	if defaultClaudeFingerprintPackageVersion != "0.94.0" {
+		t.Fatalf("default package version = %q, want captured 0.94.0", defaultClaudeFingerprintPackageVersion)
+	}
+	if defaultClaudeFingerprintRuntimeVersion != "v26.3.0" {
+		t.Fatalf("default runtime version = %q, want captured v26.3.0", defaultClaudeFingerprintRuntimeVersion)
+	}
+}
+
 func TestResolveClaudeDeviceProfileRequiredHomeCandidateLocksRereadsAndWrites(t *testing.T) {
 	client := newFakeClaudeDeviceProfileKVClient()
 	auth := &cliproxyauth.Auth{ID: "auth-1"}

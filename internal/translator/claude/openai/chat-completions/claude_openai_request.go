@@ -457,13 +457,12 @@ func applyClaudeCodeThinkingParity(out []byte, modelName string, root gjson.Resu
 
 	const maxTokens = 64000
 	out, _ = sjson.SetBytes(out, "max_tokens", maxTokens)
-	if isOpus47ThinkingAlias(modelName) {
+	if registry.IsAdaptiveClaudeOpusModel(modelName) {
 		out, _ = sjson.SetBytes(out, "thinking.type", "adaptive")
 		out, _ = sjson.DeleteBytes(out, "thinking.budget_tokens")
 		out, _ = sjson.DeleteBytes(out, "thinking.display")
 		out, _ = sjson.SetBytes(out, "context_management.edits.0.type", "clear_thinking_20251015")
 		out, _ = sjson.SetBytes(out, "context_management.edits.0.keep", "all")
-		out, _ = sjson.SetRawBytes(out, "diagnostics.previous_message_id", []byte("null"))
 	} else {
 		out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
 		out, _ = sjson.SetBytes(out, "thinking.budget_tokens", maxTokens-1)
@@ -510,11 +509,6 @@ func effortFromClaudeModelAlias(modelName string) string {
 		}
 	}
 	return ""
-}
-
-func isOpus47ThinkingAlias(modelName string) bool {
-	name := strings.ToLower(strings.TrimSpace(modelName))
-	return strings.Contains(name, "opus-4-7") || strings.Contains(name, "mythos")
 }
 
 func convertOpenAIContentPartToClaudePart(part gjson.Result) string {
