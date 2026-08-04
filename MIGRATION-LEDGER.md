@@ -543,7 +543,7 @@ leak fix, per-request Claude user IDs, plugin-store safe HTTP client, bounded
 plugin-version concurrency, and doc updates were applied in follow-up edits on
 this branch.
 
-## 2026-07-25 — Claude Opus 5 onboarding and Fable removal
+## 2026-07-25 — Claude Opus 5 onboarding and Fable alias removal
 
 - Added the `claude-opus-5` catalog entry and adaptive thinking-level aliases.
 - Updated the Claude client fingerprint to the captured Opus 5 client shape.
@@ -551,6 +551,8 @@ this branch.
   including `metadata.user_id` fallback and strict upstream message-ID parsing.
 - Restored the `extended-cache-ttl-2025-04-11` beta and explicit `ttl: "1h"` on
   proxy-owned cache anchors after production showed silent five-minute writes.
-- Removed the unused `f5-*` alias hook, embedded snapshot, tests, config guidance,
-  and current architecture documentation. Older historical ledger entries remain
-  unchanged because they describe what prior upstream syncs preserved at the time.
+- Removed the unused `f5-*` config alias hook, embedded snapshot, tests, config
+  guidance, and current architecture documentation. The direct
+  `claude-fable-5` catalog model remains supported. Older historical ledger
+  entries remain unchanged because they describe what prior upstream syncs
+  preserved at the time.

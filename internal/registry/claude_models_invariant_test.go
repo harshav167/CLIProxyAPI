@@ -140,6 +140,31 @@ func TestClaudeOpus5CatalogContract(t *testing.T) {
 	}
 }
 
+func TestClaudeFable5CatalogContract(t *testing.T) {
+	var fable5 *ModelInfo
+	for _, model := range GetClaudeModels() {
+		if model != nil && model.ID == "claude-fable-5" {
+			fable5 = model
+			break
+		}
+	}
+	if fable5 == nil {
+		t.Fatal("claude-fable-5 missing from embedded Claude model catalog")
+	}
+	if fable5.ContextLength != 1_000_000 {
+		t.Fatalf("claude-fable-5 context_length = %d, want 1000000", fable5.ContextLength)
+	}
+	if fable5.MaxCompletionTokens != 128_000 {
+		t.Fatalf("claude-fable-5 max_completion_tokens = %d, want 128000", fable5.MaxCompletionTokens)
+	}
+	if fable5.Thinking == nil {
+		t.Fatal("claude-fable-5 thinking metadata is nil")
+	}
+	if fable5.Thinking.Min != 1_024 || fable5.Thinking.Max != 128_000 || !fable5.Thinking.ZeroAllowed {
+		t.Fatalf("claude-fable-5 thinking metadata = %+v, want min=1024 max=128000 zero_allowed=true", fable5.Thinking)
+	}
+}
+
 func TestIsAdaptiveClaudeOpusModel(t *testing.T) {
 	for _, model := range []string{
 		"claude-opus-4-7",
